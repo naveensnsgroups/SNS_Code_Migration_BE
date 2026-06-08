@@ -3,7 +3,7 @@ import multer from 'multer';
 import fs from 'fs-extra';
 import path from 'path';
 import { SessionManager } from '../session/sessionManager.js';
-import { ScannerAgent } from '../agents/scanner-agent.js';
+import { ScannerAgent, ScannerAgentConfig } from '../agents/scanner-agent.js';
 
 const router = Router();
 const upload = multer({ storage: multer.memoryStorage() });
@@ -78,23 +78,24 @@ router.post('/', upload.array('files'), async (req: Request, res: Response, next
       await SessionManager.addLog(sessionId, `Project root detected and set to subfolder: ${commonParent}`, 'info');
     }
 
-    // 3. Run scanner agent
+    // 3. Build AI config from request body and run scanner agent
     await SessionManager.addLog(sessionId, 'Running codebase scanner agent...', 'info');
-    
+
     const { provider, model, apiKey } = req.body;
-    let aiService;
-    if (provider && apiKey) {
-      try {
-        const { AIProviderFactory } = await import('../ai/provider.js');
-        aiService = AIProviderFactory.getService(provider, model || '', apiKey);
-      } catch (err: any) {
-        await SessionManager.addLog(sessionId, `AI verification service skipped: ${err.message}`, 'warning');
-      }
+    const aiConfig: ScannerAgentConfig | undefined =
+      (provider && apiKey)
+        ? { provider, model: model || undefined, apiKey }
+        : undefined;
+
+    if (!aiConfig) {
+      await SessionManager.addLog(sessionId, 'No AI provider configured — using static manifest scan.', 'info');
     }
 
-    const scanResult = await ScannerAgent.run(session.projectPath, aiService, async (msg, lvl) => {
-      await SessionManager.addLog(sessionId, msg, lvl ?? 'info');
-    });
+    const scanResult = await ScannerAgent.run(
+      session.projectPath,
+      aiConfig,
+      async (msg, lvl) => { await SessionManager.addLog(sessionId, msg, lvl ?? 'info'); }
+    );
 
     // 4. Update session settings
     const updatedSession = await SessionManager.updateSession(sessionId, {

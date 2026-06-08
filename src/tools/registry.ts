@@ -4,6 +4,8 @@ import glob from 'fast-glob';
 import { writeSessionFile } from './fileWriter.js';
 import { ShellExecutor } from './shellExecutor.js';
 import { TaskContextManager } from '../session/taskContext.js';
+import { SessionManager } from '../session/sessionManager.js';
+import { EventBroadcaster } from '../routes/stream.js';
 import {
   FILE_CONTENT_FUNCTION_ID,
   GET_WORKSPACE_FILE_LIST_FUNCTION_ID,
@@ -697,6 +699,618 @@ export const TOOLS_REGISTRY: Record<string, ToolDefinition> = {
         } catch {}
       }
       return { results };
+    }
+  },
+
+  // ── extractFileSymbols ───────────────────────────────────────────────────
+  // Mirrors: ExtractFileSymbols (browser/migration-large-file-tools.ts)
+  // Extracts function/class symbols from a source file + recommends reading strategy.
+  extractFileSymbols: {
+    name: 'extractFileSymbols',
+    description:
+      'Extracts the symbol map (functions, classes, methods) from a source file and returns '
+      + 'the recommended reading strategy based on file size. '
+      + 'readingStrategy: SMALL (≤200 lines) = read whole file; MEDIUM (201-500) = symbol-targeted reads; '
+      + 'LARGE (501-2500) = chunked reads with checkpoints; ULTRA_LARGE (2500+) = multi-pass streaming. '
+      + 'ALWAYS call this before getFileContent on any source file.',
+    parameters: {
+      type: 'object',
+      properties: {
+        file: { type: 'string', description: 'Relative path to the source file within the legacy workspace.' }
+      },
+      required: ['file']
+    },
+    handler: async (args: { file: string }, context: ToolContext) => {
+      const targetPath = path.resolve(context.legacyPath, args.file);
+      if (!targetPath.startsWith(path.resolve(context.legacyPath))) throw new Error('Access denied.');
+      if (!(await fs.pathExists(targetPath))) return { error: `File not found: ${args.file}` };
+      const stat = await fs.stat(targetPath);
+      if (stat.isDirectory()) return { error: 'Path is a directory.' };
+
+      const content = await fs.readFile(targetPath, 'utf-8');
+      const lines = content.split(/\r?\n/);
+      const lineCount = lines.length;
+
+      // Determine reading strategy
+      const readingStrategy =
+        lineCount <= 200 ? 'SMALL' :
+        lineCount <= 500 ? 'MEDIUM' :
+        lineCount <= 2500 ? 'LARGE' : 'ULTRA_LARGE';
+
+      // Regex-based symbol extraction (supports JS/TS/Python/Java/Go/PHP/Ruby/C++/C#)
+      const symbols: any[] = [];
+      const patterns = [
+        // JavaScript/TypeScript functions & classes
+        { regex: /^\s*(?:export\s+)?(?:async\s+)?function\s+(\w+)\s*\(/gm,    type: 'function' },
+        { regex: /^\s*(?:export\s+)?class\s+(\w+)/gm,                          type: 'class' },
+        { regex: /^\s*(?:public|private|protected|static|async)?\s+(\w+)\s*\([^)]*\)\s*[:{]/gm, type: 'method' },
+        { regex: /^\s*const\s+(\w+)\s*=\s*(?:async\s+)?(?:\([^)]*\)|\w+)\s*=>/gm, type: 'arrow_fn' },
+        // Python
+        { regex: /^def\s+(\w+)\s*\(/gm,      type: 'function' },
+        { regex: /^class\s+(\w+)/gm,          type: 'class' },
+        // Java/C#
+        { regex: /(?:public|private|protected|static)\s+\w+\s+(\w+)\s*\(/gm, type: 'method' },
+        // Go
+        { regex: /^func\s+(?:\(\w+\s+\*?\w+\)\s+)?(\w+)\s*\(/gm, type: 'function' },
+        // PHP
+        { regex: /^\s*(?:public|private|protected)?\s*function\s+(\w+)\s*\(/gm, type: 'function' },
+        // Ruby
+        { regex: /^\s*def\s+(\w+)/gm, type: 'function' },
+      ];
+
+      const seen = new Set<string>();
+      for (const { regex, type } of patterns) {
+        let match;
+        regex.lastIndex = 0;
+        while ((match = regex.exec(content)) !== null) {
+          const name = match[1];
+          if (!name || seen.has(name)) continue;
+          seen.add(name);
+          // Find line number
+          const before = content.slice(0, match.index);
+          const startLine = before.split('\n').length;
+          symbols.push({ name, type, startLine, endLine: startLine + 5 });
+        }
+      }
+
+      return {
+        file: args.file,
+        lineCount,
+        readingStrategy,
+        symbolCount: symbols.length,
+        symbols: symbols.slice(0, 200), // cap at 200 to avoid context overflow
+        recommendation: readingStrategy === 'SMALL'
+          ? 'Read entire file with getFileContent (no offset/limit needed).'
+          : readingStrategy === 'MEDIUM'
+          ? 'Use getFileContent with offset/limit per symbol (startLine-1, lineCount).'
+          : readingStrategy === 'LARGE'
+          ? 'Read 10 symbols per turn using getFileContent with offset/limit. Save CHUNK_PROGRESS checkpoints.'
+          : 'MANDATORY MULTI-PASS: 5 symbols per turn max. Save per-symbol analysis notes after each batch.'
+      };
+    }
+  },
+
+  // ── getEnvironmentInfo ───────────────────────────────────────────────────
+  // Mirrors: GetEnvironmentInfo (browser/migration-env-tools.ts)
+  getEnvironmentInfo: {
+    name: 'getEnvironmentInfo',
+    description:
+      'Detects runtime versions (Node.js, Python, Java, Go, Rust, PHP, Ruby), package managers, '
+      + 'and system environment info. Call once at the start of Phase 1 environment probe.',
+    parameters: { type: 'object', properties: {}, required: [] },
+    handler: async (_args: {}, context: ToolContext) => {
+      const results: Record<string, string> = {
+        platform: process.platform,
+        arch: process.arch,
+        nodeVersion: process.version,
+      };
+
+      const cmds: [string, string][] = [
+        ['pythonVersion',  'python --version'],
+        ['python3Version', 'python3 --version'],
+        ['javaVersion',    'java -version'],
+        ['goVersion',      'go version'],
+        ['rustVersion',    'rustc --version'],
+        ['phpVersion',     'php --version'],
+        ['rubyVersion',    'ruby --version'],
+        ['gitVersion',     'git --version'],
+        ['dockerVersion',  'docker --version'],
+        ['npmVersion',     'npm --version'],
+        ['yarnVersion',    'yarn --version'],
+        ['pnpmVersion',    'pnpm --version'],
+        ['dotnetVersion',  'dotnet --version'],
+      ];
+
+      for (const [key, cmd] of cmds) {
+        try {
+          const res = await ShellExecutor.execute(context.sessionId, cmd, {
+            cwd: context.legacyPath,
+            timeoutMs: 5000,
+          });
+          if (res.code === 0) {
+            results[key] = (res.stdout || res.stderr || '').trim().split('\n')[0];
+          } else {
+            results[key] = 'not installed';
+          }
+        } catch {
+          results[key] = 'not installed';
+        }
+      }
+
+      return results;
+    }
+  },
+
+  // ── getGitLog ────────────────────────────────────────────────────────────
+  // Mirrors: GetGitLog (browser/migration-git-tools.ts)
+  getGitLog: {
+    name: 'getGitLog',
+    description:
+      'Retrieves git commit history from the legacy workspace. '
+      + 'Returns recent commits, high-churn files (most commits), and dead code candidates (no commits in past year). '
+      + 'Use during Phase 1 environment probe to identify migration risk areas.',
+    parameters: {
+      type: 'object',
+      properties: {
+        maxCommits: { type: 'number', description: 'Maximum commits to retrieve (default: 200).' }
+      },
+      required: []
+    },
+    handler: async (args: { maxCommits?: number }, context: ToolContext) => {
+      const max = args.maxCommits ?? 200;
+      try {
+        const res = await ShellExecutor.execute(
+          context.sessionId,
+          `git log --name-only --format="COMMIT:%H|%ai|%s" -n ${max}`,
+          { cwd: context.legacyPath, timeoutMs: 15000 }
+        );
+
+        if (res.code !== 0) {
+          return { error: 'Git log failed. Not a git repo or git not installed.', stderr: res.stderr };
+        }
+
+        const lines = res.stdout.split('\n');
+        const commits: { hash: string; date: string; message: string; files: string[] }[] = [];
+        const fileCounts: Record<string, number> = {};
+        let currentCommit: typeof commits[0] | null = null;
+        const oneYearAgo = new Date();
+        oneYearAgo.setFullYear(oneYearAgo.getFullYear() - 1);
+        const recentFiles = new Set<string>();
+
+        for (const line of lines) {
+          if (line.startsWith('COMMIT:')) {
+            if (currentCommit) commits.push(currentCommit);
+            const [_, hash, date, ...msgParts] = line.split('|');
+            currentCommit = { hash: hash?.replace('COMMIT:', ''), date, message: msgParts.join('|'), files: [] };
+            if (currentCommit.date && new Date(currentCommit.date) > oneYearAgo) {
+              // file is recently touched — will be added below
+            }
+          } else if (line.trim() && currentCommit && !line.startsWith('COMMIT:')) {
+            currentCommit.files.push(line.trim());
+            fileCounts[line.trim()] = (fileCounts[line.trim()] || 0) + 1;
+            if (currentCommit.date && new Date(currentCommit.date) > oneYearAgo) {
+              recentFiles.add(line.trim());
+            }
+          }
+        }
+        if (currentCommit) commits.push(currentCommit);
+
+        const sortedByChurn = Object.entries(fileCounts)
+          .sort((a, b) => b[1] - a[1])
+          .slice(0, 20)
+          .map(([file, count]) => ({ file, commits: count }));
+
+        const allFiles = Object.keys(fileCounts);
+        const deadCodeCandidates = allFiles.filter(f => !recentFiles.has(f)).slice(0, 20);
+
+        return {
+          totalCommits: commits.length,
+          commits: commits.slice(0, 20), // Only return first 20 to avoid context overflow
+          highChurnFiles: sortedByChurn,
+          deadCodeCandidates,
+          note: `Full history: ${commits.length} commits analyzed.`
+        };
+      } catch (err: any) {
+        return { error: err.message };
+      }
+    }
+  },
+
+  // ── scanAssetFiles ───────────────────────────────────────────────────────
+  // Mirrors: ScanAssetFiles (browser/migration-asset-tools.ts)
+  scanAssetFiles: {
+    name: 'scanAssetFiles',
+    description:
+      'Scans the legacy workspace for all non-code asset files: images, fonts, stylesheets, '
+      + 'env files, Dockerfiles, SQL scripts, config files, etc. '
+      + 'Call during Phase 1 as mandatory asset inventory before generating Stage1_Analysis.md.',
+    parameters: { type: 'object', properties: {}, required: [] },
+    handler: async (_args: {}, context: ToolContext) => {
+      const base = context.legacyPath;
+      const ignorePatterns = ['**/node_modules/**', '**/.git/**', '**/dist/**', '**/build/**', '**/__pycache__/**'];
+
+      const scan = async (patterns: string[]) =>
+        glob(patterns, { cwd: base, onlyFiles: true, ignore: ignorePatterns, dot: true });
+
+      const [images, fonts, stylesheets, envFiles, dockerFiles, sqlFiles, configFiles] = await Promise.all([
+        scan(['**/*.png', '**/*.jpg', '**/*.jpeg', '**/*.gif', '**/*.svg', '**/*.ico', '**/*.webp']),
+        scan(['**/*.ttf', '**/*.woff', '**/*.woff2', '**/*.eot', '**/*.otf']),
+        scan(['**/*.css', '**/*.scss', '**/*.sass', '**/*.less', '**/*.styl']),
+        scan(['.env', '.env.*', '**/.env', '**/.env.*']),
+        scan(['**/Dockerfile', '**/docker-compose*.yml', '**/docker-compose*.yaml']),
+        scan(['**/*.sql', '**/migrations/**', '**/schema.sql', '**/seed.sql']),
+        scan(['**/*.yaml', '**/*.yml', '**/*.toml', '**/*.ini', '**/*.conf', '**/config.*', '**/*.config.*']),
+      ]);
+
+      return {
+        images: images.slice(0, 100),
+        fonts,
+        stylesheets,
+        envFiles,
+        dockerFiles,
+        sqlFiles,
+        configFiles: configFiles.slice(0, 50),
+        totalAssets: images.length + fonts.length + stylesheets.length + envFiles.length + dockerFiles.length + sqlFiles.length + configFiles.length,
+      };
+    }
+  },
+
+  // ── copyStaticAssets ─────────────────────────────────────────────────────
+  // Mirrors: CopyStaticAssets (browser/migration-asset-tools.ts)
+  copyStaticAssets: {
+    name: 'copyStaticAssets',
+    description: 'Copies specified asset files from the legacy workspace to the same relative path in the modern output workspace.',
+    parameters: {
+      type: 'object',
+      properties: {
+        files: { type: 'array', items: { type: 'string' }, description: 'Array of relative file paths to copy from legacy to modern.' }
+      },
+      required: ['files']
+    },
+    handler: async (args: { files: string[] }, context: ToolContext) => {
+      const copied: string[] = [];
+      const errors: string[] = [];
+      for (const relPath of args.files) {
+        try {
+          const src = path.resolve(context.legacyPath, relPath);
+          const dest = path.resolve(context.modernPath, relPath);
+          if (!src.startsWith(path.resolve(context.legacyPath))) { errors.push(`Access denied: ${relPath}`); continue; }
+          await fs.ensureDir(path.dirname(dest));
+          await fs.copy(src, dest);
+          copied.push(relPath);
+        } catch (err: any) {
+          errors.push(`${relPath}: ${err.message}`);
+        }
+      }
+      return { copied, errors, totalCopied: copied.length };
+    }
+  },
+
+  // ── capturedShellExecute ─────────────────────────────────────────────────
+  // Mirrors: CapturedShellExecution (browser/migration-shell-capture-tool.ts)
+  capturedShellExecute: {
+    name: 'capturedShellExecute',
+    description:
+      'Runs a shell command and returns the FULL captured stdout + stderr output. '
+      + 'Unlike run_command, this returns the complete output buffer (last 200 lines). '
+      + 'Use for running build tools, package managers, test runners, and linters where full output is needed.',
+    parameters: {
+      type: 'object',
+      properties: {
+        command: { type: 'string', description: 'The shell command to execute.' },
+        cwd: {
+          type: 'string',
+          description: 'Working directory: "legacy" (source), "modern" (output), or an absolute path. Defaults to "modern".'
+        },
+        timeoutMs: { type: 'number', description: 'Timeout in milliseconds (default: 60000).' }
+      },
+      required: ['command']
+    },
+    handler: async (args: { command: string; cwd?: string; timeoutMs?: number }, context: ToolContext) => {
+      const workingDir =
+        args.cwd === 'legacy' ? context.legacyPath :
+        args.cwd === 'modern' ? context.modernPath :
+        (args.cwd && path.isAbsolute(args.cwd)) ? args.cwd :
+        context.modernPath;
+
+      const res = await ShellExecutor.execute(context.sessionId, args.command, {
+        cwd: workingDir,
+        timeoutMs: args.timeoutMs ?? 60000,
+        onLog: (msg, isErr) => context.onLog?.(msg, isErr ? 'error' : 'info'),
+      });
+
+      const allOutput = [res.stdout, res.stderr].filter(Boolean).join('\n');
+      const outputLines = allOutput.split('\n');
+      const tails = outputLines.slice(-200).join('\n'); // Last 200 lines
+
+      return {
+        exitCode: res.code,
+        stdout: res.stdout,
+        stderr: res.stderr,
+        tails,
+        timedOut: res.code === 124,
+        command: args.command
+      };
+    }
+  },
+
+  // ── getSkillFileContent ──────────────────────────────────────────────────
+  // Mirrors: GetSkillFileContent (browser/skill-file-functions.ts)
+  getSkillFileContent: {
+    name: 'getSkillFileContent',
+    description: 'Reads a custom skill/rule template file from the skills directory. Skills are Markdown files with custom migration rules.',
+    parameters: {
+      type: 'object',
+      properties: {
+        skillPath: { type: 'string', description: 'Name or relative path of the skill file (e.g. "custom-rules.md").' }
+      },
+      required: ['skillPath']
+    },
+    handler: async (args: { skillPath: string }, context: ToolContext) => {
+      try {
+        // Look in a skills/ directory at the BE root (or session-specific)
+        const skillsDir = path.join(process.cwd(), 'skills');
+        const skillPath = path.resolve(skillsDir, args.skillPath);
+        if (!skillPath.startsWith(skillsDir)) throw new Error('Access denied.');
+        if (!(await fs.pathExists(skillPath))) {
+          return { content: '', note: `Skill file "${args.skillPath}" not found. Using default behavior.` };
+        }
+        const content = await fs.readFile(skillPath, 'utf-8');
+        return { content, skillPath: args.skillPath };
+      } catch (err: any) {
+        return { content: '', error: err.message };
+      }
+    }
+  },
+
+  // ── todoWrite ────────────────────────────────────────────────────────────
+  // Mirrors: TodoWriteTool (browser/todo-tool.ts)
+  todoWrite: {
+    name: 'todoWrite',
+    description:
+      'Writes/updates a todo task list for progress tracking. Use this to mark files as analyzed or migrated. '
+      + 'Each call broadcasts a todo_update SSE event so the terminal shows live progress.',
+    parameters: {
+      type: 'object',
+      properties: {
+        todos: {
+          type: 'array',
+          description: 'Array of todo items.',
+          items: {
+            type: 'object',
+            properties: {
+              title:    { type: 'string', description: 'Task title, e.g. "Analyzed: src/auth.js".' },
+              status:   { type: 'string', enum: ['pending', 'in_progress', 'completed'], description: 'Task status.' },
+              priority: { type: 'string', enum: ['low', 'medium', 'high'], description: 'Task priority.' }
+            },
+            required: ['title', 'status']
+          }
+        }
+      },
+      required: ['todos']
+    },
+    handler: async (args: { todos: Array<{ title: string; status: string; priority?: string }> }, context: ToolContext) => {
+      // Save to task context under 'todo-list'
+      await TaskContextManager.updateContext(context.sessionId, { 'todo-list': args.todos });
+
+      // Broadcast to frontend
+      EventBroadcaster.broadcast(context.sessionId, 'todo_update', {
+        todos: args.todos,
+        timestamp: new Date().toISOString()
+      });
+
+      // Also log summary to terminal
+      const completed = args.todos.filter(t => t.status === 'completed').length;
+      const total = args.todos.length;
+      context.onLog?.(`📋 [Todo] ${completed}/${total} tasks completed.`, 'info');
+
+      return { saved: true, count: total, completed };
+    }
+  },
+
+  // ── update-migration-dashboard ───────────────────────────────────────────
+  // Mirrors: MigrationProgressDashboard (browser/migration-progress-dashboard-tool.ts)
+  'update-migration-dashboard': {
+    name: 'update-migration-dashboard',
+    description:
+      'Broadcasts a live progress update to the frontend dashboard. '
+      + 'Call after every batch of files to update the progress bar and current file indicator. '
+      + 'Also saves progress to session for reconnection hydration.',
+    parameters: {
+      type: 'object',
+      properties: {
+        filesCompleted: { type: 'number', description: 'Number of files analyzed/migrated so far.' },
+        totalFiles:     { type: 'number', description: 'Total files in the index.' },
+        currentFile:    { type: 'string', description: 'The file currently being processed.' },
+        phase:          { type: 'string', description: 'Current phase name (e.g. "Phase 1: FileAnalyzer").' }
+      },
+      required: ['filesCompleted', 'totalFiles']
+    },
+    handler: async (args: { filesCompleted: number; totalFiles: number; currentFile?: string; phase?: string }, context: ToolContext) => {
+      const percent = args.totalFiles > 0 ? Math.round((args.filesCompleted / args.totalFiles) * 100) : 0;
+
+      EventBroadcaster.broadcast(context.sessionId, 'progress', {
+        percent,
+        filesCompleted: args.filesCompleted,
+        totalFiles: args.totalFiles,
+        currentFile: args.currentFile || '',
+        phase: args.phase || 'Analysis',
+      });
+
+      context.onLog?.(`📊 Progress: ${args.filesCompleted}/${args.totalFiles} files (${percent}%)${args.currentFile ? ` — ${args.currentFile}` : ''}`, 'info');
+
+      // Save to session
+      await SessionManager.updateSession(context.sessionId, {
+        completedFiles: args.filesCompleted,
+        totalFiles: args.totalFiles,
+        currentFile: args.currentFile,
+      });
+
+      return { broadcasted: true, percent };
+    }
+  },
+
+  // ── compress-migration-context ───────────────────────────────────────────
+  // Mirrors: SemanticContextCompressor (browser/migration-context-compressor-tool.ts)
+  'compress-migration-context': {
+    name: 'compress-migration-context',
+    description:
+      'Archives completed phase data to free up context window space. '
+      + 'Moves large keys (file-index, rules-by-file, dep-matrix) to archive-* named keys, '
+      + 'keeping only HOT keys (ACTIVE_PHASE, *_KEY pointers, TOTAL_FILES) inline. '
+      + 'Call when CONTEXT_SIZE_WARNING=true is set in task context.',
+    parameters: { type: 'object', properties: {}, required: [] },
+    handler: async (_args: {}, context: ToolContext) => {
+      const ctx = await TaskContextManager.getContext(context.sessionId);
+
+      const ARCHIVE_KEYS = ['file-index', 'rules-by-file', 'lang-profiles', 'dep-matrix', 'symbols', 'analysis'];
+      const archived: string[] = [];
+      const archiveData: Record<string, any> = {};
+      const keptKeys: string[] = [];
+
+      for (const [key, value] of Object.entries(ctx)) {
+        const shouldArchive = ARCHIVE_KEYS.some(ak => key === ak || key.startsWith(ak + ':'));
+        if (shouldArchive && value !== undefined) {
+          archiveData['archive-' + key] = value;
+          archived.push(key);
+        } else {
+          keptKeys.push(key);
+        }
+      }
+
+      // Remove archived keys and add archive pointers
+      const updates: Record<string, any> = { ...archiveData, CONTEXT_COMPACTED: true, CONTEXT_SIZE_WARNING: false };
+      for (const key of archived) updates[key] = undefined;
+
+      await TaskContextManager.updateContext(context.sessionId, updates);
+      context.onLog?.(`🗜️ [Context] Archived ${archived.length} large keys. Kept ${keptKeys.length} HOT keys.`, 'info');
+
+      return { archived, keptKeys, contextSizeReduced: archived.length > 0 };
+    }
+  },
+
+  // ── write-migration-files ────────────────────────────────────────────────
+  // Mirrors: MultiFileWriter (browser/migration-multi-writer-tool.ts)
+  'write-migration-files': {
+    name: 'write-migration-files',
+    description:
+      'Writes multiple files to the modern output workspace in a single call. '
+      + 'More efficient than calling write_file individually. '
+      + 'Broadcasts a file_migrated SSE event for each file written.',
+    parameters: {
+      type: 'object',
+      properties: {
+        files: {
+          type: 'array',
+          description: 'Array of files to write.',
+          items: {
+            type: 'object',
+            properties: {
+              path:    { type: 'string', description: 'Relative destination path in the output workspace.' },
+              content: { type: 'string', description: 'File content to write.' }
+            },
+            required: ['path', 'content']
+          }
+        }
+      },
+      required: ['files']
+    },
+    handler: async (args: { files: Array<{ path: string; content: string }> }, context: ToolContext) => {
+      const written: string[] = [];
+      const errors: string[] = [];
+      for (const file of args.files) {
+        try {
+          await writeSessionFile(context.modernPath, file.path, file.content);
+          written.push(file.path);
+          EventBroadcaster.broadcast(context.sessionId, 'file_migrated', { file: file.path });
+          context.onLog?.(`✅ Written: ${file.path}`, 'success');
+        } catch (err: any) {
+          errors.push(`${file.path}: ${err.message}`);
+          context.onLog?.(`❌ Failed to write ${file.path}: ${err.message}`, 'error');
+        }
+      }
+      return { written, errors, totalWritten: written.length };
+    }
+  },
+
+  // ── compareFiles ─────────────────────────────────────────────────────────
+  // Mirrors: CompareFiles (browser/migration-compare-tools.ts)
+  compareFiles: {
+    name: 'compareFiles',
+    description: 'Compares a legacy file with its modern equivalent and returns a unified diff. Use to verify migration fidelity.',
+    parameters: {
+      type: 'object',
+      properties: {
+        legacyFile: { type: 'string', description: 'Relative path to the legacy file.' },
+        modernFile:  { type: 'string', description: 'Relative path to the modern file (in output workspace).' }
+      },
+      required: ['legacyFile', 'modernFile']
+    },
+    handler: async (args: { legacyFile: string; modernFile: string }, context: ToolContext) => {
+      try {
+        const legacyPath = path.resolve(context.legacyPath, args.legacyFile);
+        const modernPath  = path.resolve(context.modernPath,  args.modernFile);
+        if (!(await fs.pathExists(legacyPath))) return { error: `Legacy file not found: ${args.legacyFile}` };
+        if (!(await fs.pathExists(modernPath)))  return { error: `Modern file not found: ${args.modernFile}` };
+
+        const [legacyLines, modernLines] = await Promise.all([
+          fs.readFile(legacyPath, 'utf-8').then(c => c.split('\n')),
+          fs.readFile(modernPath,  'utf-8').then(c => c.split('\n')),
+        ]);
+
+        // Simple line-by-line diff
+        let added = 0; let removed = 0;
+        const diff: string[] = [];
+        const maxLines = Math.max(legacyLines.length, modernLines.length);
+        for (let i = 0; i < maxLines; i++) {
+          const lLine = legacyLines[i] ?? '';
+          const mLine = modernLines[i] ?? '';
+          if (lLine !== mLine) {
+            if (legacyLines[i] !== undefined) { diff.push(`- ${lLine}`); removed++; }
+            if (modernLines[i] !== undefined) { diff.push(`+ ${mLine}`); added++; }
+          }
+        }
+
+        const totalChanges = added + removed;
+        const similarity = totalChanges === 0 ? 100
+          : Math.round((1 - totalChanges / (maxLines * 2)) * 100);
+
+        return {
+          legacyFile: args.legacyFile,
+          modernFile: args.modernFile,
+          addedLines: added,
+          removedLines: removed,
+          similarity: `${similarity}%`,
+          diff: diff.slice(0, 200).join('\n'), // Cap at 200 diff lines
+        };
+      } catch (err: any) {
+        return { error: err.message };
+      }
+    }
+  },
+
+  // ── find-migration-session ───────────────────────────────────────────────
+  // Mirrors: MigrationSessionFinder (browser/migration-session-finder-tool.ts)
+  'find-migration-session': {
+    name: 'find-migration-session',
+    description: 'Scans all sessions to find incomplete migration sessions. Used for cross-session recovery on startup.',
+    parameters: { type: 'object', properties: {}, required: [] },
+    handler: async (_args: {}, context: ToolContext) => {
+      try {
+        const sessions = await SessionManager.listSessions();
+        const incomplete = sessions
+          .filter((s: any) => s.status !== 'complete' && s.status !== 'idle' && s.sessionId !== context.sessionId)
+          .map((s: any) => ({
+            sessionId: s.sessionId,
+            status: s.status,
+            phase: s.phases?.find((p: any) => p.status === 'active')?.label || 'Unknown',
+            lastAction: s.currentFile || '',
+            timestamp: s.startedAt || '',
+          }));
+        return { sessions: incomplete, found: incomplete.length };
+      } catch {
+        return { sessions: [], found: 0, note: 'Session listing not available.' };
+      }
     }
   },
 

@@ -136,4 +136,29 @@ export class SessionManager {
     await fs.ensureDir(path.dirname(logsPath));
     await fs.writeJson(logsPath, logs, { spaces: 2 });
   }
+
+  /**
+   * Lists all sessions in the sessions directory.
+   * Returns an array of MigrationSession objects for all sessions found.
+   */
+  static async listSessions(): Promise<MigrationSession[]> {
+    try {
+      if (!(await fs.pathExists(SESSIONS_DIR))) return [];
+      const dirs = await fs.readdir(SESSIONS_DIR);
+      const sessions: MigrationSession[] = [];
+      for (const dir of dirs) {
+        const sessionPath = path.join(SESSIONS_DIR, dir, 'session.json');
+        if (await fs.pathExists(sessionPath)) {
+          try {
+            const session = await fs.readJson(sessionPath);
+            sessions.push(session);
+          } catch { /* skip corrupted sessions */ }
+        }
+      }
+      return sessions;
+    } catch {
+      return [];
+    }
+  }
 }
+

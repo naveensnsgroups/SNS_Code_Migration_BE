@@ -58,6 +58,15 @@ export interface FileNode {
   language?: string;
 }
 
+export interface TokenUsage {
+  inputTokens: number;
+  outputTokens: number;
+  totalTokens: number;
+  estimatedCost: number;
+  provider?: string;
+  model?: string;
+}
+
 export interface MigrateStartRequest {
   sessionId: string;
   targetStack: TargetStack;
@@ -73,10 +82,23 @@ export interface MigrateStartRequest {
     huggingface?: string;
   };
   agentsConfig?: any;
+  // AI Config panel state — saved to session and used by orchestrator/agents
+  toolsConfig?: Record<string, boolean>;                  // tool enablement map
+  aliasesConfig?: Record<string, string>;                 // alias → resolved model string
+  promptFragments?: Record<string, string>;               // fragment id → custom text
 }
 
 export interface SSEEvent {
-  type: 'log' | 'progress' | 'phase_change' | 'file_migrated' | 'complete' | 'error' | 'heartbeat';
+  type:
+    | 'log'
+    | 'progress'
+    | 'phase_change'
+    | 'file_migrated'
+    | 'complete'
+    | 'error'
+    | 'heartbeat'
+    | 'token_usage'    // Real token counts broadcast from AgentExecutor
+    | 'todo_update';   // Per-file progress from todoWrite tool
   data: any;
   timestamp: string;
 }

@@ -2,7 +2,7 @@ import { spawn, ChildProcess } from 'child_process';
 
 interface CommandOptions {
   cwd: string;
-  onLog: (message: string, isError: boolean) => void;
+  onLog?: (message: string, isError: boolean) => void;
   timeoutMs?: number;
 }
 
@@ -19,7 +19,7 @@ export class ShellExecutor {
     options: CommandOptions
   ): Promise<{ code: number; stdout: string; stderr: string }> {
     return new Promise((resolve, reject) => {
-      options.onLog(`$ ${command}`, false);
+    options.onLog?.(`$ ${command}`, false);
 
       // Windows requires shell: true to resolve commands like 'npm' or 'npx'
       const child = spawn(command, {
@@ -39,7 +39,7 @@ export class ShellExecutor {
       if (options.timeoutMs) {
         timeoutTimer = setTimeout(() => {
           if (!isSettled) {
-            options.onLog(`[Timeout] Command exceeded limit of ${options.timeoutMs}ms. Terminating.`, true);
+            options.onLog?.(`[Timeout] Command exceeded limit of ${options.timeoutMs}ms. Terminating.`, true);
             this.kill(sessionId);
             isSettled = true;
             reject(new Error(`Command timed out after ${options.timeoutMs}ms`));
@@ -56,7 +56,7 @@ export class ShellExecutor {
         const lines = str.split(/\r?\n/);
         for (const line of lines) {
           if (line.trim()) {
-            options.onLog(line, false);
+            options.onLog?.(line, false);
           }
         }
       });
@@ -69,7 +69,7 @@ export class ShellExecutor {
         const lines = str.split(/\r?\n/);
         for (const line of lines) {
           if (line.trim()) {
-            options.onLog(line, true);
+            options.onLog?.(line, true);
           }
         }
       });
@@ -80,7 +80,7 @@ export class ShellExecutor {
         if (timeoutTimer) clearTimeout(timeoutTimer);
         this.activeProcesses.delete(sessionId);
         
-        options.onLog(`[Command execution error]: ${err.message}`, true);
+        options.onLog?.(`[Command execution error]: ${err.message}`, true);
         reject(err);
       });
 

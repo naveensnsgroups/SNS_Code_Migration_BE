@@ -6,10 +6,17 @@ import path from 'path';
 
 const router = Router();
 
+// Stage-1 reports that live in modernPath (not legacyPath)
+const MODERN_ONLY_FILES = ['Stage1_Analysis.md', 'migration-plan.md'];
+
 /**
  * GET /api/file
  * Query: sessionId, path
- * Returns legacy content and modern content side-by-side
+ * Returns legacy content and modern content side-by-side.
+ *
+ * Special case: Stage1_Analysis.md and migration-plan.md are written by the agent
+ * to modernPath. When the Explorer clicks them, serve the modernPath content as
+ * the primary content (not legacyPath which won't have them).
  */
 router.get('/', async (req: Request, res: Response, next: NextFunction) => {
   try {
@@ -26,6 +33,40 @@ router.get('/', async (req: Request, res: Response, next: NextFunction) => {
       return;
     }
 
+    const fileName = path.basename(relativePath as string);
+
+    // ── Special Case: Stage-1 report files ──────────────────────────────────
+    // These files are written by the agent to modernPath, NOT legacyPath.
+    if (MODERN_ONLY_FILES.includes(fileName)) {
+      // Try modernPath first (primary), then relativePath as absolute fallback
+      let content = '';
+      let found = false;
+
+      const modernFilePath = path.join(session.modernPath, fileName);
+      if (await fs.pathExists(modernFilePath)) {
+        content = await fs.readFile(modernFilePath, 'utf-8');
+        found = true;
+      } else {
+        // Try using the relativePath directly in modernPath
+        try {
+          content = await readSessionFile(session.modernPath, relativePath as string);
+          found = true;
+        } catch {
+          content = `# ${fileName}\n\nThis file has not been generated yet. Run the migration pipeline to generate it.`;
+        }
+      }
+
+      res.json({
+        content,
+        modernContent: null,
+        language: 'markdown',
+        isModernReport: true,
+        found,
+      });
+      return;
+    }
+
+    // ── Normal Case: Legacy source files ────────────────────────────────────
     // Read legacy file content
     let legacyContent = '';
     try {

@@ -16,7 +16,10 @@ const __dirname = path.dirname(__filename);
  */
 router.post('/start', async (req: Request, res: Response, next: NextFunction) => {
   try {
-    const { sessionId, targetStack, apiKey, apiKeys, agentsConfig, localOutputPath } = req.body as MigrateStartRequest;
+    const {
+      sessionId, targetStack, apiKey, apiKeys, agentsConfig, localOutputPath,
+      toolsConfig, aliasesConfig, promptFragments
+    } = req.body as MigrateStartRequest;
 
     if (!sessionId || !targetStack || !apiKey) {
       res.status(400).json({ error: 'Missing required parameters: sessionId, targetStack, and apiKey are required.', code: 'BAD_REQUEST' });
@@ -36,6 +39,15 @@ router.post('/start', async (req: Request, res: Response, next: NextFunction) =>
       await SessionManager.addLog(sessionId, `Modern output workspace set to custom local folder: ${targetModernPath}`, 'info');
     }
 
+    // Save AI config settings to session (used by orchestrator + agents)
+    if (toolsConfig || aliasesConfig || promptFragments) {
+      await SessionManager.updateSession(sessionId, {
+        ...(toolsConfig && { toolsConfig }),
+        ...(aliasesConfig && { aliasesConfig }),
+        ...(promptFragments && { promptFragments }),
+      });
+    }
+
     // Launch background worker without blocking the HTTP response
     MigrationOrchestrator.startMigration(sessionId, targetStack, apiKey, apiKeys, agentsConfig);
 
@@ -44,6 +56,7 @@ router.post('/start', async (req: Request, res: Response, next: NextFunction) =>
     next(err);
   }
 });
+
 
 /**
  * POST /api/migrate/stop

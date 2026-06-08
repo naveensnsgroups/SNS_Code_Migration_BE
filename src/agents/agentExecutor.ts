@@ -1,137 +1,273 @@
-import { AIService, ChatMessage } from '../ai/provider.js';
-import { TOOLS_REGISTRY, ToolDefinition, ToolContext } from '../tools/registry.js';
+// =============================================================================
+//  agentExecutor.ts — SNS IDE Standard Agent Tool Loop (Streaming)
+//
+//  Mirrors: snside AbstractModeAwareChatAgent invoke() + sendLlmRequest() pattern
+//
+//  Key changes from old implementation:
+//  1. Messages are LanguageModelMessage[] (typed, not plain {role, content})
+//  2. Tool handlers called with (arg_string: string, ctx) — raw JSON string
+//  3. tool_use → tool_result message pairs built correctly
+//  4. Uses GeminiProvider.request() streaming instead of generateCompletion()
+//  5. Streams text chunks via SSE as they arrive (token by token)
+//  6. Real token counts from UsageResponsePart (not estimates mid-loop)
+//  7. Token usage broadcast on every turn (not just every 5)
+// =============================================================================
 
-// ─────────────────────────────────────────────────────────────────────────────
-//  AgentExecutor — Sub-Agent Tool Loop
-//
-//  Runs an LLM in a tool-call loop, feeding tool results back into the
-//  conversation until the model produces a final text response (no tool calls).
-//
-//  This mirrors the snside AbstractModeAwareChatAgent invoke() loop pattern:
-//  - Send messages to LLM
-//  - If LLM returns tool calls: execute them, append results, loop
-//  - If LLM returns text with no tool calls: return that as the final answer
-//  - If max iterations reached: return the last text response gracefully
-//    (do NOT throw — the agent may have written files and that is valid success)
-// ─────────────────────────────────────────────────────────────────────────────
+import {
+  LanguageModelMessage,
+  TextMessage,
+  ToolUseMessage,
+  ToolResultMessage,
+  LanguageModelStreamPart,
+  makeToolErrorResult,
+  makeToolTextResult,
+  isTextResponsePart,
+  isUsageResponsePart,
+  isToolCallResponsePart,
+  ToolCallResult,
+  UserRequest,
+} from '../types/language-model.js';
+import { ToolRequest, ToolContext } from '../types/tool.js';
+import { EventBroadcaster } from '../routes/stream.js';
+import { SessionManager } from '../session/sessionManager.js';
+import { TokenUsage } from '../types.js';
+import { GeminiProvider } from '../ai/gemini.js';
+
+// ── Per-provider cost table (USD per 1M tokens) ───────────────────────────────
+const COST_TABLE: Record<string, [number, number]> = {
+  'claude-opus-4':      [15,    75],
+  'claude-opus-4-5':    [15,    75],
+  'claude-sonnet-4':    [3,     15],
+  'claude-sonnet-4-5':  [3,     15],
+  'claude-3-5-sonnet':  [3,     15],
+  'claude-3-opus':      [15,    75],
+  'claude-3-haiku':     [0.25,  1.25],
+  'gpt-4o':             [2.5,   10],
+  'gpt-4o-mini':        [0.15,  0.6],
+  'gpt-4-turbo':        [10,    30],
+  'gpt-3.5-turbo':      [0.5,   1.5],
+  'gemini-2.5-pro':     [1.25,  10],
+  'gemini-2.0-flash':   [0.075, 0.3],
+  'gemini-1.5-pro':     [1.25,  5],
+  'gemini-1.5-flash':   [0.075, 0.3],
+  'default':            [1,     3],
+};
+
+function estimateCost(inputTokens: number, outputTokens: number, model: string): number {
+  const entry = Object.entries(COST_TABLE).find(([key]) => model.toLowerCase().includes(key));
+  const [inCostPerM, outCostPerM] = entry ? entry[1] : COST_TABLE['default'];
+  return Math.round(((inputTokens / 1_000_000) * inCostPerM + (outputTokens / 1_000_000) * outCostPerM) * 10000) / 10000;
+}
+
+// ── Streaming Agent Executor ──────────────────────────────────────────────────
 
 export class AgentExecutor {
   /**
-   * Executes a task using an AIService and a set of tools.
-   * Runs a tool-call loop until the model produces a final response or max iterations reached.
+   * Executes a task using the GeminiProvider streaming API.
    *
-   * @param aiService      — The LLM provider service
-   * @param prompt         — The initial user instruction
-   * @param systemPrompt   — The agent's system persona and rules
-   * @param enabledTools   — The specific tools available to this agent in this phase
-   * @param context        — Session context: sessionId, legacyPath, modernPath, onLog
-   * @param maxIterations  — Maximum LLM turns before stopping (default: 40)
-   * @returns              — The final text response from the LLM
+   * Message chain (SNS IDE standard):
+   *   [system:text] → [user:text] → [ai:tool_use] → [user:tool_result] → [ai:tool_use] → ... → [ai:text]
+   *
+   * @param provider      GeminiProvider instance
+   * @param systemPrompt  Agent system persona and rules
+   * @param userPrompt    The task instruction for this run
+   * @param tools         ToolRequest[] available to this agent (SNS IDE standard)
+   * @param context       Session context (sessionId, legacyPath, modernPath, onLog)
+   * @param maxIterations Safety limit for tool call loops (default: 40)
+   * @param modelName     Model identifier for cost calculation
    */
   static async execute(
-    aiService: AIService,
-    prompt: string,
+    provider: GeminiProvider,
     systemPrompt: string,
-    enabledTools: ToolDefinition[],
+    userPrompt: string,
+    tools: ToolRequest[],
     context: ToolContext,
-    maxIterations = 40
+    maxIterations = 40,
+    modelName = ''
   ): Promise<string> {
-    const messages: ChatMessage[] = [];
-
-    // Initialize conversation
-    messages.push({ role: 'system', content: systemPrompt });
-    messages.push({ role: 'user', content: prompt });
+    // ── Initialize message chain (SNS IDE LanguageModelMessage[]) ─────────
+    const messages: LanguageModelMessage[] = [
+      { actor: 'system', type: 'text', text: systemPrompt } as TextMessage,
+      { actor: 'user',   type: 'text', text: userPrompt   } as TextMessage,
+    ];
 
     let iteration = 0;
     let lastTextResponse = '';
+    let totalInputTokens = 0;
+    let totalOutputTokens = 0;
 
     while (iteration < maxIterations) {
       iteration++;
       context.onLog?.(`[AI Request] Submitting query to LLM (Turn ${iteration})...`, 'info');
 
-      const response = await aiService.generateCompletion(messages, undefined, enabledTools);
+      const userRequest: UserRequest = {
+        messages: [...messages],
+        tools,
+        sessionId: context.sessionId,
+        requestId: `req_${context.sessionId}_t${iteration}`,
+        modelName,
+      };
 
-      // Capture any text the model outputs on this turn
-      if (response.text) {
-        lastTextResponse = response.text;
-      }
+      // ── Stream this turn ───────────────────────────────────────────────
+      const response = await provider.request(userRequest, context);
 
-      // ── Final Answer — no tool calls ──────────────────────────────────────
-      if (!response.toolCalls || response.toolCalls.length === 0) {
-        context.onLog?.(`[AI Response] Received final completion after ${iteration} turn(s).`, 'success');
-        return response.text || lastTextResponse;
-      }
+      // Collect streaming output for this turn
+      let turnText = '';
+      // id → { name, argsJson }
+      const pendingToolCalls = new Map<string, { id: string; name: string; args: string }>();
+      let turnInputTokens = 0;
+      let turnOutputTokens = 0;
 
-      // ── Tool Calls — execute and loop back ────────────────────────────────
-      // Append the assistant's intent (tool calls) to the conversation history
-      messages.push({
-        role: 'assistant',
-        content: response.text || '',
-        toolCalls: response.toolCalls
-      });
-
-      // Execute each tool call requested by the LLM
-      for (const toolCall of response.toolCalls) {
-        const toolName = toolCall.function.name;
-        let args: any = {};
-
-        try {
-          args = JSON.parse(toolCall.function.arguments || '{}');
-        } catch (e) {
-          context.onLog?.(
-            `[AgentExecutor] Failed to parse arguments for tool "${toolName}": ${toolCall.function.arguments}`,
-            'error'
-          );
-        }
-
-        // Look up the tool in the registry
-        const registeredTool = TOOLS_REGISTRY[toolName];
-
-        if (!registeredTool) {
-          const errorMsg = `Tool "${toolName}" is not registered. Available tools: ${enabledTools.map(t => t.name).join(', ')}`;
-          context.onLog?.(`[AgentExecutor] Warning: ${errorMsg}`, 'warning');
-          messages.push({
-            role: 'tool',
-            toolCallId: toolCall.id,
-            name: toolName,
-            content: JSON.stringify({ error: errorMsg })
+      for await (const part of response.stream) {
+        if (isTextResponsePart(part)) {
+          turnText += part.content;
+          // Stream text token-by-token to SSE terminal
+          EventBroadcaster.broadcast(context.sessionId, 'log', {
+            message: part.content,
+            level: 'stream',  // Frontend renders this as streaming text
+            phase: 'agent'
           });
-          continue;
-        }
-
-        context.onLog?.(`🔧 [Tool Call] Executing tool "${toolName}"...`, 'info');
-
-        try {
-          const result = await registeredTool.handler(args, context);
-          context.onLog?.(`✅ [Tool Response] Completed "${toolName}" successfully.`, 'success');
-
-          messages.push({
-            role: 'tool',
-            toolCallId: toolCall.id,
-            name: toolName,
-            content: JSON.stringify(result)
-          });
-        } catch (err: any) {
-          const errMsg = err.message || 'Unknown tool execution error';
-          context.onLog?.(`❌ [Tool Error] Failed executing "${toolName}": ${errMsg}`, 'error');
-
-          messages.push({
-            role: 'tool',
-            toolCallId: toolCall.id,
-            name: toolName,
-            content: JSON.stringify({ error: errMsg })
-          });
+        } else if (isUsageResponsePart(part)) {
+          turnInputTokens  = part.input_tokens;
+          turnOutputTokens = part.output_tokens;
+        } else if (isToolCallResponsePart(part)) {
+          for (const tc of part.tool_calls) {
+            if (tc.id && tc.function?.name && !tc.finished) {
+              // New tool call announced
+              pendingToolCalls.set(tc.id, {
+                id: tc.id,
+                name: tc.function.name,
+                args: tc.function.arguments ?? '{}',
+              });
+            } else if (tc.id && tc.finished && pendingToolCalls.has(tc.id)) {
+              // Tool completed inside the stream (recursive Gemini loop handled it)
+              // The result is already fed back — just log it
+              const existing = pendingToolCalls.get(tc.id)!;
+              context.onLog?.(`✅ [Tool Response] ${existing.name} completed (in-stream).`, 'success');
+              pendingToolCalls.delete(tc.id);
+            }
+          }
         }
       }
+
+      // ── Accumulate tokens ──────────────────────────────────────────────
+      totalInputTokens  += turnInputTokens;
+      totalOutputTokens += turnOutputTokens;
+
+      // Broadcast live token update every turn
+      const estimatedCost = estimateCost(totalInputTokens, totalOutputTokens, modelName);
+      EventBroadcaster.broadcast(context.sessionId, 'token_usage', {
+        inputTokens:  totalInputTokens,
+        outputTokens: totalOutputTokens,
+        totalTokens:  totalInputTokens + totalOutputTokens,
+        estimatedCost,
+        model: modelName,
+      } satisfies TokenUsage);
+
+      if (turnText) lastTextResponse = turnText;
+
+      // ── If there are pending tool calls (not handled by stream recursion) ─
+      // This path handles non-Gemini providers / fallback cases
+      if (pendingToolCalls.size > 0) {
+        // Append AI's tool_use messages to history
+        for (const tc of pendingToolCalls.values()) {
+          let parsedInput: unknown = {};
+          try { parsedInput = JSON.parse(tc.args); } catch { /* ignore */ }
+
+          messages.push({
+            actor: 'ai',
+            type: 'tool_use',
+            id: tc.id,
+            name: tc.name,
+            input: parsedInput,
+          } as ToolUseMessage);
+        }
+
+        // Execute each tool and append tool_result messages
+        for (const tc of pendingToolCalls.values()) {
+          const tool = tools.find(t => t.name === tc.name);
+          let result: ToolCallResult;
+
+          if (!tool) {
+            const errMsg = `Tool '${tc.name}' not registered. Available: ${tools.map(t => t.name).join(', ')}`;
+            context.onLog?.(`⚠️ [AgentExecutor] ${errMsg}`, 'warning');
+            result = makeToolErrorResult(errMsg, 'tool-not-available');
+          } else {
+            context.onLog?.(`🔧 [Tool Call] Executing tool "${tc.name}"...`, 'info');
+            try {
+              // ← SNS IDE standard: pass raw JSON arg_string
+              result = await tool.handler(tc.args, { ...context, toolCallId: tc.id });
+              context.onLog?.(`✅ [Tool Response] Completed "${tc.name}" successfully.`, 'success');
+            } catch (err: unknown) {
+              const errMsg = err instanceof Error ? err.message : 'Unknown tool execution error';
+              context.onLog?.(`❌ [Tool Error] Failed executing "${tc.name}": ${errMsg}`, 'error');
+              result = makeToolErrorResult(errMsg);
+            }
+          }
+
+          // Append tool_result to the message chain
+          messages.push({
+            actor: 'user',
+            type: 'tool_result',
+            tool_use_id: tc.id,
+            name: tc.name,
+            content: result,
+            is_error: false,
+          } as ToolResultMessage);
+        }
+
+        // Loop back for the next LLM turn with tool results
+        continue;
+      }
+
+      // ── Final Answer — no more pending tool calls ──────────────────────
+      context.onLog?.(`[AI Response] Final completion after ${iteration} turn(s).`, 'success');
+      await this.persistFinalTokenUsage(context.sessionId, totalInputTokens, totalOutputTokens, modelName);
+      return turnText || lastTextResponse;
     }
 
-    // ── Max Iterations Reached ────────────────────────────────────────────
-    // The agent may have already written output files (Stage1_Analysis.md) via write_file.
-    // Do NOT throw — return the last text response the model produced.
+    // ── Max Iterations ─────────────────────────────────────────────────────
     context.onLog?.(
-      `[AgentExecutor] Maximum ${maxIterations} iterations reached. Returning last response. The agent may have already written output files.`,
+      `[AgentExecutor] Max ${maxIterations} iterations reached. Agent may have written output files.`,
       'warning'
     );
-    return lastTextResponse || `Agent completed ${maxIterations} turns. Please check the output workspace for generated files.`;
+    await this.persistFinalTokenUsage(context.sessionId, totalInputTokens, totalOutputTokens, modelName);
+    return lastTextResponse || `Agent completed ${maxIterations} turns. Check output workspace for generated files.`;
+  }
+
+  // ── Persist final token usage to session.json ────────────────────────────
+  private static async persistFinalTokenUsage(
+    sessionId: string,
+    inputTokens: number,
+    outputTokens: number,
+    modelName: string
+  ): Promise<void> {
+    try {
+      const estimatedCost = estimateCost(inputTokens, outputTokens, modelName);
+      const tokenUsage: TokenUsage = {
+        inputTokens,
+        outputTokens,
+        totalTokens: inputTokens + outputTokens,
+        estimatedCost,
+        model: modelName,
+      };
+      EventBroadcaster.broadcast(sessionId, 'token_usage', tokenUsage);
+
+      const session = await SessionManager.getSession(sessionId);
+      if (session) {
+        const ex = session.tokenUsage;
+        await SessionManager.updateSession(sessionId, {
+          tokenUsage: {
+            inputTokens:   (ex?.inputTokens   ?? 0) + inputTokens,
+            outputTokens:  (ex?.outputTokens  ?? 0) + outputTokens,
+            totalTokens:   (ex?.totalTokens   ?? 0) + inputTokens + outputTokens,
+            estimatedCost: (ex?.estimatedCost ?? 0) + estimatedCost,
+            model: modelName,
+          }
+        });
+      }
+    } catch {
+      // Non-critical
+    }
   }
 }

@@ -1,43 +1,78 @@
-import { AIService } from '../ai/provider.js';
+// =============================================================================
+//  planner-agent.ts — Stage 1: Codebase Analysis Agent (Phase 1 ONLY)
+//
+//  Mirrors: snside FileAnalyzer sub-agent pattern
+//
+//  Goal: Fully understand and document the legacy codebase.
+//  Output: Stage1_Analysis.md written to modernPath.
+//
+//  Phase 2 (migration-plan.md) is a SEPARATE agent — not implemented here.
+//  This agent focuses exclusively on READING and UNDERSTANDING the legacy code.
+//
+//  Rules:
+//   - NO target stack context is passed to the LLM
+//   - NO "migrate to X" language in any prompt
+//   - Pure analysis only — write ONE output: Stage1_Analysis.md
+//   - Provider, model, API key resolved from session config (no hardcoding)
+//   - System prompt from prompts/analyzer-prompt.ts
+//   - Tool IDs from common/workspace-functions.ts via TOOLS_REGISTRY constants
+// =============================================================================
+
 import { DetectedStack, TargetStack } from '../types.js';
-import { TOOLS_REGISTRY, ToolContext } from '../tools/registry.js';
+import { toolRegistry } from '../core/tool-invocation-registry.js';
+import { ToolContext } from '../types/tool.js';
 import { AgentExecutor } from './agentExecutor.js';
+import { GeminiProvider } from '../ai/gemini.js';
 import { TaskContextManager } from '../session/taskContext.js';
+import { SessionManager } from '../session/sessionManager.js';
 import { ANALYZER_SYSTEM_PROMPT } from '../prompts/analyzer-prompt.js';
-import { PLANNER_SYSTEM_PROMPT } from '../prompts/planner-prompt.js';
+import { STAGE1_PLANNER_AGENT } from './agent-definitions.js';
 import fs from 'fs-extra';
 import path from 'path';
 
-// ─────────────────────────────────────────────────────────────────────────────
-//  PlannerAgent — Stage 1: Codebase Analysis and Migration Planning
-//
-//  Stage 1 runs two phases in sequence:
-//
-//  Phase 1 (FileAnalyzer sub-agent):
-//    Goal: Fully understand the legacy codebase — language, framework, structure,
-//    files, functions, business rules, dependencies, API contracts, DB ops.
-//    Output: Stage1_Analysis.md written to modernPath.
-//    Tools: Read-only workspace tools + write_file + task context memory.
-//    NO target stack context is passed. NO modern framework is mentioned.
-//    This is pure legacy codebase discovery and documentation.
-//
-//  Phase 2 (Planner sub-agent):
-//    Goal: Based on Phase 1 analysis, formulate the migration strategy and plan.
-//    Reads Stage1_Analysis.md and task context, then writes migration-plan.md.
-//    Tools: read only + write_file + task context.
-// ─────────────────────────────────────────────────────────────────────────────
+// ── Agent Configuration Constants ─────────────────────────────────────────────
+// These are named constants — never hardcoded inline in method calls.
+
+/** Maximum LLM turns for deep codebase analysis (large codebases need more turns). */
+const PHASE1_MAX_TURNS = 60;
+
+/** Output file name — defined once, referenced everywhere. */
+const PHASE1_OUTPUT_FILE = 'Stage1_Analysis.md';
+
+/** Alias key to resolve the reasoning model from session.aliasesConfig. */
+const REASONING_MODEL_ALIAS = 'reasoning-model';
+
+/** Custom prompt fragment ID for injecting user-defined system rules. */
+const CUSTOM_RULES_FRAGMENT_ID = 'system-agent-rules';
+
+// NOTE: toToolRequest() removed — all tools are now ToolRequest from the toolRegistry.
+// Use toolRegistry.getFunctions(...STAGE1_PLANNER_AGENT.functions) to get agent tools.
+
+// ── PlannerAgent ──────────────────────────────────────────────────────────────
 
 export class PlannerAgent {
   /**
-   * Runs Stage 1: codebase analysis (Phase 1) and migration plan (Phase 2).
+   * Runs Stage 1, Phase 1: Codebase Discovery and Analysis.
    *
-   * @param sessionId     — Active session ID
-   * @param legacyPath    — Path to the uploaded legacy source code (read-only)
-   * @param modernPath    — Path to the output workspace (Stage1_Analysis.md goes here)
-   * @param detectedStack — Heuristic-detected stack info from the initial scan
-   * @param targetStack   — Target modernization stack configuration
-   * @param aiService     — The LLM provider service
-   * @param onLog         — Streaming log callback for terminal output
+   * What this agent does:
+   *  1. Loads provider + model from session config (no hardcoding)
+   *  2. Builds tool list from STAGE1_PLANNER_AGENT.functions
+   *  3. Filters tools based on UI toolsConfig toggle state
+   *  4. Runs AgentExecutor with ANALYZER_SYSTEM_PROMPT
+   *  5. Verifies Stage1_Analysis.md was written; writes fallback if not
+   *
+   * What this agent does NOT do:
+   *  - Does NOT write migration-plan.md (that is Phase 2 — a separate agent)
+   *  - Does NOT mention the target stack to the LLM
+   *  - Does NOT hardcode any model names, API keys, or prompt strings
+   *
+   * @param sessionId      Current migration session ID
+   * @param legacyPath     Absolute path to the legacy project (read-only)
+   * @param modernPath     Absolute path to the output folder (writes go here)
+   * @param detectedStack  Stack detected by ScannerAgent — passed as context only
+   * @param targetStack    User's chosen target (used only for model resolution)
+   * @param _aiServiceLegacy  Kept for backward compat — provider resolved from session
+   * @param onLog          Log callback → SSE terminal stream
    */
   static async run(
     sessionId: string,
@@ -45,185 +80,136 @@ export class PlannerAgent {
     modernPath: string,
     detectedStack: DetectedStack,
     targetStack: TargetStack,
-    aiService: AIService,
+    /** @deprecated Provider is now resolved from session.apiKeys + session.aliasesConfig. */
+    _aiServiceLegacy: unknown,
     onLog?: (message: string, level?: 'info' | 'success' | 'error' | 'warning') => void
   ): Promise<string> {
-    onLog?.('Initializing autonomous Stage 1 Agent Pipeline...', 'info');
+    onLog?.('🚀 Initializing Stage 1: Codebase Analysis Agent...', 'info');
 
+    // ── Load session config (no hardcoded values below this line) ─────────
+    const session = await SessionManager.getSession(sessionId);
+    const toolsConfig:   Record<string, boolean> = (session as any)?.toolsConfig   ?? {};
+    const promptFragments: Record<string, string> = (session as any)?.promptFragments ?? {};
+    const aliasesConfig: Record<string, string>  = (session as any)?.aliasesConfig  ?? {};
+
+    // Resolve model: aliasesConfig['reasoning-model'] → targetStack.model → fallback from agent def
+    const modelName = targetStack.model;
+    const resolvedModel =
+      aliasesConfig[REASONING_MODEL_ALIAS] ??
+      modelName ??
+      STAGE1_PLANNER_AGENT.languageModelRequirements[0]?.identifier?.replace('alias:', '') ??
+      '';
+
+    // Resolve API key: session.apiKey (set by orchestrator from request body)
+    const apiKey = (session as any)?.apiKey ?? '';
+
+    // Build the streaming GeminiProvider (SNS IDE standard)
+    const provider = new GeminiProvider(resolvedModel, apiKey);
+
+    // ── Tool context ───────────────────────────────────────────────────────
     const context: ToolContext = {
       sessionId,
       legacyPath,
       modernPath,
-      onLog: (msg, lvl) => onLog?.(msg, lvl)
+      onLog: (msg, lvl) => onLog?.(msg, lvl),
     };
 
-    // Load active phase from task context memory (supports resume after restart)
-    let taskContext = await TaskContextManager.getContext(sessionId);
-    let activePhase = taskContext.active_phase || '1';
+    // ── Build ToolRequest[] from STAGE1_PLANNER_AGENT.functions ─────────────
+    // Uses the agent definition's declared function list — no inline tool names.
+    // Applies toolsConfig toggle filter from the AI Config panel.
+    // toolRegistry.getFunctions() returns ToolRequest[] — SNS IDE standard.
+    const allPhase1Tools = toolRegistry
+      .getFunctions(...STAGE1_PLANNER_AGENT.functions)
+      .filter(t => toolsConfig[t.name] !== false);
 
-    let resultSummary = '';
+    // ── Resume support: load active phase from task context ───────────────
+    const taskContext = await TaskContextManager.getContext(sessionId);
+    const activePhase = taskContext.active_phase || '1';
 
-    // ────────────────────────────────────────────────────────────────────────
-    //  PHASE 1 — Codebase Discovery and Analysis (FileAnalyzer sub-agent)
-    //
-    //  Tools available (aligned with snside file-analyzer-prompt-template.ts):
-    //
-    //  WORKSPACE EXPLORATION (read-only — legacy source):
-    //    getWorkspaceDirectoryStructure  — full directory tree
-    //    getWorkspaceFileList            — list files in a directory
-    //    getFileContent                  — read file with optional offset/limit
-    //    searchInWorkspace               — full-text search across all files
-    //    findFilesByPattern              — glob pattern file finder
-    //    getDependencyTree               — parse all manifest files (npm, pip, maven, etc.)
-    //    getFileDiagnostics              — placeholder (no LSP in BE mode)
-    //    batch-read-files                — read multiple files in one call
-    //
-    //  PERSISTENT MEMORY (task context — survives restart):
-    //    get_task_context                — read all saved state
-    //    edit_task_context               — save state, file-index, rules-by-file
-    //
-    //  OUTPUT WRITING:
-    //    write_file                      — writes to modernPath (Stage1_Analysis.md)
-    //
-    //  NOT included in Phase 1:
-    //    run_command — no shell commands during analysis
-    //    list_directory / read_file / search_code — legacy names, use new names above
-    // ────────────────────────────────────────────────────────────────────────
-    if (activePhase === '1') {
-      onLog?.('🔎 Phase 1: Starting Codebase Discovery & Analysis...', 'info');
-
-      // Build the initial user prompt for the FileAnalyzer sub-agent.
-      // IMPORTANT: NO target stack context here. No mention of "migrate to X".
-      // The agent must discover and document the legacy codebase purely.
-      const analyzerPrompt = buildAnalyzerPrompt(legacyPath, detectedStack);
-
-      // Tools available to Phase 1 FileAnalyzer — mirrors snside file-analyzer agent tools
-      const phase1Tools = [
-        // Workspace exploration (read-only)
-        TOOLS_REGISTRY.getWorkspaceDirectoryStructure,
-        TOOLS_REGISTRY.getWorkspaceFileList,
-        TOOLS_REGISTRY.getFileContent,
-        TOOLS_REGISTRY.searchInWorkspace,
-        TOOLS_REGISTRY.findFilesByPattern,
-        TOOLS_REGISTRY.getDependencyTree,
-        TOOLS_REGISTRY.getFileDiagnostics,
-        TOOLS_REGISTRY['batch-read-files'],
-        // Persistent memory
-        TOOLS_REGISTRY.get_task_context,
-        TOOLS_REGISTRY.edit_task_context,
-        // Output
-        TOOLS_REGISTRY.write_file,
-      ];
-
-      resultSummary = await AgentExecutor.execute(
-        aiService,
-        analyzerPrompt,
-        ANALYZER_SYSTEM_PROMPT,
-        phase1Tools,
-        context,
-        60   // Allow up to 60 turns for thorough analysis of large codebases
-      );
-
-      // ── Fallback: If Stage1_Analysis.md was not written by the agent ────
-      // The agent should have called write_file itself, but if not (e.g. small
-      // codebase where it returned text directly), write the response as fallback.
-      const analysisFilePath = path.join(modernPath, 'Stage1_Analysis.md');
-      if (!(await fs.pathExists(analysisFilePath))) {
-        onLog?.('⚠️ Stage1_Analysis.md was not written by the agent. Writing fallback content...', 'warning');
-        await fs.ensureDir(path.dirname(analysisFilePath));
-        await fs.writeFile(analysisFilePath, resultSummary || '# Stage 1 Analysis\n\nAgent did not produce output.', 'utf-8');
-      }
-
-      // Advance phase to 2
-      await TaskContextManager.updateContext(sessionId, { active_phase: '2' });
-      taskContext = await TaskContextManager.getContext(sessionId);
-      activePhase = '2';
-      onLog?.('🔎 Phase 1 analysis successfully written to Stage1_Analysis.md.', 'success');
+    if (activePhase !== '1') {
+      onLog?.(`ℹ️ Task context shows phase '${activePhase}' — analysis already completed. Skipping.`, 'info');
+      return `Stage 1 Phase 1 already completed (phase: ${activePhase}).`;
     }
 
-    // ────────────────────────────────────────────────────────────────────────
-    //  PHASE 2 — Formulating Modernization Strategy (Planner sub-agent)
-    //
-    //  Phase 2 reads Stage1_Analysis.md and task context from Phase 1,
-    //  then writes a detailed migration-plan.md.
-    //  Tools: read only + write_file + task context.
-    // ────────────────────────────────────────────────────────────────────────
-    if (activePhase === '2') {
-      onLog?.('⚙️ Phase 2: Formulating Modernization Strategy and Migration Plan...', 'info');
+    // ── Phase 1: Codebase Discovery and Analysis ───────────────────────────
+    onLog?.('🔎 Phase 1: Starting Codebase Discovery & Analysis...', 'info');
 
-      const plannerPrompt = `Based on the legacy analysis from Phase 1 (see Stage1_Analysis.md and task context), 
-formulate a detailed modernization strategy and file-by-file refactoring plan.
-Read Stage1_Analysis.md using getFileContent with file="Stage1_Analysis.md", then load the task context 
-to access the rules-by-file and file-index.
+    // System prompt: base from prompts file + optional custom rules fragment
+    const customRules = promptFragments[CUSTOM_RULES_FRAGMENT_ID];
+    const systemPrompt = customRules
+      ? `${ANALYZER_SYSTEM_PROMPT}\n\n<custom_rules>\n${customRules}\n</custom_rules>`
+      : ANALYZER_SYSTEM_PROMPT;
 
-The target modernization stack selected by the user is:
-  - Language: ${targetStack.language}
-  - Framework: ${targetStack.framework}
-  - Database: ${targetStack.database}
-  - Testing Framework: ${targetStack.testFramework}
+    // User prompt: built dynamically from detectedStack — no target stack mentioned
+    const userPrompt = buildAnalyzerUserPrompt(legacyPath, detectedStack);
 
-Write the final plan to "migration-plan.md" in the output workspace.`;
+    const resultText = await AgentExecutor.execute(
+      provider,
+      systemPrompt,
+      userPrompt,
+      allPhase1Tools,
+      context,
+      PHASE1_MAX_TURNS,
+      resolvedModel
+    );
 
-      const phase2Tools = [
-        TOOLS_REGISTRY.getFileContent,
-        TOOLS_REGISTRY.get_task_context,
-        TOOLS_REGISTRY.edit_task_context,
-        TOOLS_REGISTRY.write_file,
-      ];
-
-      const planSummary = await AgentExecutor.execute(
-        aiService,
-        plannerPrompt,
-        PLANNER_SYSTEM_PROMPT,
-        phase2Tools,
-        context,
-        40
+    // ── Verify output was written ──────────────────────────────────────────
+    const outputFilePath = path.join(modernPath, PHASE1_OUTPUT_FILE);
+    if (!(await fs.pathExists(outputFilePath))) {
+      onLog?.(`⚠️ ${PHASE1_OUTPUT_FILE} was not written by the agent. Writing fallback...`, 'warning');
+      await fs.ensureDir(path.dirname(outputFilePath));
+      await fs.writeFile(
+        outputFilePath,
+        resultText || `# Stage 1 Analysis\n\nAgent did not produce structured output.`,
+        'utf-8'
       );
-
-      // ── Fallback for migration-plan.md ───────────────────────────────────
-      const planFilePath = path.join(modernPath, 'migration-plan.md');
-      if (!(await fs.pathExists(planFilePath))) {
-        onLog?.('⚠️ migration-plan.md was not written by the agent. Writing fallback content...', 'warning');
-        await fs.ensureDir(path.dirname(planFilePath));
-        await fs.writeFile(planFilePath, planSummary || '# Migration Plan\n\nAgent did not produce output.', 'utf-8');
-      }
-
-      await TaskContextManager.updateContext(sessionId, { active_phase: 'complete' });
-      resultSummary = resultSummary ? `${resultSummary}\n\n${planSummary}` : planSummary;
-      onLog?.('⚙️ Phase 2 migration plan successfully written to migration-plan.md.', 'success');
     }
 
-    return resultSummary;
+    // ── Mark phase complete in task context ───────────────────────────────
+    await TaskContextManager.updateContext(sessionId, { active_phase: 'phase1-complete' });
+    onLog?.(`✅ Phase 1 analysis complete. ${PHASE1_OUTPUT_FILE} written to output workspace.`, 'success');
+
+    return resultText;
   }
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-//  buildAnalyzerPrompt
-//  Constructs the user-facing prompt for the FileAnalyzer sub-agent.
-//  KEY RULE: NO target stack. NO "migrate to X". Just: analyze the legacy code.
-// ─────────────────────────────────────────────────────────────────────────────
-function buildAnalyzerPrompt(legacyPath: string, detectedStack: DetectedStack): string {
+// ── User Prompt Builder ───────────────────────────────────────────────────────
+// Constructs the user-facing task prompt for the FileAnalyzer sub-agent.
+//
+// KEY RULES:
+//  - NO target stack mentioned — pure legacy analysis only
+//  - NO "migrate to X" language
+//  - Passes detectedStack as approximate context (LLM must verify by reading files)
+
+function buildAnalyzerUserPrompt(legacyPath: string, detectedStack: DetectedStack): string {
   return `Please perform a complete static analysis of the legacy project located at "${legacyPath}".
 
 Your task is to fully understand and document this codebase as it currently exists.
-Do NOT suggest any changes or target technologies.
+Do NOT suggest any changes or target technologies. Do NOT mention a migration target.
 
 Initial heuristic scan detected:
-  - Language: ${detectedStack.language}
-  - Framework: ${detectedStack.framework}
-  - Database: ${detectedStack.database}
-  - Package Manager: ${detectedStack.packageManager}
-  - File Count: ${detectedStack.fileCount}
+  - Language:         ${detectedStack.language}
+  - Framework:        ${detectedStack.framework}
+  - Database:         ${detectedStack.database}
+  - Package Manager:  ${detectedStack.packageManager}
+  - File Count:       ${detectedStack.fileCount}
 
 These detections may be approximate — verify them by reading the actual manifest files.
 
 Follow your system prompt workflow exactly:
   1. Load task context to check for any prior progress (LAST_FILE_ANALYZED, file-index).
-  2. Call getWorkspaceDirectoryStructure to understand the project layout.
-  3. Run Language Profile Detection: find all manifest files via findFilesByPattern.
-  4. Build the MANDATORY_FILE_INDEX of all source files and save it via edit_task_context.
-  5. Read and analyze every file in the index (use batch-read-files when possible).
-  6. Build BUSINESS_RULES_BY_FILE per-file map and save via edit_task_context.
-  7. Build DEPENDENCY_MAP via getDependencyTree.
-  8. Write the comprehensive "Stage1_Analysis.md" report via write_file.`;
+  2. Call getEnvironmentInfo to detect runtime versions and system environment.
+  3. Call getGitLog to identify high-churn files (migration risks) and dead code candidates.
+  4. Call getWorkspaceDirectoryStructure to understand the project layout.
+  5. Run Language Profile Detection: find all manifest files via findFilesByPattern.
+  6. Call scanAssetFiles for mandatory asset inventory.
+  7. Build the MANDATORY_FILE_INDEX of all source files and save it via edit_task_context.
+  8. For EACH file in the index:
+     a. Call extractFileSymbols to determine reading strategy (SMALL / MEDIUM / LARGE / ULTRA_LARGE).
+     b. Read the file according to the determined strategy.
+     c. Call todoWrite to mark it completed in the audit trail.
+     d. Every 10 files: call update-migration-dashboard with current progress %.
+  9. Build BUSINESS_RULES_BY_FILE per-file map and save via edit_task_context.
+  10. Build DEPENDENCY_MAP via getDependencyTree.
+  11. Write the comprehensive "${PHASE1_OUTPUT_FILE}" report via write_file.`;
 }

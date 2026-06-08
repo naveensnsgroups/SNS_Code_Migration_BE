@@ -1,6 +1,6 @@
 // ── Session Types for Express Backend ──────────────────────────────────────
 
-import { AIProvider, DetectedStack, FileNode, MigrationStatus, TargetStack } from '../types.js';
+import { DetectedStack, FileNode, MigrationStatus, TargetStack, TokenUsage } from '../types.js';
 
 export interface MigrationSession {
   sessionId: string;
@@ -32,6 +32,11 @@ export interface MigrationSession {
     huggingface?: string;
   };
   agentsConfig?: any;
+  // AI Config panel state
+  toolsConfig?: Record<string, boolean>;        // tool enablement map
+  aliasesConfig?: Record<string, string>;        // alias → resolved model string
+  promptFragments?: Record<string, string>;      // fragment id → custom prompt text
+  tokenUsage?: TokenUsage;                       // cumulative token counts for this session
 }
 
 export interface LogEntry {

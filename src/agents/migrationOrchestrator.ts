@@ -87,19 +87,44 @@ export class MigrationOrchestrator {
       session.apiKey
     );
 
-    // Helpers to check agent configuration dynamically
+    // Helpers to check agent configuration dynamically.
+    // agentsConfig can arrive as:
+    //   { "agent-id": { enabled, selectedModel } }  ← object from localStorage
+    //   [{ id, enabled, selectedModel }]             ← array (future format)
+    const resolveAgent = (agentId: string): any | undefined => {
+      if (!session.agentsConfig) return undefined;
+      if (Array.isArray(session.agentsConfig)) {
+        return session.agentsConfig.find((a: any) => a.id === agentId);
+      }
+      // Plain object keyed by agent ID
+      return (session.agentsConfig as Record<string, any>)[agentId];
+    };
+
     const isAgentEnabled = (agentId: string): boolean => {
-      if (!session.agentsConfig) return true;
-      const agent = (session.agentsConfig as any[]).find(a => a.id === agentId);
-      return agent ? !!agent.enabled : true;
+      const agent = resolveAgent(agentId);
+      if (agent === undefined) return true; // not in config → enabled by default
+      return agent.enabled !== false;
     };
 
     const getAgentService = (agentId: string, defaultAi: any): any => {
-      if (!session.agentsConfig) return defaultAi;
-      const agent = (session.agentsConfig as any[]).find(a => a.id === agentId);
+      const agent = resolveAgent(agentId);
       if (!agent || !agent.selectedModel) return defaultAi;
 
-      const parts = agent.selectedModel.split('/');
+      // ── Alias resolution: 'alias:reasoning-model' → look up in session.aliasesConfig
+      let selectedModel = agent.selectedModel;
+      if (selectedModel.startsWith('alias:')) {
+        const aliasKey = selectedModel.replace('alias:', '').trim();
+        const aliasesConfig = (session as any).aliasesConfig ?? {};
+        const resolved = aliasesConfig[aliasKey];
+        if (!resolved) {
+          console.warn(`[Orchestrator] Alias "${aliasKey}" not found in aliasesConfig. Using default AI.`);
+          return defaultAi;
+        }
+        selectedModel = resolved;
+        console.info(`[Orchestrator] Resolved alias "${aliasKey}" → "${selectedModel}"`);
+      }
+
+      const parts = selectedModel.split('/');
       if (parts.length < 2) return defaultAi;
 
       const provider = parts[0].toLowerCase();
@@ -133,6 +158,7 @@ export class MigrationOrchestrator {
         return defaultAi;
       }
     };
+
 
     const legacyPath = session.projectPath;
     const modernPath = session.modernPath;
@@ -212,20 +238,24 @@ export class MigrationOrchestrator {
           async (msg, lvl) => log(msg, lvl ?? 'info', 'plan')
         );
       } else {
-        await log('Skipping Phase 2: Migration Planner Agent is disabled in settings.', 'warning', 'plan');
-        await writeSessionFile(modernPath, 'Stage1_Analysis.md', '# Legacy Migration Plan\n\nSkipped by user settings.');
+        await log('Skipping Phase 1: Analysis Agent is disabled in settings.', 'warning', 'plan');
+        await writeSessionFile(modernPath, 'Stage1_Analysis.md', '# Legacy Codebase Analysis\n\nSkipped by user settings.');
       }
       await updatePhase('plan', 'done');
       
-      // Pause pipeline here to let the user review Stage-1 Analysis & Plan
+      // Pause pipeline here — let the user review Stage1_Analysis.md before next stage
       await SessionManager.updateSession(sessionId, { status: 'idle' });
-      await log('🎉 Stage-1 Analysis complete. Please review Stage1_Analysis.md and migration-plan.md in the workspace, then click "Start Modernisation" to continue.', 'success', 'plan');
+      await log(
+        '🎉 Stage 1 Analysis complete. Review Stage1_Analysis.md in the output workspace, then proceed to the next stage.',
+        'success',
+        'plan'
+      );
       EventBroadcaster.broadcast(sessionId, 'phase_change', {
         phase: 'idle',
         phaseId: 'plan',
         status: 'done',
       });
-      return; // Exit pipeline loop
+      return; // Exit pipeline — next stage starts separately
     }
 
     // ── Phase 3: Write Pseudocode ────────────────────────────────────────
