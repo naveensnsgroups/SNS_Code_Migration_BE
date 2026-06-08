@@ -85,4 +85,36 @@ router.post('/pause', async (req: Request, res: Response, next: NextFunction) =>
   }
 });
 
+/**
+ * GET /api/migrate/tree
+ * Returns modernized project file tree
+ */
+router.get('/tree', async (req: Request, res: Response, next: NextFunction) => {
+  try {
+    const { sessionId } = req.query;
+    if (!sessionId) {
+      res.status(400).json({ error: 'Missing sessionId parameter.', code: 'BAD_REQUEST' });
+      return;
+    }
+
+    const session = await SessionManager.getSession(sessionId as string);
+    if (!session) {
+      res.status(404).json({ error: 'Session not found.', code: 'NOT_FOUND' });
+      return;
+    }
+
+    const fs = await import('fs-extra');
+    if (!(await fs.pathExists(session.modernPath))) {
+      res.json({ fileTree: [], modernPath: session.modernPath });
+      return;
+    }
+
+    const { scanProjectDirectory } = await import('../tools/fileScanner.js');
+    const { fileTree } = await scanProjectDirectory(session.modernPath);
+    res.json({ fileTree, modernPath: session.modernPath });
+  } catch (err) {
+    next(err);
+  }
+});
+
 export default router;
