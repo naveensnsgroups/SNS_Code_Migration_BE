@@ -87,6 +87,8 @@ export class MigrationOrchestrator {
       session.apiKey
     );
 
+    const targetModel = session.targetStack.model;
+
     // Helpers to check agent configuration dynamically.
     // agentsConfig can arrive as:
     //   { "agent-id": { enabled, selectedModel } }  ← object from localStorage
@@ -106,9 +108,35 @@ export class MigrationOrchestrator {
       return agent.enabled !== false;
     };
 
+    const wrapAiService = (aiService: any, agentId: string, modelName: string): any => {
+      const wrapper = Object.create(aiService);
+      wrapper.generateCompletion = async (
+        prompt: any,
+        systemPrompt?: string,
+        tools?: any[]
+      ) => {
+        const response = await aiService.generateCompletion(prompt, systemPrompt, tools);
+        if (response.usage) {
+          await SessionManager.recordTokenUsage(
+            sessionId,
+            response.usage.promptTokens,
+            response.usage.completionTokens,
+            modelName,
+            agentId,
+            response.usage.cachedInputTokens,
+            response.usage.readCachedInputTokens
+          );
+        }
+        return response;
+      };
+      return wrapper;
+    };
+
     const getAgentService = (agentId: string, defaultAi: any): any => {
       const agent = resolveAgent(agentId);
-      if (!agent || !agent.selectedModel) return defaultAi;
+      if (!agent || !agent.selectedModel) {
+        return wrapAiService(defaultAi, agentId, targetModel);
+      }
 
       // ── Alias resolution: 'alias:reasoning-model' → look up in session.aliasesConfig
       let selectedModel = agent.selectedModel;
@@ -118,14 +146,16 @@ export class MigrationOrchestrator {
         const resolved = aliasesConfig[aliasKey];
         if (!resolved) {
           console.warn(`[Orchestrator] Alias "${aliasKey}" not found in aliasesConfig. Using default AI.`);
-          return defaultAi;
+          return wrapAiService(defaultAi, agentId, targetModel);
         }
         selectedModel = resolved;
         console.info(`[Orchestrator] Resolved alias "${aliasKey}" → "${selectedModel}"`);
       }
 
       const parts = selectedModel.split('/');
-      if (parts.length < 2) return defaultAi;
+      if (parts.length < 2) {
+        return wrapAiService(defaultAi, agentId, targetModel);
+      }
 
       const provider = parts[0].toLowerCase();
       const model = parts.slice(1).join('/');
@@ -152,10 +182,11 @@ export class MigrationOrchestrator {
       }
 
       try {
-        return AIProviderFactory.getService(provider, model, key || 'dummy_key');
+        const service = AIProviderFactory.getService(provider, model, key || 'dummy_key');
+        return wrapAiService(service, agentId, selectedModel);
       } catch (err) {
         console.error(`Failed to get service for agent ${agentId}:`, err);
-        return defaultAi;
+        return wrapAiService(defaultAi, agentId, targetModel);
       }
     };
 

@@ -101,6 +101,35 @@ function transformToGeminiMessages(
   return { contents, systemMessage };
 }
 
+// ── Tool Result Preview ───────────────────────────────────────────────────────
+// Formats a tool result into a short readable string for the terminal display.
+// Mirrors SNS IDE's inline result preview in expandable tool call rows.
+function formatResultPreview(result: ToolCallResult): string {
+  if (result === null || result === undefined) return '';
+  try {
+    // ToolCallContentWrapper (has .content array)
+    if (typeof result === 'object' && 'content' in result) {
+      const wrapper = result as { content: Array<{ type: string; text?: string }> };
+      const texts = wrapper.content.filter(c => c.type === 'text').map(c => c.text ?? '');
+      const joined = texts.join('\n');
+      return joined.slice(0, 400) + (joined.length > 400 ? '\n...' : '');
+    }
+    // Array result
+    if (Array.isArray(result)) {
+      const s = JSON.stringify(result, null, 2);
+      return s.slice(0, 400) + (s.length > 400 ? '\n...' : '');
+    }
+    // Object result
+    if (typeof result === 'object') {
+      const s = JSON.stringify(result, null, 2);
+      return s.slice(0, 400) + (s.length > 400 ? '\n...' : '');
+    }
+    return String(result).slice(0, 400);
+  } catch {
+    return '';
+  }
+}
+
 // ── Gemini Provider ───────────────────────────────────────────────────────────
 
 export class GeminiProvider {
@@ -243,13 +272,19 @@ export class GeminiProvider {
               );
             } else {
               try {
-                toolCtx?.onLog?.(`🔧 [Tool Call] ${tc.name}(${tc.args.slice(0, 80)}...)`, 'info');
+                toolCtx?.onLog?.(`[Tool Call] ${tc.name}(${tc.args.slice(0, 80)}...)`, 'info');
                 // ← SNS IDE standard: pass raw arg_string, NOT parsed object
                 result = await tool.handler(tc.args, toolCtx ? { ...toolCtx, toolCallId: callId } : undefined);
-                toolCtx?.onLog?.(`✅ [Tool Response] ${tc.name} completed.`, 'success');
+                toolCtx?.onLog?.(`[Tool Response] ${tc.name} completed.`, 'success');
+                // Emit the actual response data so the terminal can show it in the expanded row
+                // (mirrors SNS IDE which shows the tool result inline when expanded)
+                const resultPreview = formatResultPreview(result);
+                if (resultPreview) {
+                  toolCtx?.onLog?.(`[Tool Data] ${resultPreview}`, 'info');
+                }
               } catch (e: unknown) {
                 const msg = e instanceof Error ? e.message : 'Tool execution failed';
-                toolCtx?.onLog?.(`❌ [Tool Error] ${tc.name}: ${msg}`, 'error');
+                toolCtx?.onLog?.(`[Tool Error] ${tc.name}: ${msg}`, 'error');
                 result = makeToolErrorResult(msg);
               }
             }

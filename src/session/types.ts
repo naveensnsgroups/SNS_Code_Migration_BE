@@ -2,6 +2,21 @@
 
 import { DetectedStack, FileNode, MigrationStatus, TargetStack, TokenUsage } from '../types.js';
 
+/**
+ * Per-request token usage record — mirrors SNS IDE TokenUsageService.TokenUsage.
+ * Stored as an array in session.json so the frontend can aggregate by model.
+ */
+export interface TokenUsageEntry {
+  agentId: string;     // agent that made the request
+  model: string;       // model identifier
+  requestId: string;   // unique per LLM request turn
+  inputTokens: number;
+  outputTokens: number;
+  cachedInputTokens?: number;
+  readCachedInputTokens?: number;
+  timestamp: string;   // ISO string
+}
+
 export interface MigrationSession {
   sessionId: string;
   status: MigrationStatus;
@@ -37,6 +52,7 @@ export interface MigrationSession {
   aliasesConfig?: Record<string, string>;        // alias → resolved model string
   promptFragments?: Record<string, string>;      // fragment id → custom prompt text
   tokenUsage?: TokenUsage;                       // cumulative token counts for this session
+  tokenUsageHistory?: TokenUsageEntry[];          // per-request history (SNS IDE TokenUsageService pattern)
 }
 
 export interface LogEntry {

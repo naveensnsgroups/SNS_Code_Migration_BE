@@ -132,6 +132,8 @@ export class ClaudeService implements AIService {
         usage: {
           promptTokens: response.usage?.input_tokens ?? 0,
           completionTokens: response.usage?.output_tokens ?? 0,
+          cachedInputTokens: (response.usage as any)?.cache_creation_input_tokens ?? undefined,
+          readCachedInputTokens: (response.usage as any)?.cache_read_input_tokens ?? undefined,
         },
       };
     } catch (err: any) {

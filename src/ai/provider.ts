@@ -17,6 +17,8 @@ export interface AICompletionResponse {
   usage?: {
     promptTokens: number;
     completionTokens: number;
+    cachedInputTokens?: number;
+    readCachedInputTokens?: number;
   };
 }
 

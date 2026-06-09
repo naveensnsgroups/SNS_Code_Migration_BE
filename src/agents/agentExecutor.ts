@@ -31,10 +31,11 @@ import { ToolRequest, ToolContext } from '../types/tool.js';
 import { EventBroadcaster } from '../routes/stream.js';
 import { SessionManager } from '../session/sessionManager.js';
 import { TokenUsage } from '../types.js';
+import { TokenUsageEntry } from '../session/types.js';
 import { GeminiProvider } from '../ai/gemini.js';
 
 // ── Per-provider cost table (USD per 1M tokens) ───────────────────────────────
-const COST_TABLE: Record<string, [number, number]> = {
+export const COST_TABLE: Record<string, [number, number]> = {
   'claude-opus-4':      [15,    75],
   'claude-opus-4-5':    [15,    75],
   'claude-sonnet-4':    [3,     15],
@@ -53,7 +54,7 @@ const COST_TABLE: Record<string, [number, number]> = {
   'default':            [1,     3],
 };
 
-function estimateCost(inputTokens: number, outputTokens: number, model: string): number {
+export function estimateCost(inputTokens: number, outputTokens: number, model: string): number {
   const entry = Object.entries(COST_TABLE).find(([key]) => model.toLowerCase().includes(key));
   const [inCostPerM, outCostPerM] = entry ? entry[1] : COST_TABLE['default'];
   return Math.round(((inputTokens / 1_000_000) * inCostPerM + (outputTokens / 1_000_000) * outCostPerM) * 10000) / 10000;
@@ -83,7 +84,8 @@ export class AgentExecutor {
     tools: ToolRequest[],
     context: ToolContext,
     maxIterations = 40,
-    modelName = ''
+    modelName = '',
+    agentId = 'migration-agent'
   ): Promise<string> {
     // ── Initialize message chain (SNS IDE LanguageModelMessage[]) ─────────
     const messages: LanguageModelMessage[] = [
@@ -108,15 +110,13 @@ export class AgentExecutor {
         modelName,
       };
 
-      // ── Stream this turn ───────────────────────────────────────────────
-      const response = await provider.request(userRequest, context);
-
       // Collect streaming output for this turn
       let turnText = '';
       // id → { name, argsJson }
       const pendingToolCalls = new Map<string, { id: string; name: string; args: string }>();
-      let turnInputTokens = 0;
-      let turnOutputTokens = 0;
+
+      // ── Stream this turn ───────────────────────────────────────────────
+      const response = await provider.request(userRequest, context);
 
       for await (const part of response.stream) {
         if (isTextResponsePart(part)) {
@@ -128,8 +128,22 @@ export class AgentExecutor {
             phase: 'agent'
           });
         } else if (isUsageResponsePart(part)) {
-          turnInputTokens  = part.input_tokens;
-          turnOutputTokens = part.output_tokens;
+          const partInput = part.input_tokens;
+          const partOutput = part.output_tokens;
+          const partCacheCreation = part.cache_creation_input_tokens ?? 0;
+          const partCacheRead = part.cache_read_input_tokens ?? 0;
+
+          if (partInput > 0 || partOutput > 0 || partCacheCreation > 0 || partCacheRead > 0) {
+            await SessionManager.recordTokenUsage(
+              context.sessionId,
+              partInput,
+              partOutput,
+              modelName,
+              agentId,
+              partCacheCreation > 0 ? partCacheCreation : undefined,
+              partCacheRead > 0 ? partCacheRead : undefined
+            );
+          }
         } else if (isToolCallResponsePart(part)) {
           for (const tc of part.tool_calls) {
             if (tc.id && tc.function?.name && !tc.finished) {
@@ -143,26 +157,12 @@ export class AgentExecutor {
               // Tool completed inside the stream (recursive Gemini loop handled it)
               // The result is already fed back — just log it
               const existing = pendingToolCalls.get(tc.id)!;
-              context.onLog?.(`✅ [Tool Response] ${existing.name} completed (in-stream).`, 'success');
+              context.onLog?.(`[Tool Response] ${existing.name} completed (in-stream).`, 'success');
               pendingToolCalls.delete(tc.id);
             }
           }
         }
       }
-
-      // ── Accumulate tokens ──────────────────────────────────────────────
-      totalInputTokens  += turnInputTokens;
-      totalOutputTokens += turnOutputTokens;
-
-      // Broadcast live token update every turn
-      const estimatedCost = estimateCost(totalInputTokens, totalOutputTokens, modelName);
-      EventBroadcaster.broadcast(context.sessionId, 'token_usage', {
-        inputTokens:  totalInputTokens,
-        outputTokens: totalOutputTokens,
-        totalTokens:  totalInputTokens + totalOutputTokens,
-        estimatedCost,
-        model: modelName,
-      } satisfies TokenUsage);
 
       if (turnText) lastTextResponse = turnText;
 
@@ -190,17 +190,17 @@ export class AgentExecutor {
 
           if (!tool) {
             const errMsg = `Tool '${tc.name}' not registered. Available: ${tools.map(t => t.name).join(', ')}`;
-            context.onLog?.(`⚠️ [AgentExecutor] ${errMsg}`, 'warning');
+            context.onLog?.(`[AgentExecutor] ${errMsg}`, 'warning');
             result = makeToolErrorResult(errMsg, 'tool-not-available');
           } else {
-            context.onLog?.(`🔧 [Tool Call] Executing tool "${tc.name}"...`, 'info');
+            context.onLog?.(`[Tool Call] Executing tool "${tc.name}"...`, 'info');
             try {
               // ← SNS IDE standard: pass raw JSON arg_string
               result = await tool.handler(tc.args, { ...context, toolCallId: tc.id });
-              context.onLog?.(`✅ [Tool Response] Completed "${tc.name}" successfully.`, 'success');
+              context.onLog?.(`[Tool Response] Completed "${tc.name}" successfully.`, 'success');
             } catch (err: unknown) {
               const errMsg = err instanceof Error ? err.message : 'Unknown tool execution error';
-              context.onLog?.(`❌ [Tool Error] Failed executing "${tc.name}": ${errMsg}`, 'error');
+              context.onLog?.(`[Tool Error] Failed executing "${tc.name}": ${errMsg}`, 'error');
               result = makeToolErrorResult(errMsg);
             }
           }
@@ -222,7 +222,6 @@ export class AgentExecutor {
 
       // ── Final Answer — no more pending tool calls ──────────────────────
       context.onLog?.(`[AI Response] Final completion after ${iteration} turn(s).`, 'success');
-      await this.persistFinalTokenUsage(context.sessionId, totalInputTokens, totalOutputTokens, modelName);
       return turnText || lastTextResponse;
     }
 
@@ -231,43 +230,6 @@ export class AgentExecutor {
       `[AgentExecutor] Max ${maxIterations} iterations reached. Agent may have written output files.`,
       'warning'
     );
-    await this.persistFinalTokenUsage(context.sessionId, totalInputTokens, totalOutputTokens, modelName);
     return lastTextResponse || `Agent completed ${maxIterations} turns. Check output workspace for generated files.`;
-  }
-
-  // ── Persist final token usage to session.json ────────────────────────────
-  private static async persistFinalTokenUsage(
-    sessionId: string,
-    inputTokens: number,
-    outputTokens: number,
-    modelName: string
-  ): Promise<void> {
-    try {
-      const estimatedCost = estimateCost(inputTokens, outputTokens, modelName);
-      const tokenUsage: TokenUsage = {
-        inputTokens,
-        outputTokens,
-        totalTokens: inputTokens + outputTokens,
-        estimatedCost,
-        model: modelName,
-      };
-      EventBroadcaster.broadcast(sessionId, 'token_usage', tokenUsage);
-
-      const session = await SessionManager.getSession(sessionId);
-      if (session) {
-        const ex = session.tokenUsage;
-        await SessionManager.updateSession(sessionId, {
-          tokenUsage: {
-            inputTokens:   (ex?.inputTokens   ?? 0) + inputTokens,
-            outputTokens:  (ex?.outputTokens  ?? 0) + outputTokens,
-            totalTokens:   (ex?.totalTokens   ?? 0) + inputTokens + outputTokens,
-            estimatedCost: (ex?.estimatedCost ?? 0) + estimatedCost,
-            model: modelName,
-          }
-        });
-      }
-    } catch {
-      // Non-critical
-    }
   }
 }

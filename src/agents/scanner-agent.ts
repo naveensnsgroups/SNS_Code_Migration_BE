@@ -157,17 +157,36 @@ export class ScannerAgent {
           scanTools,               // Tools from SCANNER_AGENT.functions
           context,
           SCANNER_MAX_TURNS,       // Named constant — not inline number
-          resolvedModel
+          resolvedModel,
+          'scanner-agent'
         );
 
-        // Parse the agent's JSON response
-        const cleanJson = executorResponse
+        // Parse the agent's JSON response robustly.
+        // Gemini sometimes prefixes JSON with explanation text ("The user wants...").
+        // Strategy: strip markdown fences first, then find the first {...} block,
+        // then fall back to parsing the whole trimmed string.
+        const stripped = executorResponse
           .replace(/```json/gi, '')
           .replace(/```/gi, '')
           .trim();
-        const parsed = JSON.parse(cleanJson);
 
-        // Apply only fields that were successfully detected
+        // Extract outermost {...} block — handles "text ... { json } ... text"
+        const jsonBlockMatch = stripped.match(/\{[\s\S]*\}/);
+        const jsonToParse = jsonBlockMatch ? jsonBlockMatch[0] : stripped;
+
+        let parsed: Record<string, string> = {};
+        try {
+          parsed = JSON.parse(jsonToParse);
+        } catch {
+          // If still not valid JSON, log a specific message and parsed stays {}
+          // so the code below simply won't overwrite anything — backup scan runs
+          onLog?.(
+            `AI scanner returned non-JSON response — using static backup scan instead.`,
+            'warning'
+          );
+        }
+
+        // Apply only fields that were successfully detected (parsed may be empty {})
         if (parsed.language)       detectedStack.language       = parsed.language;
         if (parsed.framework)      detectedStack.framework      = parsed.framework;
         if (parsed.database)       detectedStack.database       = parsed.database;
@@ -178,9 +197,17 @@ export class ScannerAgent {
         if (parsed.databaseLayer)  detectedStack.databaseLayer  = parsed.databaseLayer;
         if (parsed.summary)        summary                      = parsed.summary;
 
+        // If parsed had no usable fields (Gemini returned only text, parsed = {}),
+        // run backup scan to ensure detectedStack is fully populated.
+        const aiDetectedAnything = !!(parsed.language || parsed.framework || parsed.backend);
+        if (!aiDetectedAnything) {
+          await runBackupScan(projectPath, fileList, detectedStack);
+          summary = buildSummaryString(fileList.length, detectedStack);
+        }
+
         onLog?.(
-          `Agent stack verification complete. ` +
-          `Stack: ${detectedStack.language} / ${detectedStack.framework} / ${detectedStack.database}`,
+          `Stack detection complete. ` +
+          `Detected: ${detectedStack.language} / ${detectedStack.framework} / ${detectedStack.database}`,
           'success'
         );
       } catch (err: unknown) {

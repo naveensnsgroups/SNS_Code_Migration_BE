@@ -150,7 +150,8 @@ export class PlannerAgent {
       allPhase1Tools,
       context,
       PHASE1_MAX_TURNS,
-      resolvedModel
+      resolvedModel,
+      'planner-agent'
     );
 
     // ── Verify output was written ──────────────────────────────────────────

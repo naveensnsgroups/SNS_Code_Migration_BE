@@ -61,6 +61,8 @@ export interface FileNode {
 export interface TokenUsage {
   inputTokens: number;
   outputTokens: number;
+  cachedInputTokens?: number;
+  readCachedInputTokens?: number;
   totalTokens: number;
   estimatedCost: number;
   provider?: string;

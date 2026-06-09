@@ -130,4 +130,86 @@ router.get('/tree', async (req: Request, res: Response, next: NextFunction) => {
   }
 });
 
+/**
+ * GET /api/migrate/tokens
+ * Returns the persisted token usage from session.json for the given session.
+ * Mirrors SNS IDE TokenUsageFrontendService.getTokenUsageData() aggregation pattern.
+ *
+ * Response includes:
+ *   tokenUsage   — cumulative session totals (inputTokens, outputTokens, totalTokens, estimatedCost, model)
+ *   modelBreakdown — per-model aggregation of tokenUsageHistory (SNS IDE pattern)
+ */
+router.get('/tokens', async (req: Request, res: Response, next: NextFunction) => {
+  try {
+    const { sessionId } = req.query;
+    if (!sessionId) {
+      res.status(400).json({ error: 'Missing sessionId parameter.', code: 'BAD_REQUEST' });
+      return;
+    }
+
+    const session = await SessionManager.getSession(sessionId as string);
+    if (!session) {
+      res.status(404).json({ error: 'Session not found.', code: 'NOT_FOUND' });
+      return;
+    }
+
+    // Aggregate history by model (SNS IDE TokenUsageFrontendService.aggregateTokenUsages pattern)
+    const history = session.tokenUsageHistory ?? [];
+    const modelMap = new Map<string, {
+      inputTokens: number;
+      outputTokens: number;
+      cachedInputTokens: number;
+      readCachedInputTokens: number;
+      lastUsed: string;
+    }>();
+
+    for (const entry of history) {
+      const existing = modelMap.get(entry.model);
+      if (existing) {
+        existing.inputTokens += entry.inputTokens;
+        existing.outputTokens += entry.outputTokens;
+        existing.cachedInputTokens += (entry.cachedInputTokens ?? 0);
+        existing.readCachedInputTokens += (entry.readCachedInputTokens ?? 0);
+        if (entry.timestamp > existing.lastUsed) {
+          existing.lastUsed = entry.timestamp;
+        }
+      } else {
+        modelMap.set(entry.model, {
+          inputTokens: entry.inputTokens,
+          outputTokens: entry.outputTokens,
+          cachedInputTokens: entry.cachedInputTokens ?? 0,
+          readCachedInputTokens: entry.readCachedInputTokens ?? 0,
+          lastUsed: entry.timestamp,
+        });
+      }
+    }
+
+    const modelBreakdown = Array.from(modelMap.entries()).map(([modelId, data]) => {
+      const breakdown: any = {
+        modelId,
+        inputTokens: data.inputTokens,
+        outputTokens: data.outputTokens,
+        totalTokens: data.inputTokens + data.outputTokens + data.cachedInputTokens,
+        lastUsed: data.lastUsed,
+      };
+      if (data.cachedInputTokens > 0) {
+        breakdown.cachedInputTokens = data.cachedInputTokens;
+      }
+      if (data.readCachedInputTokens > 0) {
+        breakdown.readCachedInputTokens = data.readCachedInputTokens;
+      }
+      return breakdown;
+    });
+
+    res.json({
+      tokenUsage: session.tokenUsage ?? null,
+      modelBreakdown,
+      sessionId,
+    });
+  } catch (err) {
+    next(err);
+  }
+});
+
 export default router;
+

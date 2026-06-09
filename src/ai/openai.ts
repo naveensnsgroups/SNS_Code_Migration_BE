@@ -91,6 +91,7 @@ export class OpenAIService implements AIService {
         usage: {
           promptTokens: response.usage?.prompt_tokens ?? 0,
           completionTokens: response.usage?.completion_tokens ?? 0,
+          readCachedInputTokens: (response.usage as any)?.prompt_tokens_details?.cached_tokens ?? undefined,
         },
       };
     } catch (err: any) {

@@ -1,7 +1,7 @@
 import fs from 'fs-extra';
 import path from 'path';
 import { fileURLToPath } from 'url';
-import { MigrationSession, LogEntry } from './types.js';
+import { MigrationSession, LogEntry, TokenUsageEntry } from './types.js';
 import { FileNode } from '../types.js';
 
 const __filename = fileURLToPath(import.meta.url);
@@ -158,6 +158,66 @@ export class SessionManager {
       return sessions;
     } catch {
       return [];
+    }
+  }
+
+  /**
+   * Records and aggregates token usage for the session, writes to session.json, and broadcasts the new total.
+   */
+  static async recordTokenUsage(
+    sessionId: string,
+    inputTokens: number,
+    outputTokens: number,
+    modelName: string,
+    agentId: string,
+    cachedInputTokens?: number,
+    readCachedInputTokens?: number
+  ): Promise<void> {
+    try {
+      const session = await this.getSession(sessionId);
+      if (session) {
+        const { estimateCost } = await import('../agents/agentExecutor.js');
+        const estimatedCost = estimateCost(inputTokens, outputTokens, modelName);
+
+        const ex = session.tokenUsage;
+        const accumulatedInput = (ex?.inputTokens ?? 0) + inputTokens;
+        const accumulatedOutput = (ex?.outputTokens ?? 0) + outputTokens;
+        const accumulatedCached = (ex?.cachedInputTokens ?? 0) + (cachedInputTokens ?? 0);
+        const accumulatedReadCached = (ex?.readCachedInputTokens ?? 0) + (readCachedInputTokens ?? 0);
+        const accumulatedTotal = accumulatedInput + accumulatedOutput + accumulatedCached;
+
+        const newTotals = {
+          inputTokens: accumulatedInput,
+          outputTokens: accumulatedOutput,
+          cachedInputTokens: accumulatedCached > 0 ? accumulatedCached : undefined,
+          readCachedInputTokens: accumulatedReadCached > 0 ? accumulatedReadCached : undefined,
+          totalTokens: accumulatedTotal,
+          estimatedCost: (ex?.estimatedCost ?? 0) + estimatedCost,
+          model: modelName,
+        };
+
+        const entry: TokenUsageEntry = {
+          agentId,
+          model: modelName,
+          requestId: `${sessionId}_${Date.now()}_${Math.random().toString(36).substring(2, 7)}`,
+          inputTokens,
+          outputTokens,
+          cachedInputTokens: cachedInputTokens && cachedInputTokens > 0 ? cachedInputTokens : undefined,
+          readCachedInputTokens: readCachedInputTokens && readCachedInputTokens > 0 ? readCachedInputTokens : undefined,
+          timestamp: new Date().toISOString(),
+        };
+
+        const existingHistory = session.tokenUsageHistory ?? [];
+        await this.updateSession(sessionId, {
+          tokenUsage: newTotals,
+          tokenUsageHistory: [...existingHistory, entry],
+        });
+
+        const { EventBroadcaster } = await import('../routes/stream.js');
+        EventBroadcaster.broadcast(sessionId, 'token_usage', newTotals);
+      }
+    } catch (err) {
+      console.error('Failed to record token usage:', err);
     }
   }
 }
