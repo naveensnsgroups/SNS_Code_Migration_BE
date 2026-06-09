@@ -41,13 +41,6 @@ export class SessionManager {
       phases: [
         { id: 'scan',       label: 'Scan Codebase',         status: 'pending' },
         { id: 'plan',       label: 'Generate Plan',          status: 'pending' },
-        { id: 'pseudocode', label: 'Write Pseudocode',       status: 'pending' },
-        { id: 'migrate',    label: 'Migrate Files',          status: 'pending' },
-        { id: 'install',    label: 'Install Dependencies',   status: 'pending' },
-        { id: 'build',      label: 'Build Project',          status: 'pending' },
-        { id: 'validate',   label: 'Validate & Fix',         status: 'pending' },
-        { id: 'test',       label: 'Run Tests',              status: 'pending' },
-        { id: 'report',     label: 'Final Report',           status: 'pending' },
       ],
     };
 

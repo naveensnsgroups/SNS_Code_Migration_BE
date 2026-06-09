@@ -106,15 +106,16 @@ export class ScannerAgent {
     // ── Initial "not yet detected" state ─────────────────────────────────
     // These values are placeholders. runBackupScan() or the AI will fill them in.
     let detectedStack: DetectedStack = {
-      language:       STACK_UNKNOWN_LANGUAGE,
-      framework:      STACK_NOT_DETECTED,
-      database:       STACK_NOT_DETECTED,
-      packageManager: STACK_UNKNOWN_PACKAGE_MANAGER,
-      fileCount:      fileList.length,
-      frontend:       STACK_NOT_DETECTED,
-      apiLayer:       STACK_NOT_DETECTED,
-      backend:        STACK_NOT_DETECTED,
-      databaseLayer:  STACK_NOT_DETECTED,
+      language:            STACK_UNKNOWN_LANGUAGE,
+      framework:           STACK_NOT_DETECTED,
+      database:            STACK_NOT_DETECTED,
+      packageManager:      STACK_UNKNOWN_PACKAGE_MANAGER,
+      fileCount:           fileList.length,
+      frontend:            STACK_NOT_DETECTED,
+      apiLayer:            STACK_NOT_DETECTED,
+      backend:             STACK_NOT_DETECTED,
+      databaseLayer:       STACK_NOT_DETECTED,
+      cloudInfrastructure: STACK_NOT_DETECTED,
     };
     let summary = `Project contains ${fileList.length} files.`;
 
@@ -187,15 +188,16 @@ export class ScannerAgent {
         }
 
         // Apply only fields that were successfully detected (parsed may be empty {})
-        if (parsed.language)       detectedStack.language       = parsed.language;
-        if (parsed.framework)      detectedStack.framework      = parsed.framework;
-        if (parsed.database)       detectedStack.database       = parsed.database;
-        if (parsed.packageManager) detectedStack.packageManager = parsed.packageManager;
-        if (parsed.frontend)       detectedStack.frontend       = parsed.frontend;
-        if (parsed.apiLayer)       detectedStack.apiLayer       = parsed.apiLayer;
-        if (parsed.backend)        detectedStack.backend        = parsed.backend;
-        if (parsed.databaseLayer)  detectedStack.databaseLayer  = parsed.databaseLayer;
-        if (parsed.summary)        summary                      = parsed.summary;
+        if (parsed.language)            detectedStack.language            = parsed.language;
+        if (parsed.framework)           detectedStack.framework           = parsed.framework;
+        if (parsed.database)            detectedStack.database            = parsed.database;
+        if (parsed.packageManager)      detectedStack.packageManager      = parsed.packageManager;
+        if (parsed.frontend)            detectedStack.frontend            = parsed.frontend;
+        if (parsed.apiLayer)            detectedStack.apiLayer            = parsed.apiLayer;
+        if (parsed.backend)             detectedStack.backend             = parsed.backend;
+        if (parsed.databaseLayer)       detectedStack.databaseLayer       = parsed.databaseLayer;
+        if (parsed.cloudInfrastructure) detectedStack.cloudInfrastructure = parsed.cloudInfrastructure;
+        if (parsed.summary)             summary                           = parsed.summary;
 
         // If parsed had no usable fields (Gemini returned only text, parsed = {}),
         // run backup scan to ensure detectedStack is fully populated.
@@ -253,14 +255,15 @@ async function runBackupScan(
   const path = await import('path');
 
   // Reset to unknown before backup scan populates
-  stack.language       = STACK_UNKNOWN_LANGUAGE;
-  stack.framework      = STACK_NOT_DETECTED;
-  stack.database       = STACK_NOT_DETECTED;
-  stack.packageManager = STACK_UNKNOWN_PACKAGE_MANAGER;
-  stack.frontend       = STACK_NOT_DETECTED;
-  stack.apiLayer       = STACK_NOT_DETECTED;
-  stack.backend        = STACK_NOT_DETECTED;
-  stack.databaseLayer  = STACK_NOT_DETECTED;
+  stack.language            = STACK_UNKNOWN_LANGUAGE;
+  stack.framework           = STACK_NOT_DETECTED;
+  stack.database            = STACK_NOT_DETECTED;
+  stack.packageManager      = STACK_UNKNOWN_PACKAGE_MANAGER;
+  stack.frontend            = STACK_NOT_DETECTED;
+  stack.apiLayer            = STACK_NOT_DETECTED;
+  stack.backend             = STACK_NOT_DETECTED;
+  stack.databaseLayer       = STACK_NOT_DETECTED;
+  stack.cloudInfrastructure = STACK_NOT_DETECTED;
 
   if (hasPkgJson) {
     stack.language       = 'JavaScript';
@@ -511,5 +514,23 @@ async function runBackupScan(
       stack.framework = 'Generic Node.js App'; stack.backend = 'Node.js Program';
     }
     // If no extension matches, language stays 'Unknown' — which is correct
+  }
+
+  // Detect Cloud / Infrastructure
+  const hasDockerfile    = fileList.some(f => f.toLowerCase().includes('dockerfile'));
+  const hasDockerCompose = fileList.some(f => f.toLowerCase().includes('docker-compose') || f.toLowerCase().includes('docker-stack'));
+  const hasTerraform     = fileList.some(f => f.endsWith('.tf'));
+  const hasK8s           = fileList.some(f => f.includes('k8s/') || f.includes('kubernetes/') || f.endsWith('k8s.yaml') || f.endsWith('k8s.yml'));
+
+  if (hasDockerfile && hasDockerCompose) {
+    stack.cloudInfrastructure = 'Docker & Compose';
+  } else if (hasDockerfile) {
+    stack.cloudInfrastructure = 'Docker';
+  } else if (hasK8s) {
+    stack.cloudInfrastructure = 'Kubernetes';
+  } else if (hasTerraform) {
+    stack.cloudInfrastructure = 'Terraform';
+  } else {
+    stack.cloudInfrastructure = 'None';
   }
 }

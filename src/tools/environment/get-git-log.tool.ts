@@ -35,7 +35,7 @@ export const getGitLogTool: ToolRequest = {
     try {
       const res = await ShellExecutor.execute(
         ctx!.sessionId,
-        `git log --name-only --format="COMMIT:%H|%ai|%s" -n ${max}`,
+        `git log --name-only --format="COMMIT:%H|%ai|%s" -n ${max} -- .`,
         { cwd: ctx!.legacyPath, timeoutMs: 15000 }
       );
       if (res.code !== 0) {

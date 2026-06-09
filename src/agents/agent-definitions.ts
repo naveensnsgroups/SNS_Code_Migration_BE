@@ -41,9 +41,6 @@ import {
 import {
   ANALYZER_SYSTEM_PROMPT,
 } from '../prompts/analyzer-prompt.js';
-import {
-  PLANNER_SYSTEM_PROMPT,
-} from '../prompts/planner-prompt.js';
 
 // =============================================================================
 //  SCANNER AGENT — Codebase Discovery (Pre-Stage 1)
@@ -155,105 +152,6 @@ export const STAGE1_PLANNER_AGENT: AgentDefinition = {
 };
 
 // =============================================================================
-//  STAGE 2 — Migration Writer Agent (Phase 3: Code Generation)
-//  (Definition only — implementation comes in Stage 2)
-// =============================================================================
-
-export const STAGE2_WRITER_AGENT_ID = 'migration-writer-stage2';
-
-export const STAGE2_WRITER_AGENT: AgentDefinition = {
-  id: STAGE2_WRITER_AGENT_ID,
-  name: 'Migration Writer (Stage 2)',
-  description:
-    'Reads the migration-plan.md produced by Stage 1 and migrates each file from legacy to modern code. ' +
-    'Writes modernized files to the output workspace. Validates by running build commands.',
-  tags: ['writer', 'migrator', 'stage2'],
-  functions: [
-    FILE_CONTENT_FUNCTION_ID,
-    WRITE_FILE_FUNCTION_ID,
-    WRITE_MIGRATION_FILES_FUNCTION_ID,
-    BATCH_READ_FILES_FUNCTION_ID,
-    EXTRACT_FILE_SYMBOLS_FUNCTION_ID,
-    COMPARE_FILES_FUNCTION_ID,
-    CAPTURED_SHELL_EXECUTION_ID,
-    TODO_WRITE_FUNCTION_ID,
-    UPDATE_MIGRATION_DASHBOARD_FUNCTION_ID,
-    COMPRESS_MIGRATION_CONTEXT_FUNCTION_ID,
-    GET_TASK_CONTEXT_FUNCTION_ID,
-    EDIT_TASK_CONTEXT_FUNCTION_ID,
-  ],
-  variables: ['sessionId', 'legacyPath', 'modernPath', 'migrationPlanPath'],
-  languageModelRequirements: [
-    {
-      purpose: 'code-generation',
-      identifier: 'alias:fast-model',
-    }
-  ],
-  prompts: [
-    {
-      id: 'migration-writer-stage2-system',
-      defaultVariant: {
-        id: 'migration-writer-stage2-system-default',
-        label: 'Stage 2 Writer System Prompt',
-        // Template is stored in prompts/planner-prompt.ts — not inlined here
-        template: PLANNER_SYSTEM_PROMPT,
-      }
-    }
-  ],
-  agentSpecificVariables: [
-    { name: 'legacyPath',       description: 'Legacy project root.',         usedInPrompt: true },
-    { name: 'modernPath',       description: 'Modern output folder.',        usedInPrompt: true },
-    { name: 'migrationPlanPath', description: 'Path to migration-plan.md.', usedInPrompt: true },
-  ],
-};
-
-// =============================================================================
-//  STAGE 3 — Validation Agent (Phase 4: Build + Test)
-//  (Definition only — implementation comes in Stage 3)
-// =============================================================================
-
-export const STAGE3_VALIDATOR_AGENT_ID = 'migration-validator-stage3';
-
-export const STAGE3_VALIDATOR_AGENT: AgentDefinition = {
-  id: STAGE3_VALIDATOR_AGENT_ID,
-  name: 'Migration Validator (Stage 3)',
-  description:
-    'Runs build, lint, and test commands on the modernized project. ' +
-    'Diagnoses failures and applies targeted fixes. Produces a validation report.',
-  tags: ['validator', 'tester', 'stage3'],
-  functions: [
-    CAPTURED_SHELL_EXECUTION_ID,
-    FILE_CONTENT_FUNCTION_ID,
-    WRITE_FILE_FUNCTION_ID,
-    COMPARE_FILES_FUNCTION_ID,
-    TODO_WRITE_FUNCTION_ID,
-    UPDATE_MIGRATION_DASHBOARD_FUNCTION_ID,
-  ],
-  variables: ['sessionId', 'modernPath'],
-  languageModelRequirements: [
-    {
-      purpose: 'validation',
-      identifier: 'alias:fast-model',
-    }
-  ],
-  prompts: [
-    {
-      id: 'migration-validator-stage3-system',
-      defaultVariant: {
-        id: 'migration-validator-stage3-system-default',
-        label: 'Stage 3 Validator System Prompt',
-        template:
-          'You are an expert code quality engineer. Run build and test commands on the modernized project. ' +
-          'Fix any failures. Report results in VALIDATION_REPORT.md.'
-      }
-    }
-  ],
-  agentSpecificVariables: [
-    { name: 'modernPath', description: 'Modern project root to validate.', usedInPrompt: true },
-  ],
-};
-
-// =============================================================================
 //  Registration — Auto-register all agents on module import
 //  Registers into BOTH:
 //   - AgentRegistry (existing type registry — used by agents for self-lookup)
@@ -264,17 +162,11 @@ import { agentService } from '../core/agent-service.js';
 
 AgentRegistry.register(SCANNER_AGENT);
 AgentRegistry.register(STAGE1_PLANNER_AGENT);
-AgentRegistry.register(STAGE2_WRITER_AGENT);
-AgentRegistry.register(STAGE3_VALIDATOR_AGENT);
 
 agentService.registerAgent(SCANNER_AGENT);
 agentService.registerAgent(STAGE1_PLANNER_AGENT);
-agentService.registerAgent(STAGE2_WRITER_AGENT);
-agentService.registerAgent(STAGE3_VALIDATOR_AGENT);
 
 export const ALL_AGENT_DEFINITIONS = [
   SCANNER_AGENT,
   STAGE1_PLANNER_AGENT,
-  STAGE2_WRITER_AGENT,
-  STAGE3_VALIDATOR_AGENT,
 ];

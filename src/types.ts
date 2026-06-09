@@ -4,11 +4,6 @@ export type MigrationStatus =
   | 'idle'
   | 'scanning'
   | 'planning'
-  | 'pseudocode'
-  | 'migrating'
-  | 'building'
-  | 'validating'
-  | 'testing'
   | 'complete'
   | 'error'
   | 'paused';
@@ -35,6 +30,7 @@ export interface DetectedStack {
   apiLayer?: string;
   backend?: string;
   databaseLayer?: string;
+  cloudInfrastructure?: string;
 }
 
 export interface TargetStack {
