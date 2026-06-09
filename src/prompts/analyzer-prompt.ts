@@ -173,60 +173,81 @@ export const ANALYZER_SYSTEM_PROMPT = `<system_prompt>
         # Stage 1 — Legacy Codebase Analysis
 
         ## 1. Project Identity
-        - Application purpose and description
-        - Detected language, framework, architecture type, and entry point
-        - Project metadata (name, version from manifest)
+        - Defines what the application is, source language, framework, architecture type, entry point, and project metadata (name, version from manifest).
 
         ## 2. Architecture Overview
-        - System organization: layers, modules, services, overall architecture pattern (MVC/MVVM/Monolith/Microservice/etc.)
+        - Explains how the system is organized, layers, modules, services, design patterns, and overall backend architecture.
 
         ## 3. Source Structure
-        - Complete folder and file hierarchy of the legacy project
-        - Which folders belong to which subproject (if monorepo)
+        - Complete folder and file hierarchy of the legacy project.
 
         ## 4. File Classification
-        - Each file's role: Controller | Service | Repository | Model | Middleware | Utility | Config | Test | Schema | Asset
+        - Identifies each file's role (BOTH frontend and backend files must be classified correctly: Controller, Service, Repository, Model, Middleware, Utility, Config, Page, Component, Test, Schema, Asset, etc.).
 
         ## 5. Domain Models
-        - All entities, tables, schemas, fields, types, relationships, constraints, indexes, enums
+        - Captures all entities, tables, schemas, field names, data types, relationships, constraints, indexes, and enums.
 
         ## 6. Dependencies
-        - All external libraries, frameworks, SDKs, packages with versions from manifests
+        - Lists all external libraries, frameworks, SDKs, and packages used by the application, with versions from manifests.
 
-        ## 7. Functions & Methods Catalog
-        - Master catalog of all functions, classes, methods — name, parameters, return type, purpose, callers/callees
+        ## 7. Functions
+        - Master catalog of all functions, methods, classes, including input parameters, output return types, purpose, callers, and callees.
 
-        ## 8. Business Rules
-        - All business logic, validations, calculations, restrictions, permissions, and conditions (sourced from rules-by-file)
+        ## 8. Function Behaviors
+        - Complete behavioral description and pseudocode for every function, including side effects and business execution flow.
 
-        ## 9. API Contracts (if applicable)
-        - All API route definitions: method, path, request body schema, response body schema, status codes
+        ## 9. Business Rules
+        - All business logic, validations, calculations, restrictions, permissions, and conditions.
 
-        ## 10. Database Operations (if applicable)
-        - All CRUD operations, queries, repository patterns, and data access logic
+        ## 10. API Contracts
+        - Complete API definitions including routes, HTTP methods, request body schemas, response body schemas, and HTTP status codes.
 
-        ## 11. Configuration & Environment Variables
-        - All .env variables, config file settings, constants, and feature flags
+        ## 11. Security & Permissions
+        - Authentication mechanisms, authorization logic, user roles, permission checks, tokens, and security enforcement rules.
 
-        ## 12. Error Handling
-        - Exception types, error response formats, logging behavior, and recovery patterns
+        ## 12. Middleware Execution
+        - Middleware sequence, request processing pipeline, and execution order.
 
-        ## 13. Cross-Module Call Flows
-        - Key execution flows showing how modules, services, and functions interact end-to-end
+        ## 13. Database Operations
+        - All CRUD operations, raw SQL queries, ORM queries, repository methods, and database access patterns.
 
-        ## 14. Security & Permissions (if applicable)
-        - Authentication, authorization, roles, tokens, and security enforcement rules
+        ## 14. Cross-Module Call Flows
+        - Complete execution flow showing how modules, services, and functions interact end-to-end.
 
-        ## 15. Middleware Execution (if applicable)
-        - Middleware sequence, request processing pipeline, execution order
+        ## 15. Data Transformations
+        - DTO mappings, serializers, converters, formatters, and input/output transformations.
 
-        ## 16. Async Processing (if applicable)
-        - Async functions, parallel processing, queues, background execution
+        ## 16. Configuration
+        - Environment variables, configuration files, constants, feature flags, and runtime settings.
 
-        ## 17. Testing & Verification (if applicable)
-        - Test files found, test cases, expected outputs, and edge cases
+        ## 17. Error Handling
+        - Exception types, custom errors, error responses, logging behavior, and recovery handling.
 
-        ## 18. Risk Scorecard
+        ## 18. Validation Rules
+        - Input validation, field validation, business validation, and data integrity checks.
+
+        ## 19. State Transitions
+        - Entity lifecycle rules, status changes, state transitions, and side effects.
+
+        ## 20. Async Processing
+        - Async functions, parallel processing, queues, background execution, and concurrency behavior.
+
+        ## 21. Testing & Verification
+        - Test files, test cases, expected outputs, edge cases, acceptance behavior, and validation logic extracted from test code.
+
+        ## 22. Transactions (If Present)
+        - Database transaction boundaries, commit logic, rollback logic, and consistency guarantees. If none are present, specify "None".
+
+        ## 23. Event Flows (If Present)
+        - Published events, consumed events, event handlers, and event-driven workflows. If none are present, specify "None".
+
+        ## 24. External Integrations (If Present)
+        - Third-party APIs, payment gateways, messaging systems, external services, and integration contracts. If none are present, specify "None".
+
+        ## 25. Scheduled Jobs & Workers (If Present)
+        - Cron jobs, schedulers, batch processes, workers, and background task execution. If none are present, specify "None".
+
+        ## 26. Risk Scorecard
         \`\`\`
         BREAKING_CHANGES: [list]
         DATA_MIGRATION_REQUIRED: [yes/no]

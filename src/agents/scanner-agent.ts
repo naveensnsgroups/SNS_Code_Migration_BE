@@ -18,8 +18,8 @@ import { DetectedStack, FileNode } from '../types.js';
 import { toolRegistry } from '../core/tool-invocation-registry.js';
 import { ToolContext } from '../types/tool.js';
 import { AgentExecutor } from './agentExecutor.js';
-import { GeminiProvider } from '../ai/gemini.js';
 import { AIProviderFactory } from '../ai/provider.js';
+import { StreamingProvider } from '../types/language-model.js';
 import {
   SCANNER_SYSTEM_PROMPT,
   buildScannerUserPrompt,
@@ -64,6 +64,10 @@ export interface ScannerAgentConfig {
   model?: string;
   /** API key for the provider. */
   apiKey?: string;
+  maxRetries?: number;
+  retryDelayRateLimit?: number;
+  retryDelayOther?: number;
+  timeoutMs?: number;
 }
 
 // ── ScannerAgent ──────────────────────────────────────────────────────────────
@@ -131,22 +135,19 @@ export class ScannerAgent {
           || SCANNER_AGENT.languageModelRequirements[0]?.identifier?.replace('alias:', '')
           || 'fast-model';
 
-        // Build provider using AIProviderFactory — no provider-specific imports here.
-        // This supports Google, Anthropic, OpenAI, OpenRouter, etc.
-        let provider: GeminiProvider;
-        if (config.provider.toLowerCase() === 'google') {
-          provider = new GeminiProvider(resolvedModel, config.apiKey);
-        } else {
-          // For non-Google providers, use AIProviderFactory to get AIService
-          // and wrap it into the executor pattern via the legacy shim in gemini.ts.
-          // The GeminiProvider type is used for the executor signature —
-          // for other providers this path will use the streaming shim.
-          const aiService = AIProviderFactory.getService(config.provider, resolvedModel, config.apiKey);
-          // Fallback: use Google provider if non-google is passed but only Google is supported natively.
-          // When Anthropic/OpenAI streaming providers are added, remove this fallback.
-          provider = new GeminiProvider(resolvedModel, config.apiKey);
-          void aiService; // referenced to avoid unused-var lint error
-        }
+        const providerConfig = {
+          maxRetries: config.maxRetries,
+          retryDelayRateLimit: config.retryDelayRateLimit,
+          retryDelayOther: config.retryDelayOther,
+        };
+
+        // Build provider using AIProviderFactory.
+        const provider: StreamingProvider = AIProviderFactory.getStreamingProvider(
+          config.provider,
+          resolvedModel,
+          config.apiKey,
+          providerConfig
+        );
 
         // User prompt comes from the prompts file — not hardcoded here.
         const userPrompt = buildScannerUserPrompt(projectPath);
@@ -173,16 +174,16 @@ export class ScannerAgent {
 
         // Extract outermost {...} block — handles "text ... { json } ... text"
         const jsonBlockMatch = stripped.match(/\{[\s\S]*\}/);
-        const jsonToParse = jsonBlockMatch ? jsonBlockMatch[0] : stripped;
+        const jsonToParse = jsonBlockMatch ? cleanJsonString(jsonBlockMatch[0]) : cleanJsonString(stripped);
 
         let parsed: Record<string, string> = {};
         try {
           parsed = JSON.parse(jsonToParse);
-        } catch {
+        } catch (err: any) {
           // If still not valid JSON, log a specific message and parsed stays {}
           // so the code below simply won't overwrite anything — backup scan runs
           onLog?.(
-            `AI scanner returned non-JSON response — using static backup scan instead.`,
+            `AI scanner returned non-JSON response — using static backup scan instead. Error: ${err.message}`,
             'warning'
           );
         }
@@ -233,6 +234,31 @@ export class ScannerAgent {
 function buildSummaryString(fileCount: number, stack: DetectedStack): string {
   return `Project contains ${fileCount} files. ` +
     `Detected: ${stack.language} / ${stack.framework} / ${stack.database}`;
+}
+
+// ── Clean JSON String ──────────────────────────────────────────────────────────
+// Cleans trailing commas and comments from LLM outputs before parsing.
+function cleanJsonString(str: string): string {
+  // 1. Remove trailing commas before closing braces and brackets
+  let cleaned = str.replace(/,(\s*[}\]])/g, '$1');
+  
+  // 2. Remove simple comments that are on their own lines or at the end of lines
+  const lines = cleaned.split('\n');
+  const cleanedLines = lines.map(line => {
+    const commentIdx = line.indexOf('//');
+    if (commentIdx !== -1) {
+      const beforeComment = line.substring(0, commentIdx);
+      if (!beforeComment.match(/https?:\s*$/i)) {
+        const quoteCount = (beforeComment.match(/"/g) || []).length;
+        if (quoteCount % 2 === 0) {
+          return beforeComment.trim();
+        }
+      }
+    }
+    return line;
+  });
+  
+  return cleanedLines.join('\n').trim();
 }
 
 // ── Static Backup Scan ────────────────────────────────────────────────────────

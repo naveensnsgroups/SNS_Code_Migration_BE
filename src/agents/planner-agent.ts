@@ -22,9 +22,10 @@ import { DetectedStack, TargetStack } from '../types.js';
 import { toolRegistry } from '../core/tool-invocation-registry.js';
 import { ToolContext } from '../types/tool.js';
 import { AgentExecutor } from './agentExecutor.js';
-import { GeminiProvider } from '../ai/gemini.js';
 import { TaskContextManager } from '../session/taskContext.js';
 import { SessionManager } from '../session/sessionManager.js';
+import { AIProviderFactory } from '../ai/provider.js';
+import { StreamingProvider } from '../types/language-model.js';
 import { ANALYZER_SYSTEM_PROMPT } from '../prompts/analyzer-prompt.js';
 import { STAGE1_PLANNER_AGENT } from './agent-definitions.js';
 import fs from 'fs-extra';
@@ -100,11 +101,42 @@ export class PlannerAgent {
       STAGE1_PLANNER_AGENT.languageModelRequirements[0]?.identifier?.replace('alias:', '') ??
       '';
 
-    // Resolve API key: session.apiKey (set by orchestrator from request body)
-    const apiKey = (session as any)?.apiKey ?? '';
+    // Resolve API key for the chosen provider
+    const providerName = targetStack.provider.toLowerCase();
+    let apiKey = (session as any)?.apiKey ?? '';
+    if ((session as any)?.apiKeys) {
+      if (providerName === 'anthropic' && (session as any).apiKeys.anthropic) apiKey = (session as any).apiKeys.anthropic;
+      else if (providerName === 'openai' && (session as any).apiKeys.openai) apiKey = (session as any).apiKeys.openai;
+      else if (providerName === 'google' && (session as any).apiKeys.google) apiKey = (session as any).apiKeys.google;
+      else if (providerName === 'grok' && (session as any).apiKeys.grok) apiKey = (session as any).apiKeys.grok;
+      else if (providerName === 'groq' && (session as any).apiKeys.groq) apiKey = (session as any).apiKeys.groq;
+      else if (providerName === 'openrouter' && (session as any).apiKeys.openrouter) apiKey = (session as any).apiKeys.openrouter;
+      else if (providerName === 'huggingface' && (session as any).apiKeys.huggingface) apiKey = (session as any).apiKeys.huggingface;
+    }
 
-    // Build the streaming GeminiProvider (SNS IDE standard)
-    const provider = new GeminiProvider(resolvedModel, apiKey);
+    if (!apiKey) {
+      if (providerName === 'anthropic') apiKey = process.env.ANTHROPIC_API_KEY || '';
+      else if (providerName === 'openai') apiKey = process.env.OPENAI_API_KEY || '';
+      else if (providerName === 'google') apiKey = process.env.GEMINI_API_KEY || process.env.GOOGLE_API_KEY || '';
+      else if (providerName === 'grok') apiKey = process.env.XAI_API_KEY || '';
+      else if (providerName === 'groq') apiKey = process.env.GROQ_API_KEY || '';
+      else if (providerName === 'openrouter') apiKey = process.env.OPENROUTER_API_KEY || '';
+      else if (providerName === 'huggingface') apiKey = process.env.HF_API_KEY || process.env.HF_TOKEN || '';
+    }
+
+    const providerConfig = {
+      maxRetries: (session as any)?.googleMaxRetries,
+      retryDelayRateLimit: (session as any)?.googleRetryDelayRateLimit,
+      retryDelayOther: (session as any)?.googleRetryDelayOther,
+    };
+
+    // Build the streaming provider via factory
+    const provider: StreamingProvider = AIProviderFactory.getStreamingProvider(
+      targetStack.provider,
+      resolvedModel,
+      apiKey,
+      providerConfig
+    );
 
     // ── Tool context ───────────────────────────────────────────────────────
     const context: ToolContext = {
@@ -127,12 +159,12 @@ export class PlannerAgent {
     const activePhase = taskContext.active_phase || '1';
 
     if (activePhase !== '1') {
-      onLog?.(`ℹ️ Task context shows phase '${activePhase}' — analysis already completed. Skipping.`, 'info');
+      onLog?.(`ℹ Task context shows phase '${activePhase}' — analysis already completed. Skipping.`, 'info');
       return `Stage 1 Phase 1 already completed (phase: ${activePhase}).`;
     }
 
     // ── Phase 1: Codebase Discovery and Analysis ───────────────────────────
-    onLog?.('🔎 Phase 1: Starting Codebase Discovery & Analysis...', 'info');
+    onLog?.(' Phase 1: Starting Codebase Discovery & Analysis...', 'info');
 
     // System prompt: base from prompts file + optional custom rules fragment
     const customRules = promptFragments[CUSTOM_RULES_FRAGMENT_ID];
