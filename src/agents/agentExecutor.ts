@@ -26,13 +26,13 @@ import {
   isToolCallResponsePart,
   ToolCallResult,
   UserRequest,
+  StreamingProvider,
 } from '../types/language-model.js';
 import { ToolRequest, ToolContext } from '../types/tool.js';
 import { EventBroadcaster } from '../routes/stream.js';
 import { SessionManager } from '../session/sessionManager.js';
 import { TokenUsage } from '../types.js';
 import { TokenUsageEntry } from '../session/types.js';
-import { GeminiProvider } from '../ai/gemini.js';
 
 // ── Per-provider cost table (USD per 1M tokens) ───────────────────────────────
 export const COST_TABLE: Record<string, [number, number]> = {
@@ -69,7 +69,7 @@ export class AgentExecutor {
    * Message chain (SNS IDE standard):
    *   [system:text] → [user:text] → [ai:tool_use] → [user:tool_result] → [ai:tool_use] → ... → [ai:text]
    *
-   * @param provider      GeminiProvider instance
+   * @param provider      StreamingProvider instance
    * @param systemPrompt  Agent system persona and rules
    * @param userPrompt    The task instruction for this run
    * @param tools         ToolRequest[] available to this agent (SNS IDE standard)
@@ -78,7 +78,7 @@ export class AgentExecutor {
    * @param modelName     Model identifier for cost calculation
    */
   static async execute(
-    provider: GeminiProvider,
+    provider: StreamingProvider,
     systemPrompt: string,
     userPrompt: string,
     tools: ToolRequest[],

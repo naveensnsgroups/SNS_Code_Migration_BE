@@ -1,5 +1,14 @@
 import express from 'express';
 import dotenv from 'dotenv';
+import { Agent, setGlobalDispatcher } from 'undici';
+
+// Prevent Node.js undici client from aborting active generative AI streams
+setGlobalDispatcher(new Agent({
+  headersTimeout: 0,       // 0 disables headers timeout (waits indefinitely)
+  bodyTimeout: 0,          // 0 disables body timeout (waits indefinitely)
+  keepAliveTimeout: 60000, // 1 minute keep alive
+}));
+
 import { corsMiddleware } from './middleware/cors.js';
 import { errorHandler } from './middleware/errorHandler.js';
 

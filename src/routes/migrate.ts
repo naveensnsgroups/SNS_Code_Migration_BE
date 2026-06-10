@@ -40,11 +40,23 @@ router.post('/start', async (req: Request, res: Response, next: NextFunction) =>
     }
 
     // Save AI config settings to session (used by orchestrator + agents)
-    if (toolsConfig || aliasesConfig || promptFragments) {
+    // Save AI config settings to session (used by orchestrator + agents)
+    const {
+      googleMaxRetries, googleRetryDelayRateLimit, googleRetryDelayOther
+    } = req.body as any;
+
+    if (
+      toolsConfig || aliasesConfig || promptFragments ||
+      googleMaxRetries !== undefined || googleRetryDelayRateLimit !== undefined ||
+      googleRetryDelayOther !== undefined
+    ) {
       await SessionManager.updateSession(sessionId, {
         ...(toolsConfig && { toolsConfig }),
         ...(aliasesConfig && { aliasesConfig }),
         ...(promptFragments && { promptFragments }),
+        ...(googleMaxRetries !== undefined && { googleMaxRetries: parseInt(googleMaxRetries, 10) }),
+        ...(googleRetryDelayRateLimit !== undefined && { googleRetryDelayRateLimit: parseInt(googleRetryDelayRateLimit, 10) }),
+        ...(googleRetryDelayOther !== undefined && { googleRetryDelayOther: parseInt(googleRetryDelayOther, 10) }),
       });
     }
 

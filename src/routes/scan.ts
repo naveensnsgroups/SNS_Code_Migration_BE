@@ -78,36 +78,68 @@ router.post('/', upload.array('files'), async (req: Request, res: Response, next
       await SessionManager.addLog(sessionId, `Project root detected and set to subfolder: ${commonParent}`, 'info');
     }
 
-    // 3. Build AI config from request body and run scanner agent
+    // 3. Build AI config from request body and run codebase scanner agent
     await SessionManager.addLog(sessionId, 'Running codebase scanner agent...', 'info');
 
     const { provider, model, apiKey } = req.body;
+    const maxRetries = req.body.maxRetries ? parseInt(req.body.maxRetries, 10) : undefined;
+    const retryDelayRateLimit = req.body.retryDelayRateLimit ? parseInt(req.body.retryDelayRateLimit, 10) : undefined;
+    const retryDelayOther = req.body.retryDelayOther ? parseInt(req.body.retryDelayOther, 10) : undefined;
+    const timeoutMs = req.body.timeoutMs ? parseInt(req.body.timeoutMs, 10) : undefined;
+
     const aiConfig: ScannerAgentConfig | undefined =
       (provider && apiKey)
-        ? { provider, model: model || undefined, apiKey }
+        ? {
+            provider,
+            model: model || undefined,
+            apiKey,
+            maxRetries,
+            retryDelayRateLimit,
+            retryDelayOther,
+            timeoutMs
+          }
         : undefined;
 
     if (!aiConfig) {
       await SessionManager.addLog(sessionId, 'No AI provider configured — using static manifest scan.', 'info');
     }
 
-    const scanResult = await ScannerAgent.run(
+    // Run scanner agent in the background asynchronously
+    ScannerAgent.run(
       session.projectPath,
       aiConfig,
-      async (msg, lvl) => { await SessionManager.addLog(sessionId, msg, lvl ?? 'info'); }
-    );
+      async (msg, lvl) => {
+        const entry = await SessionManager.addLog(sessionId, msg, lvl ?? 'info');
+        const { EventBroadcaster } = await import('./stream.js');
+        EventBroadcaster.broadcast(sessionId, 'log', entry);
+      }
+    ).then(async (scanResult) => {
+      // Update session settings on completion
+      await SessionManager.updateSession(sessionId, {
+        detectedStack: scanResult.detectedStack,
+        fileTree: scanResult.fileTree,
+        totalFiles: scanResult.fileList.length,
+      });
 
-    // 4. Update session settings
-    const updatedSession = await SessionManager.updateSession(sessionId, {
-      detectedStack: scanResult.detectedStack,
-      fileTree: scanResult.fileTree,
-      totalFiles: scanResult.fileList.length,
+      // Broadcast scan completion to SSE clients
+      const { EventBroadcaster } = await import('./stream.js');
+      EventBroadcaster.broadcast(sessionId, 'complete', {
+        success: true,
+        detectedStack: scanResult.detectedStack,
+        fileTree: scanResult.fileTree,
+        isScan: true,
+      });
+    }).catch(async (err: any) => {
+      console.error(`Background scan error for session ${sessionId}:`, err);
+      await SessionManager.addLog(sessionId, `Scan failed: ${err.message}`, 'error');
+      
+      const { EventBroadcaster } = await import('./stream.js');
+      EventBroadcaster.broadcast(sessionId, 'error', { message: err.message });
     });
 
+    // Return the sessionId immediately to the client
     res.json({
       sessionId,
-      fileTree: scanResult.fileTree,
-      detectedStack: scanResult.detectedStack,
     });
   } catch (err) {
     next(err);

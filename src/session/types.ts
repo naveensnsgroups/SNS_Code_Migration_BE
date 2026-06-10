@@ -51,6 +51,9 @@ export interface MigrationSession {
   toolsConfig?: Record<string, boolean>;        // tool enablement map
   aliasesConfig?: Record<string, string>;        // alias → resolved model string
   promptFragments?: Record<string, string>;      // fragment id → custom prompt text
+  googleMaxRetries?: number;
+  googleRetryDelayRateLimit?: number;
+  googleRetryDelayOther?: number;
   tokenUsage?: TokenUsage;                       // cumulative token counts for this session
   tokenUsageHistory?: TokenUsageEntry[];          // per-request history (SNS IDE TokenUsageService pattern)
 }

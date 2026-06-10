@@ -132,13 +132,81 @@ function formatResultPreview(result: ToolCallResult): string {
 
 // ── Gemini Provider ───────────────────────────────────────────────────────────
 
+export interface GeminiProviderConfig {
+  maxRetries?: number;
+  retryDelayRateLimit?: number;
+  retryDelayOther?: number;
+}
+
+function isRateLimitError(err: any): boolean {
+  const errMsg = String(err?.message || err || '').toLowerCase();
+  const status = err?.status || err?.statusCode || err?.status_code;
+  if (status === 429) return true;
+  return (
+    errMsg.includes('429') ||
+    errMsg.includes('resourceexhausted') ||
+    errMsg.includes('resource_exhausted') ||
+    errMsg.includes('quota') ||
+    errMsg.includes('rate limit')
+  );
+}
+
 export class GeminiProvider {
   private readonly modelName: string;
   private readonly apiKey: string;
+  private readonly config?: GeminiProviderConfig;
 
-  constructor(model: string, apiKey: string) {
+  constructor(model: string, apiKey: string, config?: GeminiProviderConfig) {
     this.modelName = model;
     this.apiKey = apiKey;
+    this.config = config;
+  }
+
+  private async withRetry<T>(
+    fn: () => Promise<T>,
+    toolCtx?: ToolContext
+  ): Promise<T> {
+    const maxRetries = this.config?.maxRetries ?? 3;
+    const retryDelayRateLimit = this.config?.retryDelayRateLimit ?? 60; // in seconds
+    const retryDelayOther = this.config?.retryDelayOther ?? -1; // in seconds
+
+    let attempt = 0;
+    while (true) {
+      try {
+        return await fn();
+      } catch (err: any) {
+        attempt++;
+        if (attempt > maxRetries) {
+          throw err;
+        }
+
+        const isRateLimit = isRateLimitError(err);
+        let delaySeconds = 0;
+
+        if (isRateLimit) {
+          if (retryDelayRateLimit < 0) {
+            throw err;
+          }
+          delaySeconds = retryDelayRateLimit;
+        } else {
+          if (retryDelayOther < 0) {
+            throw err;
+          }
+          delaySeconds = retryDelayOther;
+        }
+
+        const errMsg = err instanceof Error ? err.message : String(err);
+        const logMsg = `⚠️ Gemini API call failed (${errMsg}). Retrying attempt ${attempt}/${maxRetries} in ${delaySeconds}s...`;
+
+        if (toolCtx?.onLog) {
+          toolCtx.onLog(logMsg, 'warning');
+        } else {
+          console.warn(logMsg);
+        }
+
+        await new Promise((resolve) => setTimeout(resolve, delaySeconds * 1000));
+      }
+    }
   }
 
   /**
@@ -152,7 +220,9 @@ export class GeminiProvider {
     userRequest: UserRequest,
     toolCtx?: ToolContext
   ): Promise<LanguageModelStreamResponse> {
-    const genAI = new GoogleGenAI({ apiKey: this.apiKey });
+    const genAI = new GoogleGenAI({
+      apiKey: this.apiKey,
+    });
     return this.handleStreamingRequest(genAI, userRequest, toolCtx, []);
   }
 
@@ -175,21 +245,25 @@ export class GeminiProvider {
 
     const allContents = [...contents, ...extraContents];
 
-    const stream = await genAI.models.generateContentStream({
-      model: this.modelName,
-      config: {
-        systemInstruction: systemMessage,         // ← separate from contents
-        responseModalities: [Modality.TEXT],
-        ...(functionDeclarations.length > 0 && {
-          toolConfig: {
-            functionCallingConfig: { mode: FunctionCallingConfigMode.AUTO }
+    const stream = await this.withRetry(
+      () =>
+        genAI.models.generateContentStream({
+          model: this.modelName,
+          config: {
+            systemInstruction: systemMessage, // ← separate from contents
+            responseModalities: [Modality.TEXT],
+            ...(functionDeclarations.length > 0 && {
+              toolConfig: {
+                functionCallingConfig: { mode: FunctionCallingConfigMode.AUTO },
+              },
+              tools: [{ functionDeclarations }],
+            }),
+            temperature: 0.1,
           },
-          tools: [{ functionDeclarations }]
+          contents: allContents,
         }),
-        temperature: 0.1,
-      },
-      contents: allContents,
-    });
+      toolCtx
+    );
 
     // Store refs for the recursive tool call
     const providerThis = this;
@@ -198,18 +272,21 @@ export class GeminiProvider {
       stream: (async function* (): AsyncIterable<LanguageModelStreamPart> {
         // Map of callId → { name, argsJson } for all function calls in this turn
         const toolCallMap = new Map<string, { name: string; args: string; id: string }>();
+        const collectedParts: Part[] = [];
 
         for await (const chunk of stream) {
           const parts = chunk.candidates?.[0]?.content?.parts;
 
           if (parts) {
             for (const part of parts) {
+              collectedParts.push(part);
               if (part.text) {
                 const textPart: TextResponsePart = { content: part.text };
                 yield textPart;
               } else if (part.functionCall) {
                 const fc = part.functionCall;
                 const callId = fc.id ?? `call_${fc.name}_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`;
+                fc.id = callId;
 
                 if (!toolCallMap.has(callId)) {
                   const argsStr = fc.args ? JSON.stringify(fc.args) : '{}';
@@ -258,7 +335,7 @@ export class GeminiProvider {
 
         // ── Process tool calls (recursive loop like SNS IDE) ──────────────
         if (toolCallMap.size > 0) {
-          const toolResults: Content[] = [];
+          const toolResultList: Array<{ name: string; result: ToolCallResult; id: string; arguments: string }> = [];
           const finishedCalls: StreamToolCall[] = [];
 
           for (const [callId, tc] of toolCallMap) {
@@ -277,7 +354,6 @@ export class GeminiProvider {
                 result = await tool.handler(tc.args, toolCtx ? { ...toolCtx, toolCallId: callId } : undefined);
                 toolCtx?.onLog?.(`[Tool Response] ${tc.name} completed.`, 'success');
                 // Emit the actual response data so the terminal can show it in the expanded row
-                // (mirrors SNS IDE which shows the tool result inline when expanded)
                 const resultPreview = formatResultPreview(result);
                 if (resultPreview) {
                   toolCtx?.onLog?.(`[Tool Data] ${resultPreview}`, 'info');
@@ -289,11 +365,12 @@ export class GeminiProvider {
               }
             }
 
-            // Append model's function call part + user's function response part
-            toolResults.push(
-              { role: 'model', parts: [{ functionCall: { id: callId, name: tc.name, args: JSON.parse(tc.args) } }] },
-              { role: 'user',  parts: [{ functionResponse: { name: tc.name, response: toFunctionResponse(result) } }] }
-            );
+            toolResultList.push({
+              name: tc.name,
+              result,
+              id: callId,
+              arguments: tc.args
+            });
 
             finishedCalls.push({
               id: callId,
@@ -305,12 +382,28 @@ export class GeminiProvider {
             yield { tool_calls: finishedCalls } as ToolCallResponsePart;
           }
 
+          // Format tool responses for Gemini
+          // According to Gemini docs and SNS IDE implementation, functionResponse needs name and response
+          const toolResponses: Part[] = toolResultList.map(call => ({
+            functionResponse: {
+              name: call.name,
+              response: toFunctionResponse(call.result)
+            }
+          }));
+          const responseMessage: Content = { role: 'user', parts: toolResponses };
+
+          // Build the model's response content from collected parts
+          const modelResponseParts = collectedParts.filter(p => !p.thought);
+          const modelContent: Content = { role: 'model', parts: modelResponseParts };
+
+          const recursiveContents = [...extraContents, modelContent, responseMessage];
+
           // Recursive: send tool results back to Gemini for next LLM turn
           const nextResponse = await providerThis.handleStreamingRequest(
             genAI,
             userRequest,
             toolCtx,
-            [...extraContents, ...toolResults]
+            recursiveContents
           );
 
           for await (const part of nextResponse.stream) {

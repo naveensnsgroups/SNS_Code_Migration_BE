@@ -1,8 +1,9 @@
 import { ClaudeService } from './claude.js';
 import { OpenAIService } from './openai.js';
-import { GeminiService } from './gemini.js';
+import { GeminiService, GeminiProvider, GeminiProviderConfig } from './gemini.js';
 import { HuggingFaceService } from './huggingface.js';
 import { ToolDefinition } from '../tools/registry.js';
+import { StreamingProvider } from '../types/language-model.js';
 
 export interface AICompletionResponse {
   text: string;
@@ -61,6 +62,27 @@ export class AIProviderFactory {
         return new HuggingFaceService(model, apiKey);
       default:
         throw new Error(`Unsupported AI provider: ${provider}`);
+    }
+  }
+
+  static getStreamingProvider(
+    provider: string,
+    model: string,
+    apiKey: string,
+    config?: GeminiProviderConfig
+  ): StreamingProvider {
+    switch (provider.toLowerCase()) {
+      case 'google':
+        return new GeminiProvider(model, apiKey, config);
+      // Skeletons for future streaming providers
+      case 'anthropic':
+      case 'openai':
+      case 'grok':
+      case 'groq':
+      case 'openrouter':
+      case 'huggingface':
+      default:
+        throw new Error(`Streaming provider "${provider}" is not yet implemented. Please implement its streaming provider class in src/ai/ and register it here.`);
     }
   }
 }

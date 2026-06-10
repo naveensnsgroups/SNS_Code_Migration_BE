@@ -176,3 +176,11 @@ export interface UserRequest extends LanguageModelRequest {
 export interface LanguageModelStreamResponse {
   stream: AsyncIterable<LanguageModelStreamPart>;
 }
+
+export interface StreamingProvider {
+  request(
+    userRequest: UserRequest,
+    toolCtx?: import('./tool.js').ToolContext
+  ): Promise<LanguageModelStreamResponse>;
+}
+
