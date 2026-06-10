@@ -207,42 +207,73 @@ export class PlannerAgent {
 }
 
 // ── User Prompt Builder ───────────────────────────────────────────────────────
-// Constructs the user-facing task prompt for the FileAnalyzer sub-agent.
+// Builds the user task prompt for @FileAnalyzer sub-agent.
 //
-// KEY RULES:
-//  - NO target stack mentioned — pure legacy analysis only
-//  - NO "migrate to X" language
-//  - Passes detectedStack as approximate context (LLM must verify by reading files)
+// Rules:
+//  - NO target stack mentioned. Pure legacy documentation only.
+//  - Discovery-first: workspace tools reveal what exists. No assumptions.
+//  - Language-agnostic: adapts to whatever language is found.
 
 function buildAnalyzerUserPrompt(legacyPath: string, detectedStack: DetectedStack): string {
-  return `Please perform a complete static analysis of the legacy project located at "${legacyPath}".
+  return `Perform a complete static analysis of the legacy project at: "${legacyPath}"
 
-Your task is to fully understand and document this codebase as it currently exists.
-Do NOT suggest any changes or target technologies. Do NOT mention a migration target.
+GOAL: Produce "${PHASE1_OUTPUT_FILE}" covering all 26 required sections.
+Do NOT suggest improvements, target technologies, or migration strategies.
+This is pure documentation of the legacy codebase exactly as it exists.
 
-Initial heuristic scan detected:
-  - Language:         ${detectedStack.language}
-  - Framework:        ${detectedStack.framework}
-  - Database:         ${detectedStack.database}
-  - Package Manager:  ${detectedStack.packageManager}
-  - File Count:       ${detectedStack.fileCount}
+Initial heuristic scan (treat as approximate — verify everything by reading manifests):
+  Language:        ${detectedStack.language}
+  Framework:       ${detectedStack.framework}
+  Database:        ${detectedStack.database}
+  Package Manager: ${detectedStack.packageManager}
+  File Count:      ${detectedStack.fileCount}
 
-These detections may be approximate — verify them by reading the actual manifest files.
+Follow your system prompt workflow in order:
 
-Follow your system prompt workflow exactly:
-  1. Load task context to check for any prior progress (LAST_FILE_ANALYZED, file-index).
-  2. Call getEnvironmentInfo to detect runtime versions and system environment.
-  3. Call getGitLog to identify high-churn files (migration risks) and dead code candidates.
-  4. Call getWorkspaceDirectoryStructure to understand the project layout.
-  5. Run Language Profile Detection: find all manifest files via findFilesByPattern.
-  6. Call scanAssetFiles for mandatory asset inventory.
-  7. Build the MANDATORY_FILE_INDEX of all source files and save it via edit_task_context.
-  8. For EACH file in the index:
-     a. Call extractFileSymbols to determine reading strategy (SMALL / MEDIUM / LARGE / ULTRA_LARGE).
-     b. Read the file according to the determined strategy.
-     c. Call todoWrite to mark it completed in the audit trail.
-     d. Every 10 files: call update-migration-dashboard with current progress %.
-  9. Build BUSINESS_RULES_BY_FILE per-file map and save via edit_task_context.
-  10. Build DEPENDENCY_MAP via getDependencyTree.
-  11. Write the comprehensive "${PHASE1_OUTPUT_FILE}" report via write_file.`;
+STEP 1 — Resume check:
+  Call get_task_context. If resuming, start from LAST_FILE_ANALYZED.
+
+STEP 2 — Discover the workspace:
+  Call getWorkspaceDirectoryStructure (monorepo check).
+  Call getEnvironmentInfo (runtime versions).
+  Call getGitLog (HIGH_CHURN_FILES, DEAD_CODE_CANDIDATES).
+  Call findFilesByPattern for ALL manifest types to detect language profiles.
+  Call scanAssetFiles for asset inventory.
+  Save LANGUAGE_PROFILES under key "lang-profiles".
+
+STEP 3 — Build MANDATORY_FILE_INDEX:
+  Index every source file discovered. Type determined by content + location, not extension.
+  Save under key "file-index". Save FILE_INDEX_KEY and TOTAL_FILES inline.
+
+STEP 4 — Read and analyze EVERY file:
+  Follow the 4-tier reading strategy (SMALL/MEDIUM/LARGE/ULTRA_LARGE) per system prompt rules.
+  For each file — extract what it contains, adapted to the detected language:
+    callable units, data contracts, entry points, external dependencies,
+    business logic, configuration values, error types.
+  Save under key "analysis:[escaped_path]". Mark DONE in FILE_INDEX.
+  Use batch-read-files for groups of SMALL files. Checkpoint every 10 files.
+
+STEP 5 — Trace cross-module call flows:
+  Identify 5–10 critical use-cases. Trace the full execution path for each.
+  Save under key "call-flows".
+
+STEP 6 — Phase completion audit:
+  Verify DONE_COUNT === TOTAL_FILES before writing the report.
+  Go back and read any PENDING files if found.
+
+STEP 7 — Write "${PHASE1_OUTPUT_FILE}" via write_file:
+  All 26 sections must be present. Adapt content to what was actually found.
+  After each section: save SECTION_[N]_WRITTEN=true.
+  Sections: 1.Project Identity, 2.Architecture, 3.Source Structure, 4.File Classification,
+  5.Domain Models, 6.Dependencies, 7.Functions, 8.Function Behaviors, 9.Business Rules,
+  10.API Contracts, 11.Security, 12.Middleware, 13.Database Operations, 14.Call Flows,
+  15.Data Transformations, 16.Configuration, 17.Error Handling, 18.Validation Rules,
+  19.State Transitions, 20.Async Processing, 21.Testing, 22.Transactions, 23.Event Flows,
+  24.External Integrations, 25.Scheduled Jobs, 26.Risk Scorecard.
+
+STEP 8 — Section completion gate:
+  Verify all 26 SECTION_[N]_WRITTEN=true. Write any missing section.
+  Save ACTIVE_PHASE=complete, STAGE1_ANALYSIS_WRITTEN=true.`;
 }
+
+
