@@ -163,25 +163,29 @@ export class ScannerAgent {
           'scanner-agent'
         );
 
-        // Parse the agent's JSON response robustly.
-        // Gemini sometimes prefixes JSON with explanation text ("The user wants...").
-        // Strategy: strip markdown fences first, then find the first {...} block,
-        // then fall back to parsing the whole trimmed string.
+        // ── Parse the agent's JSON response — bulletproof extraction ────────
+        // LLM can return any of these patterns:
+        //   1. Raw:           { "language": "C++", ... }
+        //   2. Fenced:        ```json\n{ ... }\n```
+        //   3. Text+JSON:     "Here is the result:\n{ ... }"
+        //   4. Double-object: { ... }\n{ ... }   ← take only FIRST match
+        //   5. Comments:      { // inline comment\n "key": "val" }
+        //   6. Trailing text: { ... }\nSome explanation after
+
+        // Step 1: Strip markdown code fences (```json...``` or ```...```)
         const stripped = executorResponse
-          .replace(/```json/gi, '')
-          .replace(/```/gi, '')
+          .replace(/```json\s*/gi, '')
+          .replace(/```\s*/gi, '')
           .trim();
 
-        // Extract outermost {...} block — handles "text ... { json } ... text"
-        const jsonBlockMatch = stripped.match(/\{[\s\S]*\}/);
-        const jsonToParse = jsonBlockMatch ? cleanJsonString(jsonBlockMatch[0]) : cleanJsonString(stripped);
+        // Step 2: Extract the FIRST complete {...} block (handles text before/after JSON)
+        // Uses a stack-based extractor to find the matching closing brace correctly
+        const jsonToParse = extractFirstJsonObject(stripped);
 
         let parsed: Record<string, string> = {};
         try {
           parsed = JSON.parse(jsonToParse);
         } catch (err: any) {
-          // If still not valid JSON, log a specific message and parsed stays {}
-          // so the code below simply won't overwrite anything — backup scan runs
           onLog?.(
             `AI scanner returned non-JSON response — using static backup scan instead. Error: ${err.message}`,
             'warning'
@@ -236,29 +240,81 @@ function buildSummaryString(fileCount: number, stack: DetectedStack): string {
     `Detected: ${stack.language} / ${stack.framework} / ${stack.database}`;
 }
 
-// ── Clean JSON String ──────────────────────────────────────────────────────────
-// Cleans trailing commas and comments from LLM outputs before parsing.
-function cleanJsonString(str: string): string {
-  // 1. Remove trailing commas before closing braces and brackets
-  let cleaned = str.replace(/,(\s*[}\]])/g, '$1');
-  
-  // 2. Remove simple comments that are on their own lines or at the end of lines
-  const lines = cleaned.split('\n');
-  const cleanedLines = lines.map(line => {
-    const commentIdx = line.indexOf('//');
-    if (commentIdx !== -1) {
-      const beforeComment = line.substring(0, commentIdx);
-      if (!beforeComment.match(/https?:\s*$/i)) {
-        const quoteCount = (beforeComment.match(/"/g) || []).length;
-        if (quoteCount % 2 === 0) {
-          return beforeComment.trim();
-        }
+
+// ── JSON Extraction Utilities ─────────────────────────────────────────────────
+
+/**
+ * Extracts the FIRST valid {...} JSON object from LLM text output.
+ *
+ * Handles all common LLM output patterns:
+ *   1. Raw JSON:        { "language": "C++", ... }
+ *   2. Fenced:          ```json\n{...}\n``` (fences stripped by caller)
+ *   3. Prefixed text:   "Here's the result:\n{ ... }"
+ *   4. Double objects:  { ... }\n{ ... }  → takes only FIRST block
+ *   5. Inline comments: { // comment\n "key": "val" }
+ *   6. Trailing commas: { "key": "val", }
+ *
+ * Uses stack-based brace counting (not greedy regex) to avoid
+ * "Unexpected non-whitespace character after JSON" on multi-object responses.
+ */
+function extractFirstJsonObject(text: string): string {
+  // Step 1: Remove // line comments outside of string values
+  const withoutComments = removeLineComments(text);
+
+  // Step 2: Find the first opening brace
+  const start = withoutComments.indexOf('{');
+  if (start === -1) return text.trim();
+
+  // Step 3: Stack-count braces to find the matching closing brace
+  let depth = 0;
+  let inString = false;
+  let escape = false;
+  let end = -1;
+
+  for (let i = start; i < withoutComments.length; i++) {
+    const ch = withoutComments[i];
+    if (escape)      { escape = false; continue; }
+    if (ch === '\\' && inString) { escape = true; continue; }
+    if (ch === '"')  { inString = !inString; continue; }
+    if (inString)    continue;
+    if (ch === '{')  depth++;
+    else if (ch === '}') {
+      depth--;
+      if (depth === 0) { end = i; break; }
+    }
+  }
+
+  if (end === -1) return withoutComments.trim();
+
+  // Step 4: Extract and remove trailing commas
+  return removeTrailingCommas(withoutComments.slice(start, end + 1));
+}
+
+/**
+ * Removes // line comments that are NOT inside JSON string values.
+ * Preserves URLs (http://, https://).
+ */
+function removeLineComments(text: string): string {
+  return text.split('\n').map(line => {
+    let inStr = false;
+    let esc = false;
+    for (let i = 0; i < line.length - 1; i++) {
+      const ch = line[i];
+      if (esc)        { esc = false; continue; }
+      if (ch === '\\') { esc = true; continue; }
+      if (ch === '"') { inStr = !inStr; continue; }
+      if (!inStr && ch === '/' && line[i + 1] === '/') {
+        if (/https?:\s*$/.test(line.slice(0, i))) continue; // preserve URLs
+        return line.slice(0, i).trimEnd();
       }
     }
     return line;
-  });
-  
-  return cleanedLines.join('\n').trim();
+  }).join('\n');
+}
+
+/** Removes trailing commas before } or ] (invalid JSON but common in LLM output). */
+function removeTrailingCommas(str: string): string {
+  return str.replace(/,(\s*[}\]])/g, '$1');
 }
 
 // ── Static Backup Scan ────────────────────────────────────────────────────────

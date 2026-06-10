@@ -1,9 +1,19 @@
-import { ClaudeService } from './claude.js';
-import { OpenAIService } from './openai.js';
-import { GeminiService, GeminiProvider, GeminiProviderConfig } from './gemini.js';
-import { HuggingFaceService } from './huggingface.js';
-import { ToolDefinition } from '../tools/registry.js';
+// =============================================================================
+//  provider.ts — AI Provider Factory
+// =============================================================================
+
+// ── Sub-folder imports (SNS IDE structure) ────────────────────────────────────
+import { ClaudeService }    from './anthropic/claude-service.js';
+import { ClaudeProvider, ClaudeProviderConfig } from './anthropic/anthropic-language-model.js';
+import { GeminiService, GeminiProvider, GeminiProviderConfig } from './google/gemini-language-model.js';
+import { OpenAIService }    from './openai/openai-service.js';
+import { HuggingFaceService } from './huggingface/huggingface-service.js';
+
+import { ToolDefinition }   from '../tools/registry.js';
 import { StreamingProvider } from '../types/language-model.js';
+
+// ── Shared Interfaces ─────────────────────────────────────────────────────────
+// Re-exported so downstream modules can import from 'provider.js' directly.
 
 export interface AICompletionResponse {
   text: string;
@@ -39,7 +49,14 @@ export interface AIService {
   ): Promise<AICompletionResponse>;
 }
 
+// ── Provider Factory ──────────────────────────────────────────────────────────
+
 export class AIProviderFactory {
+
+  /**
+   * Returns a legacy (blocking, non-streaming) AIService.
+   * Used only by legacy code paths — prefer getStreamingProvider() for new agent code.
+   */
   static getService(
     provider: string,
     model: string,
@@ -61,28 +78,57 @@ export class AIProviderFactory {
       case 'huggingface':
         return new HuggingFaceService(model, apiKey);
       default:
-        throw new Error(`Unsupported AI provider: ${provider}`);
+        throw new Error(`Unsupported AI provider: "${provider}"`);
     }
   }
 
+  /**
+   * Returns a StreamingProvider — the SNS IDE standard for agent execution.
+   * Used by AgentExecutor and PlannerAgent for all migration sessions.
+   *
+   * Providers:
+   *   google    → GeminiProvider    (src/ai/google/gemini-language-model.ts)
+   *   anthropic → ClaudeProvider    (src/ai/anthropic/anthropic-language-model.ts)
+   *   openai    → (TODO: OpenAIProvider — not yet implemented)
+   */
   static getStreamingProvider(
     provider: string,
     model: string,
     apiKey: string,
-    config?: GeminiProviderConfig
+    config?: GeminiProviderConfig & ClaudeProviderConfig
   ): StreamingProvider {
     switch (provider.toLowerCase()) {
+
+      // ── Google / Gemini ───────────────────────────────────────────────────
       case 'google':
         return new GeminiProvider(model, apiKey, config);
-      // Skeletons for future streaming providers
+
+      // ── Anthropic / Claude ────────────────────────────────────────────────
+      // Uses messages.stream() (true streaming) — NOT messages.create() (blocking)
+      // No timeout — migration sessions can run for hours on large codebases.
       case 'anthropic':
+        return new ClaudeProvider(model, apiKey, config);
+
+      // ── OpenAI-compatible ─────────────────────────────────────────────────
+      // All use same OpenAI-compatible streaming API, different baseURLs.
+      // TODO: Implement OpenAIProvider in src/ai/openai/openai-provider.ts
       case 'openai':
       case 'grok':
       case 'groq':
       case 'openrouter':
+        throw new Error(
+          `Streaming provider "${provider}" (OpenAI-compatible) is not yet implemented. ` +
+          `Add OpenAIProvider to src/ai/openai/openai-provider.ts and register it here.`
+        );
+
       case 'huggingface':
+        throw new Error(`HuggingFace streaming provider not yet implemented.`);
+
       default:
-        throw new Error(`Streaming provider "${provider}" is not yet implemented. Please implement its streaming provider class in src/ai/ and register it here.`);
+        throw new Error(
+          `Unsupported streaming provider: "${provider}". ` +
+          `Available: google, anthropic. Coming soon: openai, grok, groq, openrouter.`
+        );
     }
   }
 }

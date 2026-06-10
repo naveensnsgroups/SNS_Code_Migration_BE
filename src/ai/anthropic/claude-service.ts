@@ -1,6 +1,21 @@
+// =============================================================================
+//  anthropic/claude-service.ts — Legacy AIService shim for Anthropic Claude
+//
+//  SNS IDE folder structure:
+//    src/ai/anthropic/
+//      claude-service.ts             ← this file: legacy blocking AIService
+//      anthropic-language-model.ts   ← streaming StreamingProvider (SNS IDE standard)
+//
+//  ClaudeService is kept ONLY for backward-compat with getService() factory.
+//  All new agent code (AgentExecutor, PlannerAgent) uses ClaudeProvider (streaming).
+//
+//  NOTE: This uses messages.create() which is BLOCKING (non-streaming).
+//  Do NOT use this for long-running migration sessions.
+// =============================================================================
+
 import Anthropic from '@anthropic-ai/sdk';
-import { AIService, AICompletionResponse, ChatMessage } from './provider.js';
-import { ToolDefinition } from '../tools/registry.js';
+import { AIService, AICompletionResponse, ChatMessage } from '../provider.js';
+import { ToolDefinition } from '../../tools/registry.js';
 
 export class ClaudeService implements AIService {
   private client: Anthropic;
@@ -29,24 +44,19 @@ export class ClaudeService implements AIService {
           finalSystemPrompt = systemMsg.content;
         }
 
-        // Group consecutive tool messages to prevent alternate role errors and support parallel tool calls
+        // Group consecutive tool messages to prevent alternate role errors
+        // and support parallel tool calls (multiple tool_result in one user turn)
         const nonSystemMsgs = prompt.filter(m => m.role !== 'system');
         const groupedMsgs: any[] = [];
         for (const m of nonSystemMsgs) {
           if (m.role === 'tool') {
             const last = groupedMsgs[groupedMsgs.length - 1];
             if (last && last.role === 'tool_group') {
-              last.toolResults.push({
-                toolCallId: m.toolCallId || '',
-                content: m.content
-              });
+              last.toolResults.push({ toolCallId: m.toolCallId || '', content: m.content });
             } else {
               groupedMsgs.push({
                 role: 'tool_group',
-                toolResults: [{
-                  toolCallId: m.toolCallId || '',
-                  content: m.content
-                }]
+                toolResults: [{ toolCallId: m.toolCallId || '', content: m.content }]
               });
             }
           } else {
@@ -58,10 +68,8 @@ export class ClaudeService implements AIService {
           if (m.role === 'user') {
             return { role: 'user', content: m.content };
           } else if (m.role === 'assistant') {
-            const content: (Anthropic.TextBlockParam | Anthropic.ToolUseBlockParam)[] = [];
-            if (m.content) {
-              content.push({ type: 'text', text: m.content });
-            }
+            const content: any[] = [];
+            if (m.content) content.push({ type: 'text', text: m.content });
             if (m.toolCalls) {
               m.toolCalls.forEach((tc: any) => {
                 content.push({
@@ -105,7 +113,6 @@ export class ClaudeService implements AIService {
         tools: claudeTools
       });
 
-      // Extract text content and tool use blocks from response
       let text = '';
       const toolCalls: any[] = [];
 
