@@ -34,8 +34,11 @@ import path from 'path';
 // ── Agent Configuration Constants ─────────────────────────────────────────────
 // These are named constants — never hardcoded inline in method calls.
 
-/** Maximum LLM turns for deep codebase analysis (large codebases need more turns). */
-const PHASE1_MAX_TURNS = 60;
+/** Maximum LLM turns for deep codebase analysis.
+ * 80 turns supports EXTREME complexity (200+ files).
+ * Rule R14_turn_budget ensures the agent self-manages within this budget.
+ */
+const PHASE1_MAX_TURNS = 80;
 
 /** Output file name — defined once, referenced everywhere. */
 const PHASE1_OUTPUT_FILE = 'Stage1_Analysis.md';
@@ -158,7 +161,7 @@ export class PlannerAgent {
     const taskContext = await TaskContextManager.getContext(sessionId);
     const activePhase = taskContext.active_phase || '1';
 
-    if (activePhase !== '1') {
+    if (activePhase !== '1' && activePhase !== '1_5') {
       onLog?.(`ℹ Task context shows phase '${activePhase}' — analysis already completed. Skipping.`, 'info');
       return `Stage 1 Phase 1 already completed (phase: ${activePhase}).`;
     }
@@ -185,6 +188,55 @@ export class PlannerAgent {
       resolvedModel,
       'planner-agent'
     );
+
+    // ── Phase 1_5 continuation: If agent set ACTIVE_PHASE=1_5, run a second pass ──
+    // This handles large codebases where reading all files used all turns.
+    // Phase 1_5 = write-only pass: load data from task context, write Stage1_Analysis.md.
+    const taskContextAfter = await TaskContextManager.getContext(sessionId);
+    const phaseAfter = taskContextAfter.active_phase;
+
+    if (phaseAfter === '1_5') {
+      onLog?.('📝 Phase 1_5: Writing Stage1_Analysis.md from collected analysis data...', 'info');
+
+      const phase15UserPrompt = `You are now in ACTIVE_PHASE=1_5.
+
+Your file reading is complete. All data is stored in task context under analysis:[file] named keys.
+
+Your ONLY job now is to write Stage1_Analysis.md with ALL 26 sections.
+
+STEPS:
+1. Call get_task_context to load: file-index, lang-profiles, dep-matrix, call-flows, rules-by-file, all analysis:[file] keys.
+2. Write Stage1_Analysis.md using write_file with all 26 sections.
+3. After each section, save SECTION_N_WRITTEN=true.
+4. After all 26 sections, save ACTIVE_PHASE=complete, STAGE1_ANALYSIS_WRITTEN=true.
+
+Sections required (all 26):
+1.Project Identity, 2.Architecture Overview, 3.Source Structure, 4.File Classification,
+5.Domain Models, 6.Dependencies, 7.Functions (Master Catalog), 8.Function Behaviors,
+9.Business Rules, 10.API Contracts, 11.Security & Permissions, 12.Middleware Execution,
+13.Database Operations, 14.Cross-Module Call Flows, 15.Data Transformations,
+16.Configuration, 17.Error Handling, 18.Validation Rules, 19.State Transitions,
+20.Async Processing, 21.Testing & Verification, 22.Transactions, 23.Event Flows,
+24.External Integrations, 25.Scheduled Jobs & Workers, 26.Risk Scorecard.
+
+Do NOT do any file reading. All data is already in task context.
+Write the report NOW.`;
+
+      const phase15Result = await AgentExecutor.execute(
+        provider,
+        systemPrompt,
+        phase15UserPrompt,
+        allPhase1Tools,
+        context,
+        PHASE1_MAX_TURNS,
+        resolvedModel,
+        'planner-agent-phase15'
+      );
+
+      if (phase15Result) {
+        onLog?.('✅ Phase 1_5 complete. Stage1_Analysis.md written.', 'success');
+      }
+    }
 
     // ── Verify output was written ──────────────────────────────────────────
     const outputFilePath = path.join(modernPath, PHASE1_OUTPUT_FILE);

@@ -1,6 +1,23 @@
+// =============================================================================
+//  openai/openai-service.ts — OpenAI & OpenAI-Compatible Legacy AIService
+//
+//  SNS IDE folder structure:
+//    src/ai/openai/
+//      openai-service.ts    ← this file: legacy blocking AIService
+//
+//  Supports OpenAI-compatible APIs via custom baseURL:
+//    - OpenAI:     (default endpoint)
+//    - Grok:       https://api.x.ai/v1
+//    - Groq:       https://api.groq.com/openai/v1
+//    - OpenRouter: https://openrouter.ai/api/v1
+//
+//  TODO: Add openai-language-model.ts with chat.completions.stream()
+//        to support streaming in AgentExecutor ReAct loop.
+// =============================================================================
+
 import OpenAI from 'openai';
-import { AIService, AICompletionResponse, ChatMessage } from './provider.js';
-import { ToolDefinition } from '../tools/registry.js';
+import { AIService, AICompletionResponse, ChatMessage } from '../provider.js';
+import { ToolDefinition } from '../../tools/registry.js';
 
 export class OpenAIService implements AIService {
   private client: OpenAI;
@@ -9,7 +26,7 @@ export class OpenAIService implements AIService {
   constructor(model: string, apiKey: string, baseURL?: string) {
     this.client = new OpenAI({
       apiKey,
-      baseURL: baseURL || undefined, // undefined uses standard OpenAI endpoint
+      baseURL: baseURL || undefined,
     });
     this.model = model;
   }
@@ -42,19 +59,12 @@ export class OpenAIService implements AIService {
               assistantMsg.tool_calls = m.toolCalls.map(tc => ({
                 id: tc.id,
                 type: 'function',
-                function: {
-                  name: tc.function.name,
-                  arguments: tc.function.arguments
-                }
+                function: { name: tc.function.name, arguments: tc.function.arguments }
               }));
             }
             return assistantMsg;
           } else if (m.role === 'tool') {
-            return {
-              role: 'tool',
-              content: m.content,
-              tool_call_id: m.toolCallId || ''
-            };
+            return { role: 'tool', content: m.content, tool_call_id: m.toolCallId || '' };
           }
           throw new Error(`Unsupported chat message role: ${m.role}`);
         });
@@ -62,18 +72,14 @@ export class OpenAIService implements AIService {
 
       const openAiTools = tools && tools.length > 0 ? tools.map(t => ({
         type: 'function' as const,
-        function: {
-          name: t.name,
-          description: t.description,
-          parameters: t.parameters
-        }
+        function: { name: t.name, description: t.description, parameters: t.parameters }
       })) : undefined;
 
       const response = await this.client.chat.completions.create({
         model: this.model,
         messages,
         tools: openAiTools,
-        temperature: 0.1, // low temperature for precise code migration
+        temperature: 0.1,
       });
 
       const choiceMessage = response.choices[0]?.message;
@@ -83,10 +89,7 @@ export class OpenAIService implements AIService {
         toolCalls: choiceMessage?.tool_calls ? choiceMessage.tool_calls.map(tc => ({
           id: tc.id,
           type: 'function' as const,
-          function: {
-            name: tc.function.name,
-            arguments: tc.function.arguments
-          }
+          function: { name: tc.function.name, arguments: tc.function.arguments }
         })) : undefined,
         usage: {
           promptTokens: response.usage?.prompt_tokens ?? 0,

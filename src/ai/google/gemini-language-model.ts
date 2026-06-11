@@ -31,9 +31,9 @@ import {
   StreamToolCall,
   makeToolErrorResult,
   ToolCallResult,
-} from '../types/language-model.js';
-import { ToolRequest, ToolContext } from '../types/tool.js';
-import { UserRequest } from '../types/language-model.js';
+} from '../../types/language-model.js';
+import { ToolRequest, ToolContext } from '../../types/tool.js';
+import { UserRequest } from '../../types/language-model.js';
 
 // ── Message Conversion ────────────────────────────────────────────────────────
 // Mirrors google-language-model.ts transformToGeminiMessages()
@@ -220,6 +220,8 @@ export class GeminiProvider {
     userRequest: UserRequest,
     toolCtx?: ToolContext
   ): Promise<LanguageModelStreamResponse> {
+    // NOTE: No timeout set — migration analysis can run for hours on large codebases.
+    // The GoogleGenAI SDK default is no timeout (unlimited), which is correct here.
     const genAI = new GoogleGenAI({
       apiKey: this.apiKey,
     });
@@ -418,11 +420,11 @@ export class GeminiProvider {
 }
 
 // ── Legacy Compatibility Shim ─────────────────────────────────────────────────
-// Keeps existing planner-agent.ts calling pattern working while we migrate.
+// Keeps existing calling patterns working while we migrate to full streaming.
 // Will be removed once agentExecutor is fully ported to streaming.
 
-import { AIService, AICompletionResponse } from './provider.js';
-import { ToolDefinition } from '../tools/registry.js';
+import { AIService, AICompletionResponse } from '../provider.js';
+import { ToolDefinition } from '../../tools/registry.js';
 
 export class GeminiService implements AIService {
   private readonly provider: GeminiProvider;
@@ -432,21 +434,20 @@ export class GeminiService implements AIService {
   }
 
   async generateCompletion(
-    prompt: string | import('./provider.js').ChatMessage[],
+    prompt: string | import('../provider.js').ChatMessage[],
     _systemPrompt?: string,
     tools?: ToolDefinition[]
   ): Promise<AICompletionResponse> {
     // Build LanguageModelMessage[] from legacy ChatMessage[] / string
-    const { buildMessages } = await import('./message-builder.js');
+    const { buildMessages } = await import('../message-builder.js');
     const messages = buildMessages(prompt, _systemPrompt);
 
-    // Convert ToolDefinition[] → ToolRequest[] (same shape, just type rename)
     const toolRequests = (tools ?? []).map(t => ({
-      id: t.name,
-      name: t.name,
-      description: t.description,
-      parameters: t.parameters,
-      handler: t.handler as unknown as (arg_string: string) => Promise<import('../types/language-model.js').ToolCallResult>,
+      id: (t as any).name,
+      name: (t as any).name,
+      description: (t as any).description,
+      parameters: (t as any).parameters,
+      handler: (t as any).handler as unknown as (arg_string: string) => Promise<import('../../types/language-model.js').ToolCallResult>,
       providerName: 'registry',
     }));
 

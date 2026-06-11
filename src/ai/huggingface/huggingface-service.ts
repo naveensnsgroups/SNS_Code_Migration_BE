@@ -1,4 +1,15 @@
-import { AIService, AICompletionResponse } from './provider.js';
+// =============================================================================
+//  huggingface/huggingface-service.ts — HuggingFace Inference API Service
+//
+//  SNS IDE folder structure:
+//    src/ai/huggingface/
+//      huggingface-service.ts  ← this file
+//
+//  Uses HuggingFace Inference API (text-generation endpoint).
+//  No streaming support yet — uses blocking fetch.
+// =============================================================================
+
+import { AIService, AICompletionResponse } from '../provider.js';
 
 export class HuggingFaceService implements AIService {
   private apiKey: string;
@@ -11,7 +22,9 @@ export class HuggingFaceService implements AIService {
 
   async generateCompletion(prompt: string, systemPrompt?: string): Promise<AICompletionResponse> {
     try {
-      const formattedPrompt = systemPrompt ? `${systemPrompt}\n\nUser: ${prompt}\nAssistant:` : prompt;
+      const formattedPrompt = systemPrompt
+        ? `${systemPrompt}\n\nUser: ${prompt}\nAssistant:`
+        : prompt;
 
       const response = await fetch(`https://api-inference.huggingface.co/models/${this.model}`, {
         method: 'POST',
@@ -34,7 +47,7 @@ export class HuggingFaceService implements AIService {
       }
 
       const data = await response.json();
-      
+
       let text = '';
       if (Array.isArray(data) && data[0]?.generated_text) {
         text = data[0].generated_text;
