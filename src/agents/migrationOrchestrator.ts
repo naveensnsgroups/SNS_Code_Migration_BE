@@ -7,6 +7,7 @@ import { ShellExecutor } from '../tools/shellExecutor.js';
 import { writeSessionFile } from '../tools/fileWriter.js';
 import { scanProjectDirectory } from '../tools/fileScanner.js';
 import { DetectedStack, TargetStack, MigrationStatus } from '../types.js';
+import { resolveApiKey, resolveModelAlias } from '../ai/index.js';
 
 export class MigrationOrchestrator {
   private static pausedSessions: Set<string> = new Set();
@@ -47,8 +48,8 @@ export class MigrationOrchestrator {
     const session = await SessionManager.getSession(sessionId);
     if (!session) return;
 
-    // Initialize/reset task context memory
-    await TaskContextManager.saveContext(sessionId, { active_phase: '1' });
+    // Initialize/reset task context memory — phase must start at 'discovery'
+    await TaskContextManager.saveContext(sessionId, { active_phase: 'discovery' });
 
     // Save target stack configuration to session
     await SessionManager.updateSession(sessionId, {
@@ -72,14 +73,24 @@ export class MigrationOrchestrator {
 
   private static async runPipeline(sessionId: string): Promise<void> {
     let session = await SessionManager.getSession(sessionId);
-    if (!session || !session.targetStack || !session.apiKey || !session.detectedStack) {
+    if (!session || !session.targetStack || !session.detectedStack) {
       throw new Error('Session is missing configuration properties.');
+    }
+
+    const resolvedModel = resolveModelAlias(session.targetStack.model, (session as any).aliasesConfig ?? {});
+    const apiKey = resolveApiKey(
+      session.targetStack.provider,
+      session.apiKey || '',
+      session.apiKeys
+    );
+    if (!apiKey) {
+      throw new Error(`API key for provider "${session.targetStack.provider}" could not be resolved.`);
     }
 
     const ai = AIProviderFactory.getService(
       session.targetStack.provider,
-      session.targetStack.model,
-      session.apiKey
+      resolvedModel,
+      apiKey
     );
 
     const targetModel = session.targetStack.model;
@@ -134,20 +145,9 @@ export class MigrationOrchestrator {
       }
 
       // ── Alias resolution: 'alias:reasoning-model' → look up in session.aliasesConfig
-      let selectedModel = agent.selectedModel;
-      if (selectedModel.startsWith('alias:')) {
-        const aliasKey = selectedModel.replace('alias:', '').trim();
-        const aliasesConfig = (session as any).aliasesConfig ?? {};
-        const resolved = aliasesConfig[aliasKey];
-        if (!resolved) {
-          console.warn(`[Orchestrator] Alias "${aliasKey}" not found in aliasesConfig. Using default AI.`);
-          return wrapAiService(defaultAi, agentId, targetModel);
-        }
-        selectedModel = resolved;
-        console.info(`[Orchestrator] Resolved alias "${aliasKey}" → "${selectedModel}"`);
-      }
+      const resolvedAgentModel = resolveModelAlias(agent.selectedModel, (session as any).aliasesConfig ?? {});
 
-      const parts = selectedModel.split('/');
+      const parts = resolvedAgentModel.split('/');
       if (parts.length < 2) {
         return wrapAiService(defaultAi, agentId, targetModel);
       }
@@ -155,30 +155,15 @@ export class MigrationOrchestrator {
       const provider = parts[0].toLowerCase();
       const model = parts.slice(1).join('/');
 
-      let key = session.apiKey;
-      if (session.apiKeys) {
-        if (provider === 'anthropic' && session.apiKeys.anthropic) key = session.apiKeys.anthropic;
-        else if (provider === 'openai' && session.apiKeys.openai) key = session.apiKeys.openai;
-        else if (provider === 'google' && session.apiKeys.google) key = session.apiKeys.google;
-        else if (provider === 'grok' && session.apiKeys.grok) key = session.apiKeys.grok;
-        else if (provider === 'groq' && session.apiKeys.groq) key = session.apiKeys.groq;
-        else if (provider === 'openrouter' && session.apiKeys.openrouter) key = session.apiKeys.openrouter;
-        else if (provider === 'huggingface' && session.apiKeys.huggingface) key = session.apiKeys.huggingface;
-      }
-
-      if (!key) {
-        if (provider === 'anthropic') key = process.env.ANTHROPIC_API_KEY || '';
-        else if (provider === 'openai') key = process.env.OPENAI_API_KEY || '';
-        else if (provider === 'google') key = process.env.GEMINI_API_KEY || process.env.GOOGLE_API_KEY || '';
-        else if (provider === 'grok') key = process.env.XAI_API_KEY || '';
-        else if (provider === 'groq') key = process.env.GROQ_API_KEY || '';
-        else if (provider === 'openrouter') key = process.env.OPENROUTER_API_KEY || '';
-        else if (provider === 'huggingface') key = process.env.HF_API_KEY || process.env.HF_TOKEN || '';
-      }
+      const key = resolveApiKey(
+        provider,
+        session.apiKey || '',
+        session.apiKeys
+      );
 
       try {
         const service = AIProviderFactory.getService(provider, model, key || 'dummy_key');
-        return wrapAiService(service, agentId, selectedModel);
+        return wrapAiService(service, agentId, resolvedAgentModel);
       } catch (err) {
         console.error(`Failed to get service for agent ${agentId}:`, err);
         return wrapAiService(defaultAi, agentId, targetModel);
@@ -261,7 +246,10 @@ export class MigrationOrchestrator {
           session.detectedStack,
           session.targetStack,
           agentAi,
-          async (msg, lvl) => log(msg, lvl ?? 'info', 'plan')
+          async (msg, lvl) => log(msg, lvl ?? 'info', 'plan'),
+          (percent, currentFile) => {
+            EventBroadcaster.broadcast(sessionId, 'progress', { percent, currentFile: currentFile ?? '' });
+          }
         );
       } else {
         await log('Skipping Phase 1: Analysis Agent is disabled in settings.', 'warning', 'plan');
@@ -270,10 +258,10 @@ export class MigrationOrchestrator {
       await updatePhase('plan', 'done');
       
       // Pause pipeline here — let the user review Stage1_Analysis.md before next stage
-      await log('🎉 Stage 1 Analysis complete. Review Stage1_Analysis.md and migration-plan.md in the output workspace.', 'success', 'plan');
+      await log('[Pipeline] Stage 1 Analysis complete. Review Stage1_Analysis.md in the output workspace.', 'success', 'plan');
       
-      // Clear API key on complete for security
-      await SessionManager.updateSession(sessionId, { status: 'complete', apiKey: undefined });
+      // Clear API keys on complete for security
+      await SessionManager.updateSession(sessionId, { status: 'complete', apiKey: undefined, apiKeys: undefined });
       EventBroadcaster.broadcast(sessionId, 'complete', { success: true });
       return;
     }

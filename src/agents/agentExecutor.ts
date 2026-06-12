@@ -60,6 +60,50 @@ export function estimateCost(inputTokens: number, outputTokens: number, model: s
   return Math.round(((inputTokens / 1_000_000) * inCostPerM + (outputTokens / 1_000_000) * outCostPerM) * 10000) / 10000;
 }
 
+// ── Rate Limit Retry Helper ───────────────────────────────────────────────────
+// Wraps provider.request() with exponential backoff for 429 / 503 errors.
+// Free-tier models (Gemini 15 RPM, Claude/OpenAI limits) can hit rate limits
+// during multi-pass analysis. This retries transparently instead of crashing.
+
+const RATE_LIMIT_PATTERNS = [
+  'rate limit', 'rate_limit', 'ratelimit',
+  'quota exceeded', 'too many requests',
+  'resource exhausted', 'resourceexhausted',
+  '429', '503',
+];
+
+function isRateLimitError(err: unknown): boolean {
+  if (!err) return false;
+  const msg = (err instanceof Error ? err.message : String(err)).toLowerCase();
+  return RATE_LIMIT_PATTERNS.some(p => msg.includes(p));
+}
+
+async function requestWithRetry(
+  provider:    { request: (...args: any[]) => any },
+  userRequest: any,
+  context:     any,
+  maxRetries = 4
+): Promise<any> {
+  let delay = 2000; // start at 2 seconds
+  for (let attempt = 0; attempt <= maxRetries; attempt++) {
+    try {
+      return await provider.request(userRequest, context);
+    } catch (err: unknown) {
+      if (isRateLimitError(err) && attempt < maxRetries) {
+        context.onLog?.(
+          `[AgentExecutor] Rate limit hit — waiting ${delay / 1000}s before retry ${attempt + 1}/${maxRetries}...`,
+          'warning'
+        );
+        await new Promise(res => setTimeout(res, delay));
+        delay = Math.min(delay * 2, 32000); // double delay: 2s → 4s → 8s → 16s → 32s
+        continue;
+      }
+      throw err; // non-rate-limit errors propagate immediately
+    }
+  }
+  throw new Error(`Rate limit persisted after ${maxRetries} retries. Check your API quota.`);
+}
+
 // ── Streaming Agent Executor ──────────────────────────────────────────────────
 
 export class AgentExecutor {
@@ -83,7 +127,9 @@ export class AgentExecutor {
     userPrompt: string,
     tools: ToolRequest[],
     context: ToolContext,
-    maxIterations = 40,
+    // Agent stops naturally when it has no more tool calls — this is only a safety net
+    // against infinite loops caused by bugs. Set very high so it is never reached in practice.
+    maxIterations = 10_000,
     modelName = '',
     agentId = 'migration-agent'
   ): Promise<string> {
@@ -115,8 +161,8 @@ export class AgentExecutor {
       // id → { name, argsJson }
       const pendingToolCalls = new Map<string, { id: string; name: string; args: string }>();
 
-      // ── Stream this turn ───────────────────────────────────────────────
-      const response = await provider.request(userRequest, context);
+      // ── Stream this turn (with rate-limit retry) ──────────────────────
+      const response = await requestWithRetry(provider, userRequest, context);
 
       for await (const part of response.stream) {
         if (isTextResponsePart(part)) {

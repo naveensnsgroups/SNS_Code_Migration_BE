@@ -43,7 +43,7 @@ export const updateMigrationDashboardTool: ToolRequest = {
       phase: args.phase || 'Analysis',
     });
 
-    ctx!.onLog?.(`📊 Progress: ${args.filesCompleted}/${args.totalFiles} files (${percent}%)${args.currentFile ? ` — ${args.currentFile}` : ''}`, 'info');
+    ctx!.onLog?.(`[Progress] ${args.filesCompleted}/${args.totalFiles} files (${percent}%)${args.currentFile ? ` — ${args.currentFile}` : ''}`, 'info');
 
     await SessionManager.updateSession(ctx!.sessionId, {
       completedFiles: args.filesCompleted,

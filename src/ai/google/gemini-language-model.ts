@@ -196,7 +196,7 @@ export class GeminiProvider {
         }
 
         const errMsg = err instanceof Error ? err.message : String(err);
-        const logMsg = `⚠️ Gemini API call failed (${errMsg}). Retrying attempt ${attempt}/${maxRetries} in ${delaySeconds}s...`;
+        const logMsg = `Gemini API call failed (${errMsg}). Retrying attempt ${attempt}/${maxRetries} in ${delaySeconds}s...`;
 
         if (toolCtx?.onLog) {
           toolCtx.onLog(logMsg, 'warning');

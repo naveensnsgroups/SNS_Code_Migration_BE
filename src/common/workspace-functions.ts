@@ -73,3 +73,9 @@ export const UPDATE_MIGRATION_DASHBOARD_FUNCTION_ID        = 'update-migration-d
 export const WRITE_MIGRATION_FILES_FUNCTION_ID             = 'write-migration-files';
 /** Find and recover an existing migration session by project path. */
 export const FIND_MIGRATION_SESSION_FUNCTION_ID            = 'find-migration-session';
+
+// ── Knowledge Graph Tools (Stage 1 cross-file synthesis) ─────────────────────
+/** Merges analysis data into a named knowledge graph file (_analysis/<name>-graph.json). */
+export const APPEND_TO_KNOWLEDGE_GRAPH_FUNCTION_ID         = 'append-to-knowledge-graph';
+/** Reads a fully-merged knowledge graph file for report writing. */
+export const READ_KNOWLEDGE_GRAPH_FUNCTION_ID              = 'read-knowledge-graph';
