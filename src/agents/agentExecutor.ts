@@ -240,13 +240,35 @@ export class AgentExecutor {
             result = makeToolErrorResult(errMsg, 'tool-not-available');
           } else {
             context.onLog?.(`[Tool Call] Executing tool "${tc.name}"...`, 'info');
+
+            // Broadcast structured tool_call event — FE receives clean JSON (no log parsing)
+            let parsedArgs: Record<string, unknown> = {};
+            try { parsedArgs = JSON.parse(tc.args) as Record<string, unknown>; } catch { /* keep empty */ }
+            EventBroadcaster.broadcast(context.sessionId, 'tool_call', {
+              name:    tc.name,
+              args:    parsedArgs,
+              agentId,
+            });
+
             try {
               // ← SNS IDE standard: pass raw JSON arg_string
               result = await tool.handler(tc.args, { ...context, toolCallId: tc.id });
               context.onLog?.(`[Tool Response] Completed "${tc.name}" successfully.`, 'success');
+
+              // Broadcast tool_response (success)
+              EventBroadcaster.broadcast(context.sessionId, 'tool_response', {
+                name:    tc.name,
+                success: true,
+              });
             } catch (err: unknown) {
               const errMsg = err instanceof Error ? err.message : 'Unknown tool execution error';
               context.onLog?.(`[Tool Error] Failed executing "${tc.name}": ${errMsg}`, 'error');
+
+              // Broadcast tool_response (failure)
+              EventBroadcaster.broadcast(context.sessionId, 'tool_response', {
+                name:    tc.name,
+                success: false,
+              });
               result = makeToolErrorResult(errMsg);
             }
           }
