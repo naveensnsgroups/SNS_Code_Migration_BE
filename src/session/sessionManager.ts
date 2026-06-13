@@ -3,6 +3,7 @@ import path from 'path';
 import { fileURLToPath } from 'url';
 import { MigrationSession, LogEntry, TokenUsageEntry } from './types.js';
 import { FileNode } from '../types.js';
+import { writeJsonAtomic, readJsonWithRetry } from './fileUtils.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -11,6 +12,24 @@ const __dirname = path.dirname(__filename);
 const SESSIONS_DIR = path.join(__dirname, '..', '..', 'sessions');
 
 export class SessionManager {
+  // ── Per-session write serialization queue ───────────────────────────────────
+  // Prevents concurrent read-modify-write races on logs.json / session.json.
+  // On Windows, concurrent fs.rename() calls to the same target file throw EPERM.
+  // All writes for the same sessionId are chained through this queue so only
+  // ONE write is in-flight per session at a time.
+  private static readonly writeQueues = new Map<string, Promise<void>>();
+
+  private static enqueueWrite<T>(
+    sessionId: string,
+    fn: () => Promise<T>
+  ): Promise<T> {
+    const tail   = this.writeQueues.get(sessionId) ?? Promise.resolve();
+    const result = tail.then(() => fn());
+    // Store only the settled tail so the chain doesn't grow unboundedly
+    this.writeQueues.set(sessionId, result.then(() => {}, () => {}));
+    return result;
+  }
+
   /**
    * Generates a unique session ID
    */
@@ -54,8 +73,7 @@ export class SessionManager {
    */
   static async saveSession(session: MigrationSession): Promise<void> {
     const sessionPath = path.join(SESSIONS_DIR, session.sessionId, 'session.json');
-    await fs.ensureDir(path.dirname(sessionPath));
-    await fs.writeJson(sessionPath, session, { spaces: 2 });
+    await writeJsonAtomic(sessionPath, session);
   }
 
   /**
@@ -66,21 +84,26 @@ export class SessionManager {
     if (!(await fs.pathExists(sessionPath))) {
       return null;
     }
-    return fs.readJson(sessionPath);
+    try {
+      return await readJsonWithRetry<MigrationSession>(sessionPath);
+    } catch {
+      return null;
+    }
   }
 
   /**
    * Updates session data
    */
   static async updateSession(sessionId: string, updates: Partial<MigrationSession>): Promise<MigrationSession> {
-    const session = await this.getSession(sessionId);
-    if (!session) {
-      throw new Error(`Session ${sessionId} not found`);
-    }
-
-    const updatedSession = { ...session, ...updates };
-    await this.saveSession(updatedSession);
-    return updatedSession;
+    return this.enqueueWrite(sessionId, async () => {
+      const session = await this.getSession(sessionId);
+      if (!session) {
+        throw new Error(`Session ${sessionId} not found`);
+      }
+      const updatedSession = { ...session, ...updates };
+      await this.saveSession(updatedSession);
+      return updatedSession;
+    });
   }
 
   /**
@@ -92,18 +115,19 @@ export class SessionManager {
     level: LogEntry['level'] = 'info',
     phase?: string
   ): Promise<LogEntry> {
-    const log: LogEntry = {
-      id: Math.random().toString(36).substring(2, 10),
-      timestamp: new Date().toLocaleTimeString('en-US', { hour12: false }),
-      level,
-      message,
-      phase,
-    };
-
-    const logs = await this.getLogs(sessionId);
-    logs.push(log);
-    await this.saveLogs(sessionId, logs);
-    return log;
+    return this.enqueueWrite(sessionId, async () => {
+      const log: LogEntry = {
+        id: Math.random().toString(36).substring(2, 10),
+        timestamp: new Date().toLocaleTimeString('en-US', { hour12: false }),
+        level,
+        message,
+        phase,
+      };
+      const logs = await this.getLogs(sessionId);
+      logs.push(log);
+      await this.saveLogs(sessionId, logs);
+      return log;
+    });
   }
 
   /**
@@ -115,7 +139,7 @@ export class SessionManager {
       return [];
     }
     try {
-      return await fs.readJson(logsPath);
+      return await readJsonWithRetry<LogEntry[]>(logsPath);
     } catch {
       return [];
     }
@@ -126,8 +150,7 @@ export class SessionManager {
    */
   private static async saveLogs(sessionId: string, logs: LogEntry[]): Promise<void> {
     const logsPath = path.join(SESSIONS_DIR, sessionId, 'logs.json');
-    await fs.ensureDir(path.dirname(logsPath));
-    await fs.writeJson(logsPath, logs, { spaces: 2 });
+    await writeJsonAtomic(logsPath, logs);
   }
 
   /**
@@ -143,7 +166,7 @@ export class SessionManager {
         const sessionPath = path.join(SESSIONS_DIR, dir, 'session.json');
         if (await fs.pathExists(sessionPath)) {
           try {
-            const session = await fs.readJson(sessionPath);
+            const session = await readJsonWithRetry<MigrationSession>(sessionPath);
             sessions.push(session);
           } catch { /* skip corrupted sessions */ }
         }

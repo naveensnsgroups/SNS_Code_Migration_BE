@@ -48,11 +48,11 @@ export const writeMigrationFilesTool: ToolRequest = {
         await writeSessionFile(ctx!.modernPath, file.path, file.content);
         written.push(file.path);
         EventBroadcaster.broadcast(ctx!.sessionId, 'file_migrated', { file: file.path });
-        ctx!.onLog?.(`✅ Written: ${file.path}`, 'success');
+        ctx!.onLog?.(`Written: ${file.path}`, 'success');
       } catch (err: unknown) {
         const msg = (err as Error).message;
         errors.push(`${file.path}: ${msg}`);
-        ctx!.onLog?.(`❌ Failed to write ${file.path}: ${msg}`, 'error');
+        ctx!.onLog?.(`Failed to write ${file.path}: ${msg}`, 'error');
       }
     }
     return makeToolTextResult(JSON.stringify({ written, errors, totalWritten: written.length }));

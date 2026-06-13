@@ -6,6 +6,7 @@ import { ShellExecutor } from './shellExecutor.js';
 import { TaskContextManager } from '../session/taskContext.js';
 import { SessionManager } from '../session/sessionManager.js';
 import { EventBroadcaster } from '../routes/stream.js';
+import { writeJsonAtomic, readJsonWithRetry } from '../session/fileUtils.js';
 import {
   FILE_CONTENT_FUNCTION_ID,
   GET_WORKSPACE_FILE_LIST_FUNCTION_ID,
@@ -16,6 +17,7 @@ import {
   GET_DEPENDENCY_TREE_FUNCTION_ID,
   BATCH_READ_FILES_FUNCTION_ID
 } from '../common/workspace-functions.js';
+import { mergeGraphData, getValidGraphNames } from './knowledge/knowledge-graph-utils.js';
 
 // ── Tool Context ─────────────────────────────────────────────────────────────
 // Mirrors snside WorkspaceFunctionScope — provides sessionId, legacyPath,
@@ -1102,7 +1104,7 @@ export const TOOLS_REGISTRY: Record<string, ToolDefinition> = {
       // Also log summary to terminal
       const completed = args.todos.filter(t => t.status === 'completed').length;
       const total = args.todos.length;
-      context.onLog?.(`📋 [Todo] ${completed}/${total} tasks completed.`, 'info');
+      context.onLog?.(`[Todo] ${completed}/${total} tasks completed.`, 'info');
 
       return { saved: true, count: total, completed };
     }
@@ -1137,7 +1139,7 @@ export const TOOLS_REGISTRY: Record<string, ToolDefinition> = {
         phase: args.phase || 'Analysis',
       });
 
-      context.onLog?.(`📊 Progress: ${args.filesCompleted}/${args.totalFiles} files (${percent}%)${args.currentFile ? ` — ${args.currentFile}` : ''}`, 'info');
+      context.onLog?.(`[Progress] ${args.filesCompleted}/${args.totalFiles} files (${percent}%)${args.currentFile ? ` — ${args.currentFile}` : ''}`, 'info');
 
       // Save to session
       await SessionManager.updateSession(context.sessionId, {
@@ -1183,7 +1185,7 @@ export const TOOLS_REGISTRY: Record<string, ToolDefinition> = {
       for (const key of archived) updates[key] = undefined;
 
       await TaskContextManager.updateContext(context.sessionId, updates);
-      context.onLog?.(`🗜️ [Context] Archived ${archived.length} large keys. Kept ${keptKeys.length} HOT keys.`, 'info');
+      context.onLog?.(`[Context] Archived ${archived.length} large keys. Kept ${keptKeys.length} HOT keys.`, 'info');
 
       return { archived, keptKeys, contextSizeReduced: archived.length > 0 };
     }
@@ -1223,10 +1225,10 @@ export const TOOLS_REGISTRY: Record<string, ToolDefinition> = {
           await writeSessionFile(context.modernPath, file.path, file.content);
           written.push(file.path);
           EventBroadcaster.broadcast(context.sessionId, 'file_migrated', { file: file.path });
-          context.onLog?.(`✅ Written: ${file.path}`, 'success');
+          context.onLog?.(`Written: ${file.path}`, 'success');
         } catch (err: any) {
           errors.push(`${file.path}: ${err.message}`);
-          context.onLog?.(`❌ Failed to write ${file.path}: ${err.message}`, 'error');
+          context.onLog?.(`Failed to write ${file.path}: ${err.message}`, 'error');
         }
       }
       return { written, errors, totalWritten: written.length };
@@ -1329,6 +1331,188 @@ export const TOOLS_REGISTRY: Record<string, ToolDefinition> = {
     },
     handler: async (_args, _context) => {
       return { diagnostics: [], note: 'No LSP diagnostics available in backend mode.' };
+    }
+  },
+
+  // ── append-to-knowledge-graph ─────────────────────────────────────────────
+  // Incrementally builds cross-file knowledge graphs during Phase 1 analysis.
+  // Called after EVERY file read to contribute extracted data to the relevant graph(s).
+  'append-to-knowledge-graph': {
+    name: 'append-to-knowledge-graph',
+    description:
+      'Merges new analysis data into a named knowledge graph file stored in the output workspace '
+      + '(_analysis/<graphName>-graph.json). Call this after EVERY file analysis to incrementally '
+      + 'build cross-file knowledge graphs. Instead of loading 50+ raw per-file analysis keys at '
+      + 'report time, the agent reads the pre-merged graphs. '
+      + 'Valid graphName values: entity, symbol, rule, api, db, event, config, state, middleware, '
+      + 'security, transform, error, async, test, integration, job, call-flow, architecture. '
+      + 'Data is merged intelligently: entity/symbol/api/db/event graphs merge by key name; '
+      + 'rule/transform/test graphs append arrays; security/architecture/middleware/error graphs deep-merge. '
+      + 'MANDATORY after each file read — do NOT skip this step.',
+    parameters: {
+      type: 'object',
+      properties: {
+        graphName: {
+          type: 'string',
+          description:
+            'Name of the knowledge graph to update. Must be one of: '
+            + 'entity, symbol, rule, api, db, event, config, state, middleware, '
+            + 'security, transform, error, async, test, integration, job, call-flow, architecture.'
+        },
+        data: {
+          type: 'object',
+          description:
+            'Data to merge into the graph. Shape must match the graph schema. '
+            + 'entity-graph: { "EntityName": { table, files:[...], fields:[...], relations:[...] } } '
+            + 'symbol-graph: { "funcName": { file, signature, isAsync, calledBy:[...], calls:[...] } } '
+            + 'rule-graph: { "domain": [{ rule, enforcement, violation, relatedFiles:[...] }] } '
+            + 'api-graph: { "METHOD /path": { handler, auth, request:{}, responses:{}, middlewareChain:[...], files:[...] } } '
+            + 'db-graph: { "tableName": { operations:[{ type, fields, condition, function, calledFrom:[...] }] } } '
+            + 'event-graph: { "event.name": { emittedIn, payload, listeners:[{ file, handler, does }] } } '
+            + 'config-graph: { "CONFIG_KEY": { type, required, default, purpose, usedIn:[...] } } '
+            + 'state-graph: { "EntityName": { field, modelFile, states:[...], transitions:[...] } } '
+            + 'middleware-graph: { globalPipeline:[{ order, name, file, purpose, appliesTo }], routeSpecific:{} } '
+            + 'security-graph: { authMechanism, tokenStrategy:{}, roles:{}, publicRoutes:[...] } '
+            + 'transform-graph: { "Name": { inputShape:{}, inputFile, transformFunction, outputShape:{}, outputFile } } '
+            + 'error-graph: { customErrors:{ "ErrorName": { extends, status, definedIn, thrownIn:[...] } }, globalHandler:{} } '
+            + 'async-graph: { "funcName": { pattern, awaits:[...], parallelOps:[...], fireAndForget:[...] } } '
+            + 'test-graph: { framework, configFile, testFiles:{ "path": { covers, cases:[...], mocks:[...] } } } '
+            + 'integration-graph: { "Provider": { purpose, auth, calledFrom, operations:[{ call, sends, receives }] } } '
+            + 'job-graph: { "Job Name": { schedule, scheduledIn, implementation, calls, sideEffects:[...], type } } '
+            + 'call-flow-graph: { "Use Case": { steps:[...] } } '
+            + 'architecture-graph: { type, layers:[...], patterns:[...], modules:[...], entryPoint, communicationProtocol }'
+        },
+        sourceFile: {
+          type: 'string',
+          description: 'The file path that produced this data. Used for audit tracing. Optional but recommended.'
+        }
+      },
+      required: ['graphName', 'data']
+    },
+    handler: async (args: { graphName: string; data: Record<string, any>; sourceFile?: string }, context) => {
+      const validNames = getValidGraphNames();
+      if (!validNames.includes(args.graphName)) {
+        return {
+          error: `Unknown graphName "${args.graphName}". Valid names: ${validNames.join(', ')}.`,
+          validNames
+        };
+      }
+
+      const analysisDir = path.join(context.modernPath, '_analysis');
+      await fs.ensureDir(analysisDir);
+      const graphPath = path.join(analysisDir, `${args.graphName}-graph.json`);
+
+      // Load existing graph (or start with empty object)
+      let existing: Record<string, any> = {};
+      try {
+        if (await fs.pathExists(graphPath)) {
+          existing = await readJsonWithRetry<Record<string, any>>(graphPath);
+        }
+      } catch {
+        existing = {}; // If file is corrupt, start fresh
+      }
+
+      // Merge incoming data using the correct strategy for this graph type
+      const merged = mergeGraphData(args.graphName, existing, args.data);
+
+      // Write merged result back
+      await writeJsonAtomic(graphPath, merged);
+
+      const entryCount = Object.keys(merged).length;
+      const message = `Graph "${args.graphName}" updated: ${entryCount} top-level entries.`
+        + (args.sourceFile ? ` (source: ${args.sourceFile})` : '');
+
+      context.onLog?.(`[KnowledgeGraph] ${message}`, 'info');
+
+      return {
+        success: true,
+        graphName: args.graphName,
+        graphPath: `_analysis/${args.graphName}-graph.json`,
+        entryCount,
+        message
+      };
+    }
+  },
+
+  // ── read-knowledge-graph ──────────────────────────────────────────────────
+  // Reads a fully-merged knowledge graph at report-writing time.
+  // Agent calls this instead of loading 50+ raw per-file analysis keys.
+  'read-knowledge-graph': {
+    name: 'read-knowledge-graph',
+    description:
+      'Reads the current state of a named knowledge graph file from the output workspace. '
+      + 'Use this at REPORT WRITING TIME (Phase 1_5) instead of loading raw per-file analysis '
+      + 'keys from task context. Each section has a designated source graph — read that graph '
+      + 'and write the section directly from the pre-merged, cross-referenced data. '
+      + 'Section → Graph mapping: '
+      + '5(Domain Models)→entity | 7(Functions)→symbol | 8(Behaviors)→symbol | 9(Business Rules)→rule | '
+      + '10(API Contracts)→api | 11(Security)→security | 12(Middleware)→middleware | 13(DB Ops)→db | '
+      + '14(Call Flows)→call-flow | 15(Transforms)→transform | 16(Config)→config | 17(Errors)→error | '
+      + '18(Validation)→rule | 19(State)→state | 20(Async)→async | 21(Tests)→test | '
+      + '22(Transactions)→db | 23(Events)→event | 24(Integrations)→integration | 25(Jobs)→job | '
+      + '2(Architecture)→architecture.',
+    parameters: {
+      type: 'object',
+      properties: {
+        graphName: {
+          type: 'string',
+          description:
+            'Name of the graph to read. One of: '
+            + 'entity, symbol, rule, api, db, event, config, state, middleware, '
+            + 'security, transform, error, async, test, integration, job, call-flow, architecture.'
+        }
+      },
+      required: ['graphName']
+    },
+    handler: async (args: { graphName: string }, context) => {
+      const validNames = getValidGraphNames();
+      if (!validNames.includes(args.graphName)) {
+        return {
+          error: `Unknown graphName "${args.graphName}". Valid names: ${validNames.join(', ')}.`,
+          validNames
+        };
+      }
+
+      const graphPath = path.join(context.modernPath, '_analysis', `${args.graphName}-graph.json`);
+
+      if (!(await fs.pathExists(graphPath))) {
+        return {
+          exists: false,
+          graphName: args.graphName,
+          data: {},
+          entryCount: 0,
+          message: `Graph not yet built: _analysis/${args.graphName}-graph.json. ` +
+            `Run Phase 1 analysis first so append-to-knowledge-graph can populate this graph.`
+        };
+      }
+
+      let data: Record<string, any> = {};
+      try {
+        data = await readJsonWithRetry<Record<string, any>>(graphPath);
+      } catch (err: any) {
+        return {
+          exists: true,
+          graphName: args.graphName,
+          data: {},
+          entryCount: 0,
+          error: `Failed to read graph file: ${err.message}`
+        };
+      }
+
+      const entryCount = Object.keys(data).length;
+      const graphSizeBytes = JSON.stringify(data).length;
+
+      context.onLog?.(`[KnowledgeGraph] Read "${args.graphName}-graph": ${entryCount} entries, ${Math.round(graphSizeBytes / 1024)}KB`, 'info');
+
+      return {
+        exists: true,
+        graphName: args.graphName,
+        graphPath: `_analysis/${args.graphName}-graph.json`,
+        data,
+        entryCount,
+        graphSizeBytes,
+        message: `Loaded ${args.graphName}-graph: ${entryCount} top-level entries.`
+      };
     }
   },
 

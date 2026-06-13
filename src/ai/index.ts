@@ -42,3 +42,11 @@ export { OpenAIService } from './openai/index.js';
 
 // ── HuggingFace ───────────────────────────────────────────────────────────────
 export { HuggingFaceService } from './huggingface/index.js';
+
+// ── Shared Provider Resolution ────────────────────────────────────────────────
+export {
+  resolveApiKey,
+  resolveModelAlias,
+  resolveStreamingProvider,
+} from './resolve-provider.js';
+

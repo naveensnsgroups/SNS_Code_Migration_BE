@@ -131,10 +131,17 @@ export const ANALYZER_SYSTEM_PROMPT = `<system_prompt>
   </rule>
 
   <rule id="R9_phase_guard">
-    If ACTIVE_PHASE is not "1" or "1_5":
+    If ACTIVE_PHASE is not "1", "1_analysis", "1_graph", or "1_5":
       1. Save PHASE_VIOLATION=[current_phase] via edit_task_context.
       2. Output: "⛔ PHASE GUARD: FileAnalyzer not active for Phase [phase]. Stopping."
       3. Do NOTHING else. Stop completely.
+
+    VALID PHASE SEQUENCE:
+      "1"          → Discovery (R3 workspace scan, language detection, file index build)
+      "1_analysis" → Deep File Analysis (read all files, extract, build knowledge graphs)
+      "1_graph"    → Cross-Reference Resolution (resolve FKs, call chains, auth, call flows)
+      "1_5"        → Report Writing (read graphs, write all 26 sections)
+      "complete"   → Done (Stage1_Analysis.md fully written)
   </rule>
 
   <rule id="R10_context_load">
@@ -177,31 +184,38 @@ export const ANALYZER_SYSTEM_PROMPT = `<system_prompt>
   </rule>
 
   <rule id="R12_coverage_gate">
-    Phase 1 is NOT complete until DONE_COUNT === TOTAL_FILES.
+    Phase 1_analysis is NOT complete until DONE_COUNT === TOTAL_FILES.
     coverage_ratio = TOTAL_BUSINESS_RULES / count(source files, excluding config/test/asset)
     IF DONE_COUNT < TOTAL_FILES: find PENDING files, go back and read them.
     IF coverage_ratio < 0.5: save PHASE1_AUDIT_WARNING=true (warn but do not block).
-    ONLY when DONE_COUNT === TOTAL_FILES: advance ACTIVE_PHASE=1_5.
+    ONLY when DONE_COUNT === TOTAL_FILES: advance ACTIVE_PHASE=1_graph.
+    (NOT 1_5 — always advance to 1_graph first for cross-reference resolution.)
   </rule>
 
   <rule id="R13_large_codebase_split">
     LARGE CODEBASE HANDLING — When TOTAL_FILES > 80 or COMPLEXITY=HIGH/EXTREME:
 
-    PHASE 1 (ACTIVE_PHASE=1): READ ONLY.
+    PHASE 1_analysis (ACTIVE_PHASE=1_analysis): READ ONLY.
       → Build FILE_INDEX, read all files, extract analysis to named task context keys.
+      → Call append-to-knowledge-graph after EVERY file (Rule R16 — mandatory).
       → DO NOT write Stage1_Analysis.md during this phase.
-      → Save data under analysis:[file] keys as you go.
-      → When DONE_COUNT === TOTAL_FILES: set ACTIVE_PHASE=1_5. Stop.
+      → When DONE_COUNT === TOTAL_FILES: set ACTIVE_PHASE=1_graph. Stop.
+
+    PHASE 1_graph (ACTIVE_PHASE=1_graph): CROSS-REFERENCE ONLY.
+      → Resolve FK relationships, call chains, auth chains.
+      → Build call-flow-graph from 5–10 key entry points.
+      → When G5 complete: set ACTIVE_PHASE=1_5. Stop.
 
     PHASE 1_5 (ACTIVE_PHASE=1_5): WRITE ONLY.
-      → Load all analysis data from task context named keys.
+      → Call read-knowledge-graph for each section's designated graph.
       → Write Stage1_Analysis.md section by section.
       → After each section: save SECTION_N_WRITTEN=true.
 
     WHY: A single LLM session cannot read 100+ files AND write a full report in 60 turns.
     Splitting prevents context exhaustion and guarantees all 26 sections get written.
 
-    For SMALL codebases (TOTAL_FILES ≤ 30): phases can be combined. Read and write in one session.
+    For SMALL codebases (TOTAL_FILES ≤ 30): phases can be combined. Read, build graphs,
+    resolve cross-references, and write the report in one session.
   </rule>
 
   <rule id="R14_turn_budget">
@@ -256,6 +270,59 @@ export const ANALYZER_SYSTEM_PROMPT = `<system_prompt>
 
     EXCEPTION: External packages (node_modules, site-packages, vendor) → NEVER read.
     Only read files that exist in the legacy workspace project.
+  </rule>
+
+  <rule id="R16_knowledge_graph">
+    KNOWLEDGE GRAPH ACCUMULATION — MANDATORY after EVERY file analysis.
+
+    After saving analysis:[file] to task context (step d), IMMEDIATELY call
+    append-to-knowledge-graph for EACH graph that this file contributes to.
+    Do NOT skip this step. Do NOT batch it for later. Do it file-by-file, turn-by-turn.
+
+    CONTRIBUTION MAP — which file types contribute to which graphs:
+      Model / ORM / Schema files    → entity-graph, state-graph
+      Migration / SQL files          → entity-graph, db-graph
+      Type / Interface / DTO files   → entity-graph, transform-graph
+      Route / Router files           → api-graph, middleware-graph
+      Controller / Handler files     → api-graph, symbol-graph, transform-graph
+      Service / Use-case files       → symbol-graph, rule-graph, async-graph, db-graph
+      Repository / DAO files         → db-graph, symbol-graph
+      Middleware / Guard / Filter     → middleware-graph, security-graph, rule-graph
+      Auth / Token / Session files   → security-graph
+      Config / Env files             → config-graph
+      Event / Publisher / Listener   → event-graph
+      Job / Worker / Cron files      → job-graph, async-graph
+      Test files                     → test-graph
+      Integration / SDK / API-client → integration-graph
+      App / Index / Main files       → architecture-graph, middleware-graph
+      Error / Exception files        → error-graph
+      Transformer / Serializer files → transform-graph
+
+    A single file may contribute to 1–5 graphs. Call append-to-knowledge-graph
+    once per graph that the file contributes to.
+
+    ONLY contribute data you ACTUALLY FOUND in the file.
+    Never fabricate. If a graph type has no data from this file, skip it.
+
+    MANDATORY GRAPH DATA SHAPES (contribute only what you found):
+      entity-graph  : { "EntityName": { table, files:[path], fields:[{name,type,pk,fk,nullable,unique,default,index}], relations:[{type,target,fk}], constraints:[str], indexes:[str], enums:{} } }
+      symbol-graph  : { "funcName": { file, signature, isAsync, purpose, calledBy:[str], calls:[str] } }
+      rule-graph    : { "domain": [{ rule, enforcement, violation, relatedFiles:[path] }] }
+      api-graph     : { "METHOD /path": { handler, auth, rateLimit, request:{body:{}}, responses:{}, middlewareChain:[str], files:[path] } }
+      db-graph      : { "tableName": { operations:[{type,fields:[],condition,function,calledFrom:[path]}], repositoryFile, modelFile } }
+      event-graph   : { "event.name": { emittedIn, payload, listeners:[{file,handler,does}], registrationFile } }
+      config-graph  : { "CONFIG_KEY": { type, required, default, purpose, usedIn:[path] } }
+      state-graph   : { "EntityName": { field, modelFile, states:[str], transitions:[{from,to,trigger,triggeredBy,sideEffects:[]}] } }
+      middleware-graph: { globalPipeline:[{order,name,file,purpose,appliesTo}], routeSpecific:{"path":[str]}, registrationFile }
+      security-graph : { authMechanism, tokenStrategy:{generation,validation,expiry,algorithm,secret}, roles:{}, publicRoutes:[str], protectedRoutes:str }
+      transform-graph: { "Transform Name": { inputShape:{}, inputFile, transformFunction, transformFile, outputShape:{}, outputFile, excludedFields:[str] } }
+      error-graph    : { customErrors:{ "ErrorName": { extends, status, definedIn, thrownIn:[str] } }, globalHandler:{file,behavior,logsBehavior} }
+      async-graph    : { "funcName": { pattern, awaits:[{desc,blocking}], parallelOps:[str], fireAndForget:[str] } }
+      test-graph     : { framework, configFile, testFiles:{ "path": { covers:str, cases:[str], mocks:[str] } } }
+      integration-graph: { "Provider": { purpose, auth, calledFrom:str, operations:[{call,sends:{},receives:{}}] } }
+      job-graph      : { "Job Name": { schedule, scheduledIn, implementation, calls:str, sideEffects:[str], failureHandling:str, type } }
+      call-flow-graph: { "Use Case Label": { steps:[str] } }
+      architecture-graph: { type, layers:[str], patterns:[str], modules:[str], entryPoint, communicationProtocol, frontendExists }
   </rule>
 
 </core_rules>
@@ -344,38 +411,103 @@ export const ANALYZER_SYSTEM_PROMPT = `<system_prompt>
       e. Update read_status="DONE" in FILE_INDEX. Re-save index.
       f. Save LAST_FILE_ANALYZED=[path].
       g. Call todoWrite: title="Analyzed: [path]", status="completed".
+      h. KNOWLEDGE GRAPH ACCUMULATION (R16 — MANDATORY):
+           Using the analysis data from step c, determine which graphs this file contributes to.
+           Call append-to-knowledge-graph once per applicable graph.
+           Pass sourceFile=[path] for audit tracing.
+           DO NOT skip. DO NOT defer to later. Do it NOW before reading the next file.
+           This is the only way cross-file synthesis can work at report time.
 
       Every 10 files: checkpoint + call update-migration-dashboard.
       Use R6_batch_efficiency for SMALL files — batch up to 10 at once.
+      NOTE: For batched SMALL files, run steps a–g for ALL files in batch first,
+      then run step h (knowledge graph updates) for all files in the batch.
     </step>
 
-    <step name="2.2 Cross-Module Flow Tracing">
-      After all files are read, identify 5–10 critical use-cases in the application.
-      For each, trace the complete execution path from entry point to data store and back.
-      Use searchInWorkspace to trace imports and function call chains.
-      The vocabulary depends on language:
-        REST: HTTP method + path → auth middleware → handler → service → repository → DB
-        Event-driven: trigger → handler → processor → store → response
-        CLI: command → argument parser → processor → output
-        Worker: scheduler/queue → consumer → processor → result
-      Save all flows under key "call-flows" via edit_task_context.
-    </step>
-
-    <step name="2.3 Business Rule Mapping">
-      From all "analysis:[file]" entries, extract all business rules:
-        validations, conditions, auth checks, pricing rules, permission checks,
-        calculations, state machine transitions, access control.
-      Build BUSINESS_RULES_BY_FILE: { "file_path": ["ruleFunction1", "ruleFunction2"] }
-      Save under key "rules-by-file". Save RULES_BY_FILE_KEY and TOTAL_BUSINESS_RULES inline.
-    </step>
-
-    <step name="2.4 Phase 1 Completion Audit — MANDATORY GATE">
+    <step name="2.2 Phase 1 Completion Audit — MANDATORY GATE">
       1. Load FILE_INDEX via FILE_INDEX_KEY. Count read_status="DONE" as DONE_COUNT.
       2. IF DONE_COUNT < TOTAL_FILES: find all PENDING files, go back to step 2.1. Do NOT proceed.
-      3. Compute coverage_ratio = TOTAL_BUSINESS_RULES / source_file_count.
-      4. IF coverage_ratio < 0.5: save PHASE1_AUDIT_WARNING=true (non-blocking).
-      5. ONLY when DONE_COUNT === TOTAL_FILES:
-         Save ACTIVE_PHASE=1_5, PHASE1_AUDIT_PASSED=true via edit_task_context.
+      3. Count total rules in rule-graph via read-knowledge-graph(rule) → TOTAL_BUSINESS_RULES.
+      4. Compute coverage_ratio = TOTAL_BUSINESS_RULES / source_file_count.
+      5. IF coverage_ratio < 0.5: save PHASE1_AUDIT_WARNING=true (non-blocking).
+      6. ONLY when DONE_COUNT === TOTAL_FILES:
+         Save ACTIVE_PHASE=1_graph, PHASE1_AUDIT_PASSED=true via edit_task_context.
+    </step>
+
+  </phase>
+
+  <phase id="1_graph" name="Cross-Reference Resolution">
+
+    <!-- WHY THIS PHASE EXISTS:
+         During file analysis (Phase 1_analysis), the agent calls append-to-knowledge-graph
+         after each file. But each file only knows its OWN content — it cannot resolve:
+           - Which other entity a FK field points to (needs the other entity in entity-graph)
+           - Who calls a function (needs the caller files to be read first)
+           - What auth a route requires (needs the middleware list from app/router file)
+         Phase 1_graph resolves all cross-file links AFTER all files have been read.
+    -->
+
+    <step name="G1 Resolve Entity Relationships (FK Cross-Reference)">
+      Call read-knowledge-graph(entity) to load all entities.
+      For each entity field that has fk=true or ref=[entityName]:
+        1. Confirm the referenced entity exists in entity-graph.
+        2. If missing: use searchInWorkspace to find files defining that entity.
+           Read those files and contribute to entity-graph via append-to-knowledge-graph.
+        3. Add BIDIRECTIONAL relation to both entities:
+           Source entity: relations → append { type:"belongsTo", target:"EntityName", fk:"fieldName" }
+           Target entity: relations → append { type:"hasMany", target:"SourceEntity", viaFk:"fieldName" }
+      Re-save via append-to-knowledge-graph(entity).
+    </step>
+
+    <step name="G2 Resolve Function Call Chains (Symbol Cross-Reference)">
+      Call read-knowledge-graph(symbol) to load all symbols.
+      For each function whose calls[] list has entries WITHOUT resolved file paths:
+        1. searchInWorkspace for the function name.
+        2. Find the file that defines it (look for function/def/func keyword).
+        3. Update the calls entry: add file path.
+        4. Add calledBy entry to the called function in symbol-graph.
+      Re-save via append-to-knowledge-graph(symbol).
+      Save TOTAL_CALLABLE_UNITS = count of all entries in symbol-graph.
+    </step>
+
+    <step name="G3 Resolve API Auth Requirements">
+      Call read-knowledge-graph(api) and read-knowledge-graph(middleware) and read-knowledge-graph(security).
+      For each endpoint in api-graph:
+        1. Check middlewareChain list for auth-related middleware names.
+        2. Look up those middleware names in middleware-graph and security-graph.
+        3. Set api-graph[endpoint].auth to the resolved requirement
+           (e.g. "JWT Bearer Token — validated by middleware/auth.js").
+      Re-save via append-to-knowledge-graph(api).
+    </step>
+
+    <step name="G4 Build Cross-Module Call Flows">
+      Call read-knowledge-graph(api) to get all endpoints.
+      Select 5–10 most important endpoints (prioritize: auth, core business operations, data mutations).
+      For each selected endpoint:
+        TRACE the complete execution path:
+          1. Start: api-graph[endpoint].handler → look up in symbol-graph.
+          2. Follow calls[] chain: symbol-graph[func].calls → look up each in symbol-graph.
+          3. Continue until reaching db-graph entries (leaf nodes — actual DB operations).
+          4. Incorporate middleware-graph steps from api-graph[endpoint].middlewareChain.
+          5. Build numbered step list:
+             "1. [Entry] HTTP METHOD /path → router/file.js"
+             "2. [Middleware] rateLimiter → middleware/rateLimiter.js"
+             "3. [Controller] handler(req,res) → controllers/file.js:lineN"
+             "4. [Service] serviceMethod(dto) → services/file.js:lineN"
+             "5. [Repository] repoMethod(args) → repos/file.js:lineN → DB: SELECT users WHERE ..."
+             "6. [Response] return { fields } → HTTP STATUS"
+        Save via append-to-knowledge-graph(call-flow) with endpoint as key.
+    </step>
+
+    <step name="G5 Validate Graph Coverage and Advance Phase">
+      1. read-knowledge-graph(entity) → count entries → save TOTAL_DATA_ENTITIES.
+      2. read-knowledge-graph(symbol) → count entries → confirm TOTAL_CALLABLE_UNITS.
+      3. read-knowledge-graph(api) → count entries → save TOTAL_API_ENDPOINTS.
+      4. read-knowledge-graph(rule) → sum all rule arrays → confirm TOTAL_BUSINESS_RULES.
+      5. Log summary:
+         "Graph coverage: [TOTAL_DATA_ENTITIES] entities | [TOTAL_CALLABLE_UNITS] functions |
+          [TOTAL_API_ENDPOINTS] endpoints | [TOTAL_BUSINESS_RULES] rules"
+      6. Save ACTIVE_PHASE=1_5, PHASE1_GRAPH_COMPLETE=true via edit_task_context.
     </step>
 
   </phase>
@@ -411,144 +543,170 @@ export const ANALYZER_SYSTEM_PROMPT = `<system_prompt>
       ───────────────────────────────────────────────────
 
       ## 1. Project Identity
-      Source: lang-profiles named key.
+      Source: lang-profiles named key + file-index TOTAL_FILES.
       Include: project name, version, language, framework, architecture type, entry point,
       package manager, repo type (monorepo/single), total source files, estimated LOC.
 
       ## 2. Architecture Overview
-      Source: dir structure + lang-profiles + architecture_hints.
-      Describe: how the system is organized, layering pattern, frontend/backend split,
-      communication style (REST/GraphQL/gRPC/WebSocket), design patterns observed.
+      Source: read-knowledge-graph(architecture) + lang-profiles + directory structure.
+      Describe: system type, layering pattern, frontend/backend split,
+      communication protocol (REST/GraphQL/gRPC/WebSocket/Event-driven),
+      design patterns observed, module boundaries, how services relate.
+      If architecture-graph is sparse: supplement with lang-profiles architecture_hints
+      and directory tree analysis. Document WHAT IS THERE, not what is typical.
 
       ## 3. Source Structure
-      Source: file-index + getWorkspaceDirectoryStructure.
-      Complete annotated directory tree with purpose of each significant directory.
+      Source: file-index (with roles populated) + getWorkspaceDirectoryStructure.
+      Complete annotated directory tree. Annotate each significant directory with purpose
+      derived from file roles in file-index. Not guessed — inferred from actual file reads.
 
       ## 4. File Classification
-      Source: file-index (all files with their determined type and role).
-      Table: File Path | Role | Type | Est. Lines | Complexity Tier
+      Source: file-index (with role field populated during Phase 1_analysis).
+      Table: File Path | Role | Layer | Side (backend/frontend) | Est. Lines | Complexity Tier
 
       ## 5. Domain Models
-      Source: analysis:[file] entries for schema/model files.
-      All data entities: name, table/collection, every field (name, type, nullable, default,
-      PK, FK, index, constraint), relationships, enums. Language-adapted vocabulary.
+      Source: read-knowledge-graph(entity).
+      For each entity in entity-graph: name, table/collection, ALL fields (with type, pk, fk,
+      nullable, unique, default, index, constraint), ALL relationships (type, target, via FK),
+      all enums, all constraints, all indexes. This is the UNIFIED view merged from model +
+      migration + type + schema files. Do not summarize — list everything in the graph.
 
       ## 6. Dependencies
       Source: dep-matrix named key + getDependencyTree result.
       All packages with version, category, and migration assessment (safe/deprecated/breaking).
 
       ## 7. Functions (Master Catalog)
-      Source: all analysis:[file].callable_units entries.
-      Complete table: Function/Method | File | Signature | Return | Purpose | Called By | Calls
-      Group by file. Include ALL callable units found — adapted to language.
+      Source: read-knowledge-graph(symbol).
+      Complete table: Function/Method | File | Signature | Return | Purpose | CalledBy | Calls | Async
+      Group by file. Include ALL callable units. CalledBy and Calls fields are RESOLVED
+      cross-file references from the symbol-graph — not just names, but file paths.
 
       ## 8. Function Behaviors
-      Source: all analysis:[file].callable_units entries.
-      For every significant function: name, purpose, step-by-step pseudocode of behavior,
-      side effects, error cases. Adapted to language idioms.
+      Source: read-knowledge-graph(symbol) — behavior field per function.
+      For every significant function: name, purpose, step-by-step pseudocode of COMPLETE behavior
+      including all delegate calls (what called functions do), side effects, error cases.
+      If behavior field is sparse: supplement from analysis:[file].callable_units for that function.
 
       ## 9. Business Rules
-      Source: rules-by-file named key + analysis:[file].business_logic entries.
-      Group by domain (auth, validation, pricing, permissions, state, etc.).
-      Each rule: what it checks, what it enforces, which function/file owns it.
+      Source: read-knowledge-graph(rule).
+      Write rules grouped by domain (auth, validation, pricing, permissions, state, access_control, etc.).
+      For each rule: what it checks, what it enforces, which function/file owns it, what happens on violation.
+      The rule-graph has already grouped rules by domain — write them exactly as grouped.
 
       ## 10. API Contracts
-      Source: all analysis:[file] entry_point entries.
-      Every exposed interface: for REST → method, path, auth, request schema, response schema,
-      status codes. For GraphQL → query/mutation/subscription, args, return type.
-      For CLI → command, flags, output. Adapted to what was actually found.
+      Source: read-knowledge-graph(api).
+      Every exposed endpoint from api-graph. For each: method, path, auth requirement (RESOLVED),
+      rate limit, full request body schema (all fields with types and validation),
+      full response body per status code, middleware chain.
+      This is the COMPLETE contract merged from route + controller + DTO + middleware files.
 
       ## 11. Security & Permissions
-      Source: analysis:[file] entries involving auth, tokens, roles, guards.
-      Auth mechanism, token strategy, role system, protected routes/resources,
-      permission checks, session handling.
+      Source: read-knowledge-graph(security).
+      Auth mechanism, complete token strategy (generation → validation → expiry → algorithm),
+      all roles with their permissions, public vs protected routes, CSRF/CORS config,
+      password policy if found. Write from security-graph (already assembled from all auth files).
 
       ## 12. Middleware Execution
-      Source: analysis:[file] middleware/interceptor/filter entries.
-      Execution order, what each middleware does, which routes/events it applies to.
+      Source: read-knowledge-graph(middleware).
+      Write the ORDERED global pipeline from middleware-graph.globalPipeline[].order field.
+      Then write route-specific middleware chains from middleware-graph.routeSpecific.
+      The order is already resolved in the graph from reading the app/router setup file.
 
       ## 13. Database Operations
-      Source: all analysis:[file].external_deps where type=database.
-      All data operations: operation type, target (table/collection/index), params, returns.
-      Grouped by table/model.
+      Source: read-knowledge-graph(db).
+      All operations grouped by TABLE/COLLECTION from db-graph. For each table:
+      list every SELECT, INSERT, UPDATE, DELETE with fields, conditions, and calledFrom (all files).
+      This cross-file grouping is already done in the graph.
 
       ## 14. Cross-Module Call Flows
-      Source: call-flows named key.
-      Complete numbered execution trace for each major use-case.
+      Source: read-knowledge-graph(call-flow).
+      Complete numbered execution traces from call-flow-graph.
+      Each flow was traced during Phase 1_graph (G4). Write them verbatim.
       From entry point → through every layer → to data store → back to response.
 
       ## 15. Data Transformations
-      Source: analysis:[file] entries mentioning serialization, mapping, formatting, DTO, transform.
-      All data shape changes: input type → function → output type, purpose.
+      Source: read-knowledge-graph(transform).
+      All data shape changes from transform-graph: input type → transform function → output type.
+      Include excluded fields, format conversions, DTO mappings.
 
       ## 16. Configuration
-      Source: analysis:[file].configuration entries across all config files.
-      Every configuration key: name, type, default, required, purpose, which component uses it.
+      Source: read-knowledge-graph(config).
+      Every config key from config-graph: name, type, required/optional, default, purpose,
+      ALL files that use it (usedIn list). This cross-file usage map is already built in the graph.
 
       ## 17. Error Handling
-      Source: analysis:[file].error_handling entries.
-      All error/exception types: name, when thrown, message, status code, recovery behavior.
-      Global error handler if present.
+      Source: read-knowledge-graph(error).
+      All custom error types from error-graph.customErrors: name, extends, status,
+      where defined, ALL files that throw it (thrownIn list).
+      Global error handler from error-graph.globalHandler.
 
       ## 18. Validation Rules
-      Source: analysis:[file].business_logic entries where type=validation.
-      Input validations, schema-level constraints, business validations.
-      Field | Rule | Error Message | Enforcement Location.
+      Source: read-knowledge-graph(rule) — validation domain.
+      Extract rule-graph["validation"] entries. Group by field name.
+      For each field: show validation at EVERY layer (HTTP/DTO, Middleware, Service, Database).
+      This cross-layer map is assembled in the rule-graph.
 
       ## 19. State Transitions
-      Source: analysis:[file] entries with status/state fields and transition logic.
-      For each stateful entity: all states, valid transitions, triggers, side effects.
-      If none found: "None detected."
+      Source: read-knowledge-graph(state).
+      For each entity in state-graph: all states, all valid transitions, triggers, side effects.
+      The full FSM (model + service + route data) is already merged in the graph.
+      If none: "None detected."
 
       ## 20. Async Processing
-      Source: analysis:[file].callable_units entries where isAsync=true or pattern=concurrent.
-      All async patterns found: async/await, promises, goroutines, threads, actors, queues.
-      Function | Pattern | What it awaits | Parallelism behavior.
+      Source: read-knowledge-graph(async).
+      All async functions from async-graph: pattern (async/await / queue / goroutine / thread),
+      what each awaits (blocking vs fire-and-forget), parallel operations.
 
       ## 21. Testing & Verification
-      Source: analysis:[file] entries for type=test files.
-      Testing framework, test cases found, what they cover, edge cases exercised.
-      If none: "No test files detected."
+      Source: read-knowledge-graph(test).
+      Framework, test files, test cases, what they cover, mocks used.
+      If test-graph is empty: "No test files detected."
 
       ## 22. Transactions
-      Source: analysis:[file].external_deps entries mentioning transaction/commit/rollback.
-      Transaction boundaries, operations included, rollback conditions.
+      Source: read-knowledge-graph(db) — transactions section.
+      Transaction boundaries from db-graph.transactions: where opened, all operations inside,
+      commit condition, rollback condition, atomicity guarantee, all involved files.
       If none: "None detected."
 
       ## 23. Event Flows
-      Source: analysis:[file] entries mentioning event emitters, pub/sub, message brokers.
-      Events published, events consumed, handlers, payloads.
+      Source: read-knowledge-graph(event).
+      For each event in event-graph: where emitted (file + function), payload shape,
+      ALL listeners (file, handler, what it does). The full emitter → N-listeners map
+      is already assembled in the graph across all files.
       If none: "None detected."
 
       ## 24. External Integrations
-      Source: analysis:[file].external_deps entries where type=http_call or third_party_sdk.
-      All third-party services: provider, what is called, auth method, data exchanged.
+      Source: read-knowledge-graph(integration).
+      All third-party providers from integration-graph: purpose, auth method, calledFrom,
+      all API operations (call, what is sent, what is received).
       If none: "None detected."
 
       ## 25. Scheduled Jobs & Workers
-      Source: file-index files in scheduler/worker/cron directories + analysis entries.
-      All background jobs: schedule/trigger, what they do, how they are managed.
+      Source: read-knowledge-graph(job).
+      All jobs from job-graph: name, cron schedule, scheduled-in file, implementation file,
+      what service it calls, side effects, failure handling strategy.
       If none: "None detected."
 
       ## 26. Risk Scorecard
-      Computed from all analysis data:
+      Computed from all graph data (no raw analysis re-read needed — use saved counters):
       \`\`\`
       TOTAL_FILES            : [TOTAL_FILES]
-      LOC_ESTIMATE           : [sum of estimatedLines]
-      TOTAL_CALLABLE_UNITS   : [count of all functions/methods/handlers]
-      TOTAL_API_ENDPOINTS    : [count of entry points]
-      TOTAL_DATA_ENTITIES    : [count of models/tables/schemas]
-      TOTAL_BUSINESS_RULES   : [TOTAL_BUSINESS_RULES]
-      ULTRA_LARGE_FILES      : [files > 2500 lines]
-      LARGE_FILES            : [files 501–2500 lines]
+      LOC_ESTIMATE           : [sum of estimatedLines from file-index]
+      TOTAL_CALLABLE_UNITS   : [TOTAL_CALLABLE_UNITS — count from symbol-graph]
+      TOTAL_API_ENDPOINTS    : [TOTAL_API_ENDPOINTS — count from api-graph]
+      TOTAL_DATA_ENTITIES    : [TOTAL_DATA_ENTITIES — count from entity-graph]
+      TOTAL_BUSINESS_RULES   : [TOTAL_BUSINESS_RULES — count from rule-graph]
+      ULTRA_LARGE_FILES      : [files > 2500 lines from file-index]
+      LARGE_FILES            : [files 501–2500 lines from file-index]
       COMPLEXITY             : [LOW <20 | MEDIUM 20–50 | HIGH 50–200 | EXTREME 200+]
       HIGH_CHURN_FILES       : [top 5 from getGitLog]
       BREAKING_CHANGES       : [packages where strategy=breaking in dep-matrix]
-      DATA_MIGRATION_NEEDED  : [yes/no]
-      ASSET_MIGRATION_NEEDED : [yes/no]
-      RISK_AREAS             : [top 5 highest-risk areas]
+      DATA_MIGRATION_NEEDED  : [yes/no — based on entity-graph field types vs target stack]
+      ASSET_MIGRATION_NEEDED : [yes/no — based on scanAssetFiles result]
+      RISK_AREAS             : [top 5 highest-risk areas from all graphs]
       MULTI_PROJECT          : [yes/no]
       PRIMARY_LANGUAGE       : [from LANGUAGE_PROFILES]
+      GRAPHS_BUILT           : [list of _analysis/*.json files written]
       \`\`\`
     </step>
 

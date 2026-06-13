@@ -50,6 +50,10 @@ import { getSkillFileContentTool }   from './session/get-skill-file-content.tool
 // ── Compare ───────────────────────────────────────────────────────────────────
 import { compareFilesTool }          from './compare/compare-files.tool.js';
 
+// ── Knowledge Graphs ──────────────────────────────────────────────────────────
+import { appendToKnowledgeGraphTool } from './knowledge/append-to-knowledge-graph.tool.js';
+import { readKnowledgeGraphTool }     from './knowledge/read-knowledge-graph.tool.js';
+
 // ── Register all tools ────────────────────────────────────────────────────────
 // Order does not matter — each tool has a unique ID.
 
@@ -91,6 +95,10 @@ export function registerAllTools(): void {
 
   // Compare
   toolRegistry.registerTool(compareFilesTool);
+
+  // Knowledge Graphs
+  toolRegistry.registerTool(appendToKnowledgeGraphTool);
+  toolRegistry.registerTool(readKnowledgeGraphTool);
 }
 
 // ── Tool ID Constants: Single Source of Truth ─────────────────────────────────

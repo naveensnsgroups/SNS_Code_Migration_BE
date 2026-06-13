@@ -45,7 +45,7 @@ export const todoWriteTool: ToolRequest = {
     EventBroadcaster.broadcast(ctx!.sessionId, 'todo_update', { todos: args.todos, timestamp: new Date().toISOString() });
     const completed = args.todos.filter(t => t.status === 'completed').length;
     const total = args.todos.length;
-    ctx!.onLog?.(`📋 [Todo] ${completed}/${total} tasks completed.`, 'info');
+    ctx!.onLog?.(`[Todo] ${completed}/${total} tasks completed.`, 'info');
     return makeToolTextResult(JSON.stringify({ saved: true, count: total, completed }));
   }
 };

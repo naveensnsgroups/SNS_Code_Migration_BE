@@ -1,147 +1,131 @@
 // =============================================================================
-//  planner-agent.ts — Stage 1: Codebase Analysis Agent (Phase 1 ONLY)
+//  planner-agent.ts — Stage 1: TypeScript Orchestrator
 //
-//  Mirrors: snside FileAnalyzer sub-agent pattern
+//  SNS IDE pattern:
+//    - ONE AgentExecutor.execute() per phase — no restart loops
+//    - TypeScript controls phase TRANSITIONS only — agent decides when it is done
+//    - No turn counting from orchestrator — agent stops naturally (no more tool calls)
+//    - If a phase needs a resume pass, TypeScript makes ONE more call — not a loop
 //
-//  Goal: Fully understand and document the legacy codebase.
-//  Output: Stage1_Analysis.md written to modernPath.
-//
-//  Phase 2 (migration-plan.md) is a SEPARATE agent — not implemented here.
-//  This agent focuses exclusively on READING and UNDERSTANDING the legacy code.
-//
-//  Rules:
-//   - NO target stack context is passed to the LLM
-//   - NO "migrate to X" language in any prompt
-//   - Pure analysis only — write ONE output: Stage1_Analysis.md
-//   - Provider, model, API key resolved from session config (no hardcoding)
-//   - System prompt from prompts/analyzer-prompt.ts
-//   - Tool IDs from common/workspace-functions.ts via TOOLS_REGISTRY constants
+//  Stage 1: Discovery        (1 call — discovers files, saves TOTAL_FILES)
+//  Stage 2: File Analysis    (1 call + 1 optional resume — reads all source files)
+//  Stage 3: Graph Resolution (1 call — resolves cross-references across graphs)
+//  Stage 4: Section Writing  (26 calls parallel by graph group — writes one file each)
+//  Stage 5: Assembly         (TypeScript only — no LLM)
 // =============================================================================
 
 import { DetectedStack, TargetStack } from '../types.js';
-import { toolRegistry } from '../core/tool-invocation-registry.js';
-import { ToolContext } from '../types/tool.js';
-import { AgentExecutor } from './agentExecutor.js';
-import { TaskContextManager } from '../session/taskContext.js';
-import { SessionManager } from '../session/sessionManager.js';
-import { AIProviderFactory } from '../ai/provider.js';
-import { StreamingProvider } from '../types/language-model.js';
-import { ANALYZER_SYSTEM_PROMPT } from '../prompts/analyzer-prompt.js';
-import { STAGE1_PLANNER_AGENT } from './agent-definitions.js';
-import fs from 'fs-extra';
+import { toolRegistry }               from '../core/tool-invocation-registry.js';
+import { ToolContext }                 from '../types/tool.js';
+import { AgentExecutor }              from './agentExecutor.js';
+import { TaskContextManager }         from '../session/taskContext.js';
+import { SessionManager }             from '../session/sessionManager.js';
+import { resolveStreamingProvider }   from '../ai/index.js';
+import { StreamingProvider }          from '../types/language-model.js';
+import {
+  DISCOVERY_AGENT,
+  GRAPH_RESOLVER_AGENT,
+  SECTION_WRITER_AGENT,
+  STAGE1_PLANNER_AGENT,
+} from './agent-definitions.js';
+import {
+  DISCOVERY_SYSTEM_PROMPT,
+  buildDiscoveryUserPrompt,
+} from '../prompts/discovery-prompt.js';
+import {
+  FILE_ANALYSIS_SYSTEM_PROMPT,
+  buildAnalysisUserPrompt,
+} from '../prompts/file-analysis-prompt.js';
+import {
+  GRAPH_RESOLUTION_SYSTEM_PROMPT,
+  buildGraphResolutionUserPrompt,
+} from '../prompts/graph-resolution-prompt.js';
+import {
+  SECTION_SYSTEM_PROMPT,
+  SECTION_CONFIG,
+  SectionConfig,
+  buildSectionUserPrompt,
+  buildParallelSectionGroups,
+} from '../prompts/section-writer-prompt.js';
+import { assembleSections, getWrittenSections } from './section-assembler.js';
+import fs   from 'fs-extra';
 import path from 'path';
 
-// ── Agent Configuration Constants ─────────────────────────────────────────────
-// These are named constants — never hardcoded inline in method calls.
+// ── Constants ─────────────────────────────────────────────────────────────────
 
-/** Maximum LLM turns for deep codebase analysis.
- * 80 turns supports EXTREME complexity (200+ files).
- * Rule R14_turn_budget ensures the agent self-manages within this budget.
- */
-const PHASE1_MAX_TURNS = 80;
-
-/** Output file name — defined once, referenced everywhere. */
-const PHASE1_OUTPUT_FILE = 'Stage1_Analysis.md';
-
-/** Alias key to resolve the reasoning model from session.aliasesConfig. */
-const REASONING_MODEL_ALIAS = 'reasoning-model';
-
-/** Custom prompt fragment ID for injecting user-defined system rules. */
+const REASONING_MODEL_ALIAS    = 'reasoning-model';
 const CUSTOM_RULES_FRAGMENT_ID = 'system-agent-rules';
 
-// NOTE: toToolRequest() removed — all tools are now ToolRequest from the toolRegistry.
-// Use toolRegistry.getFunctions(...STAGE1_PLANNER_AGENT.functions) to get agent tools.
+// ── Model-Aware Turn Cap ──────────────────────────────────────────────────────
+// Computes the maximum number of files the file-analysis agent should process
+// per session, based on the model's context window size.
+// Larger context = more files per session.
+// Free tier models need conservative caps to avoid rate limits and context exhaustion.
+
+function computeTurnCap(modelName: string): number {
+  const m = modelName.toLowerCase();
+  if (m.includes('gemini-2.0-flash'))   return 35;  // 1M context, 15 RPM free
+  if (m.includes('gemini-2.5-flash'))   return 35;
+  if (m.includes('gemini-2.5-pro'))     return 30;  // 1M context, 50 RPD free — conservative
+  if (m.includes('gemini-1.5-flash'))   return 30;
+  if (m.includes('gemini-1.5-pro'))     return 28;
+  if (m.includes('claude-opus-4'))      return 20;  // 200k context
+  if (m.includes('claude-sonnet-4'))    return 25;
+  if (m.includes('claude-3-5-sonnet'))  return 25;
+  if (m.includes('claude-3-opus'))      return 18;
+  if (m.includes('claude-3-haiku'))     return 20;
+  if (m.includes('claude-haiku'))       return 20;
+  if (m.includes('gpt-4o-mini'))        return 22;  // 128k context
+  if (m.includes('gpt-4o'))             return 18;
+  if (m.includes('gpt-4-turbo'))        return 18;
+  if (m.includes('gpt-3.5'))            return 15;  // 16k context — very limited
+  return 22;                                         // safe default for unknown models
+}
+
+// ── Project-Size-Aware Batch Size ─────────────────────────────────────────────
+// Controls how many SMALL files (<= 200 lines) are read in a single batch-read-files call.
+// More files in parallel = faster analysis, but higher token cost per turn.
+// For large projects, reduce batch size to stay within token budgets.
+
+function computeBatchSize(totalFiles: number): number {
+  if (totalFiles < 30)  return 10;   // tiny project — batch aggressively
+  if (totalFiles < 100) return 8;    // small project — moderate batching
+  if (totalFiles < 300) return 5;    // medium project — conservative
+  return 3;                          // large project — minimal, prioritise quality
+}
+
 
 // ── PlannerAgent ──────────────────────────────────────────────────────────────
 
 export class PlannerAgent {
   /**
-   * Runs Stage 1, Phase 1: Codebase Discovery and Analysis.
+   * Runs Stage 1: TypeScript orchestrator (SNS IDE pattern).
    *
-   * What this agent does:
-   *  1. Loads provider + model from session config (no hardcoding)
-   *  2. Builds tool list from STAGE1_PLANNER_AGENT.functions
-   *  3. Filters tools based on UI toolsConfig toggle state
-   *  4. Runs AgentExecutor with ANALYZER_SYSTEM_PROMPT
-   *  5. Verifies Stage1_Analysis.md was written; writes fallback if not
-   *
-   * What this agent does NOT do:
-   *  - Does NOT write migration-plan.md (that is Phase 2 — a separate agent)
-   *  - Does NOT mention the target stack to the LLM
-   *  - Does NOT hardcode any model names, API keys, or prompt strings
-   *
-   * @param sessionId      Current migration session ID
-   * @param legacyPath     Absolute path to the legacy project (read-only)
-   * @param modernPath     Absolute path to the output folder (writes go here)
-   * @param detectedStack  Stack detected by ScannerAgent — passed as context only
-   * @param targetStack    User's chosen target (used only for model resolution)
-   * @param _aiServiceLegacy  Kept for backward compat — provider resolved from session
-   * @param onLog          Log callback → SSE terminal stream
+   * TypeScript controls phase TRANSITIONS only.
+   * Each phase calls AgentExecutor once — agent self-manages and stops naturally.
+   * No restart loops — ONE optional resume pass per phase if progress was made.
    */
   static async run(
-    sessionId: string,
-    legacyPath: string,
-    modernPath: string,
-    detectedStack: DetectedStack,
-    targetStack: TargetStack,
-    /** @deprecated Provider is now resolved from session.apiKeys + session.aliasesConfig. */
+    sessionId:       string,
+    legacyPath:      string,
+    modernPath:      string,
+    detectedStack:   DetectedStack,
+    targetStack:     TargetStack,
+    /** @deprecated Provider resolved from session config — not used. */
     _aiServiceLegacy: unknown,
-    onLog?: (message: string, level?: 'info' | 'success' | 'error' | 'warning') => void
+    onLog?:      (message: string, level?: 'info' | 'success' | 'error' | 'warning') => void,
+    onProgress?: (percent: number, currentFile?: string) => void
   ): Promise<string> {
-    onLog?.('🚀 Initializing Stage 1: Codebase Analysis Agent...', 'info');
+    onLog?.('[PlannerAgent] Stage 1: Starting codebase analysis...', 'info');
 
-    // ── Load session config (no hardcoded values below this line) ─────────
-    const session = await SessionManager.getSession(sessionId);
-    const toolsConfig:   Record<string, boolean> = (session as any)?.toolsConfig   ?? {};
-    const promptFragments: Record<string, string> = (session as any)?.promptFragments ?? {};
-    const aliasesConfig: Record<string, string>  = (session as any)?.aliasesConfig  ?? {};
+    // ── Resolve provider + model (shared utility — no duplication) ────────────
+    const session        = await SessionManager.getSession(sessionId);
+    const toolsConfig    : Record<string, boolean> = (session as any)?.toolsConfig    ?? {};
+    const promptFragments: Record<string, string>  = (session as any)?.promptFragments ?? {};
 
-    // Resolve model: aliasesConfig['reasoning-model'] → targetStack.model → fallback from agent def
-    const modelName = targetStack.model;
-    const resolvedModel =
-      aliasesConfig[REASONING_MODEL_ALIAS] ??
-      modelName ??
-      STAGE1_PLANNER_AGENT.languageModelRequirements[0]?.identifier?.replace('alias:', '') ??
-      '';
+    const { provider, resolvedModel } = await resolveStreamingProvider(sessionId, targetStack);
 
-    // Resolve API key for the chosen provider
-    const providerName = targetStack.provider.toLowerCase();
-    let apiKey = (session as any)?.apiKey ?? '';
-    if ((session as any)?.apiKeys) {
-      if (providerName === 'anthropic' && (session as any).apiKeys.anthropic) apiKey = (session as any).apiKeys.anthropic;
-      else if (providerName === 'openai' && (session as any).apiKeys.openai) apiKey = (session as any).apiKeys.openai;
-      else if (providerName === 'google' && (session as any).apiKeys.google) apiKey = (session as any).apiKeys.google;
-      else if (providerName === 'grok' && (session as any).apiKeys.grok) apiKey = (session as any).apiKeys.grok;
-      else if (providerName === 'groq' && (session as any).apiKeys.groq) apiKey = (session as any).apiKeys.groq;
-      else if (providerName === 'openrouter' && (session as any).apiKeys.openrouter) apiKey = (session as any).apiKeys.openrouter;
-      else if (providerName === 'huggingface' && (session as any).apiKeys.huggingface) apiKey = (session as any).apiKeys.huggingface;
-    }
-
-    if (!apiKey) {
-      if (providerName === 'anthropic') apiKey = process.env.ANTHROPIC_API_KEY || '';
-      else if (providerName === 'openai') apiKey = process.env.OPENAI_API_KEY || '';
-      else if (providerName === 'google') apiKey = process.env.GEMINI_API_KEY || process.env.GOOGLE_API_KEY || '';
-      else if (providerName === 'grok') apiKey = process.env.XAI_API_KEY || '';
-      else if (providerName === 'groq') apiKey = process.env.GROQ_API_KEY || '';
-      else if (providerName === 'openrouter') apiKey = process.env.OPENROUTER_API_KEY || '';
-      else if (providerName === 'huggingface') apiKey = process.env.HF_API_KEY || process.env.HF_TOKEN || '';
-    }
-
-    const providerConfig = {
-      maxRetries: (session as any)?.googleMaxRetries,
-      retryDelayRateLimit: (session as any)?.googleRetryDelayRateLimit,
-      retryDelayOther: (session as any)?.googleRetryDelayOther,
-    };
-
-    // Build the streaming provider via factory
-    const provider: StreamingProvider = AIProviderFactory.getStreamingProvider(
-      targetStack.provider,
-      resolvedModel,
-      apiKey,
-      providerConfig
-    );
-
-    // ── Tool context ───────────────────────────────────────────────────────
+    // ── Tool context ─────────────────────────────────────────────────────────
     const context: ToolContext = {
       sessionId,
       legacyPath,
@@ -149,183 +133,385 @@ export class PlannerAgent {
       onLog: (msg, lvl) => onLog?.(msg, lvl),
     };
 
-    // ── Build ToolRequest[] from STAGE1_PLANNER_AGENT.functions ─────────────
-    // Uses the agent definition's declared function list — no inline tool names.
-    // Applies toolsConfig toggle filter from the AI Config panel.
-    // toolRegistry.getFunctions() returns ToolRequest[] — SNS IDE standard.
-    const allPhase1Tools = toolRegistry
-      .getFunctions(...STAGE1_PLANNER_AGENT.functions)
-      .filter(t => toolsConfig[t.name] !== false);
+    // Optional custom rules from AI Config panel
+    const customRules  = promptFragments[CUSTOM_RULES_FRAGMENT_ID];
+    const customSuffix = customRules ? `\n\n<custom_rules>\n${customRules}\n</custom_rules>` : '';
 
-    // ── Resume support: load active phase from task context ───────────────
-    const taskContext = await TaskContextManager.getContext(sessionId);
-    const activePhase = taskContext.active_phase || '1';
+    // ── Per-agent tool lists (filtered by UI toggle config) ──────────────────
+    const filter = (def: typeof DISCOVERY_AGENT) =>
+      toolRegistry.getFunctions(...def.functions).filter(t => toolsConfig[t.name] !== false);
 
-    if (activePhase !== '1' && activePhase !== '1_5') {
-      onLog?.(`ℹ Task context shows phase '${activePhase}' — analysis already completed. Skipping.`, 'info');
-      return `Stage 1 Phase 1 already completed (phase: ${activePhase}).`;
+    const discoveryTools = filter(DISCOVERY_AGENT);
+    const analysisTools  = filter(STAGE1_PLANNER_AGENT);  // full tool set for file reading
+    const graphTools     = filter(GRAPH_RESOLVER_AGENT);
+    const sectionTools   = filter(SECTION_WRITER_AGENT);
+
+    // ── Load current phase (resume support) ──────────────────────────────────
+    let taskCtx     = await TaskContextManager.getContext(sessionId);
+    let activePhase = (taskCtx.active_phase as string) || 'discovery';
+
+    if (activePhase === 'complete') {
+      onLog?.('[PlannerAgent] Stage 1 already complete.', 'success');
+      return 'Stage 1 analysis already complete.';
     }
 
-    // ── Phase 1: Codebase Discovery and Analysis ───────────────────────────
-    onLog?.(' Phase 1: Starting Codebase Discovery & Analysis...', 'info');
+    onLog?.(`[PlannerAgent] Resuming from phase: "${activePhase}"`, 'info');
 
-    // System prompt: base from prompts file + optional custom rules fragment
-    const customRules = promptFragments[CUSTOM_RULES_FRAGMENT_ID];
-    const systemPrompt = customRules
-      ? `${ANALYZER_SYSTEM_PROMPT}\n\n<custom_rules>\n${customRules}\n</custom_rules>`
-      : ANALYZER_SYSTEM_PROMPT;
+    // ═════════════════════════════════════════════════════════════════════════
+    // STAGE 1 — Discovery
+    // TypeScript checks: TOTAL_FILES saved before advancing to analysis.
+    // ═════════════════════════════════════════════════════════════════════════
+    if (activePhase === 'discovery') {
+      onLog?.('[PlannerAgent] Stage 1/5: Workspace Discovery...', 'info');
 
-    // User prompt: built dynamically from detectedStack — no target stack mentioned
-    const userPrompt = buildAnalyzerUserPrompt(legacyPath, detectedStack);
+      await AgentExecutor.execute(
+        provider,
+        DISCOVERY_SYSTEM_PROMPT + customSuffix,
+        buildDiscoveryUserPrompt(legacyPath, detectedStack),
+        discoveryTools,
+        context,
+        undefined,       // maxIterations — agent stops naturally; undefined uses the default
+        resolvedModel,
+        'discovery-agent'
+      );
 
-    const resultText = await AgentExecutor.execute(
-      provider,
-      systemPrompt,
-      userPrompt,
-      allPhase1Tools,
-      context,
-      PHASE1_MAX_TURNS,
-      resolvedModel,
-      'planner-agent'
+      taskCtx = await TaskContextManager.getContext(sessionId);
+      const totalFiles = (taskCtx.TOTAL_FILES as number | undefined) ?? 0;
+      if (totalFiles === 0) {
+        onLog?.(
+          '[PlannerAgent] WARNING: TOTAL_FILES=0 after discovery. ' +
+          'Workspace may have no source files, or the discovery agent hit an error. ' +
+          'Advancing to analysis — agent will attempt to build FILE_INDEX from scratch.',
+          'warning'
+        );
+      }
+
+      onLog?.(`[PlannerAgent] Discovery complete: ${totalFiles} files indexed.`, 'success');
+      onProgress?.(5, 'Workspace Discovery');
+      await TaskContextManager.updateContext(sessionId, { active_phase: 'analysis' });
+      activePhase = 'analysis';
+    }
+
+    // ═════════════════════════════════════════════════════════════════════════
+    // STAGE 2 — File Analysis (Full While Loop)
+    // TypeScript loops as many times as needed until ALL files are DONE.
+    // Stall guard: if a pass makes ZERO progress, agent is stuck → advance anyway.
+    // Handles codebases of any size (3 files or 3,000 files).
+    // ═════════════════════════════════════════════════════════════════════════
+    if (activePhase === 'analysis') {
+      taskCtx = await TaskContextManager.getContext(sessionId);
+      const totalFiles = (taskCtx.TOTAL_FILES as number) || 0;
+
+      onLog?.(`[PlannerAgent] Stage 2/5: File Analysis (${totalFiles} files)...`, 'info');
+
+      let passNumber   = 0;
+      let prevDone     = -1;    // sentinel: tracks progress between passes
+      const MAX_PASSES = 20;    // safety ceiling — no infinite loop ever
+
+      while (passNumber < MAX_PASSES) {
+        passNumber++;
+
+        // Re-read context to get LAST_FILE_ANALYZED for resume prompt
+        taskCtx = await TaskContextManager.getContext(sessionId);
+        const lastAnalyzed = taskCtx.LAST_FILE_ANALYZED as string | undefined;
+
+        // Check current done count BEFORE running
+        const fileIndexKey = taskCtx.FILE_INDEX_KEY as string | undefined;
+        const fileIndex: any[] = fileIndexKey ? ((taskCtx[fileIndexKey] as any[]) ?? []) : [];
+        const doneCount = fileIndex.filter((f: any) => f?.read_status === 'DONE').length;
+
+        if (doneCount >= totalFiles) {
+          onLog?.(`[PlannerAgent] All ${totalFiles} files analyzed.`, 'success');
+          break;
+        }
+
+        const remaining = totalFiles - doneCount;
+        const agentId   = passNumber === 1 ? 'file-analysis-agent' : `file-analysis-agent-pass${passNumber}`;
+        onLog?.(`[PlannerAgent] Analysis pass ${passNumber}: ${remaining} files remaining (${doneCount}/${totalFiles} done).`, 'info');
+
+        // Compute dynamic limits (model-aware + project-size-aware)
+        const turnCap   = computeTurnCap(resolvedModel);
+        const batchSize = computeBatchSize(totalFiles);
+        onLog?.(`[PlannerAgent] Session limits: turnCap=${turnCap} files | batchSize=${batchSize} small files/batch (model: ${resolvedModel || 'default'})`, 'info');
+
+        await AgentExecutor.execute(
+          provider,
+          FILE_ANALYSIS_SYSTEM_PROMPT + customSuffix,
+          buildAnalysisUserPrompt(legacyPath, lastAnalyzed, turnCap, batchSize),
+          analysisTools,
+          context,
+          undefined,   // maxIterations — agent stops naturally; undefined uses the default
+          resolvedModel,
+          agentId
+        );
+
+        await PlannerAgent.cleanupAnalysisKeys(sessionId);
+
+        // Re-read context to measure progress made in this pass
+        taskCtx = await TaskContextManager.getContext(sessionId);
+        const fileIndexKeyAfter   = taskCtx.FILE_INDEX_KEY as string | undefined;
+        const fileIndexAfter: any[] = fileIndexKeyAfter ? ((taskCtx[fileIndexKeyAfter] as any[]) ?? []) : [];
+        const doneAfter = fileIndexAfter.filter((f: any) => f?.read_status === 'DONE').length;
+
+        if (doneAfter >= totalFiles) {
+          onLog?.(`[PlannerAgent] All ${totalFiles} files analyzed after pass ${passNumber}.`, 'success');
+          onProgress?.(45, `Analyzed ${doneAfter} / ${totalFiles} files`);
+          break;
+        }
+
+        // Stall guard: if this pass made zero progress, agent is stuck — advance to next stage
+        if (doneAfter <= prevDone) {
+          onLog?.(
+            `[PlannerAgent] Stall detected after pass ${passNumber} — no new files analyzed. ` +
+            `Advancing with ${doneAfter}/${totalFiles} files done.`,
+            'warning'
+          );
+          onProgress?.(45, `Stalled at ${doneAfter} / ${totalFiles} files`);
+          break;
+        }
+
+        // Real incremental progress — 5% base + up to 40% for analysis phase
+        const analysisPct = 5 + Math.min(Math.round((doneAfter / Math.max(totalFiles, 1)) * 40), 40);
+        onProgress?.(analysisPct, `Analyzed ${doneAfter} / ${totalFiles} files`);
+        prevDone = doneAfter;
+      }
+
+      if (passNumber >= MAX_PASSES) {
+        onLog?.(`[PlannerAgent] Max passes (${MAX_PASSES}) reached. Advancing with partial analysis.`, 'warning');
+      }
+
+      onLog?.('[PlannerAgent] Stage 2/5: File analysis complete.', 'success');
+      await TaskContextManager.updateContext(sessionId, { active_phase: 'graph-resolution' });
+      activePhase = 'graph-resolution';
+    }
+
+
+    // ═════════════════════════════════════════════════════════════════════════
+    // STAGE 3 — Graph Resolution
+    // ONE call. Agent resolves cross-refs, synthesizes architecture, saves counters.
+    // Agent self-manages: reads all graphs, resolves references, stops naturally.
+    // ═════════════════════════════════════════════════════════════════════════
+    if (activePhase === 'graph-resolution') {
+      onLog?.('[PlannerAgent] Stage 3/5: Graph Resolution...', 'info');
+
+      await AgentExecutor.execute(
+        provider,
+        GRAPH_RESOLUTION_SYSTEM_PROMPT + customSuffix,
+        buildGraphResolutionUserPrompt(legacyPath),
+        graphTools,
+        context,
+        undefined,       // maxIterations — agent stops naturally; undefined uses the default
+        resolvedModel,
+        'graph-resolver-agent'
+      );
+
+      // ── Validate that G5 counters were saved ─────────────────────────────────
+      // If the graph resolver stopped before G5, Section 26 will show zeros.
+      // We detect this and emit a clear warning so it's visible in the terminal log.
+      const ctxAfterGraph = await TaskContextManager.getContext(sessionId);
+      const countersPresent = ctxAfterGraph.TOTAL_CALLABLE_UNITS !== undefined
+                           || ctxAfterGraph.TOTAL_DATA_ENTITIES  !== undefined
+                           || ctxAfterGraph.TOTAL_API_ENDPOINTS  !== undefined;
+      if (!countersPresent) {
+        onLog?.(
+          '[PlannerAgent] WARNING: Graph resolver did not save counters (TOTAL_CALLABLE_UNITS missing). ' +
+          'Section 26 (Risk Scorecard) may show zeros. This happens when the resolver stops before step G5. ' +
+          'Check the graph-resolver-agent logs for errors.',
+          'warning'
+        );
+      } else {
+        onLog?.(
+          `[PlannerAgent] Graph counters: ${ctxAfterGraph.TOTAL_CALLABLE_UNITS ?? 0} functions | ` +
+          `${ctxAfterGraph.TOTAL_DATA_ENTITIES ?? 0} entities | ` +
+          `${ctxAfterGraph.TOTAL_API_ENDPOINTS ?? 0} endpoints | ` +
+          `${ctxAfterGraph.TOTAL_BUSINESS_RULES ?? 0} rules`,
+          'info'
+        );
+      }
+
+      onLog?.('[PlannerAgent] Stage 3/5: Graph resolution complete.', 'success');
+      onProgress?.(55, 'Graph Resolution');
+      await TaskContextManager.updateContext(sessionId, { active_phase: 'section-writing' });
+      activePhase = 'section-writing';
+    }
+
+    // ═════════════════════════════════════════════════════════════════════════
+    // STAGE 4 — Section Writing (26 focused agent calls, parallel by graph group)
+    // Each section gets a FRESH context window — no exhaustion.
+    // Agent self-manages per section: reads its graph, writes the file, stops.
+    // TypeScript verifies each file exists. Retries once if missing.
+    // ═════════════════════════════════════════════════════════════════════════
+    if (activePhase === 'section-writing') {
+      onLog?.('[PlannerAgent] Stage 4/5: Writing 26 sections...', 'info');
+
+      // Check which sections already exist on disk (resume support)
+      const alreadyWritten = await getWrittenSections(modernPath);
+
+      // Shared counter for real per-section progress (55–90%)
+      // JS is single-threaded — counter increments are safe despite parallel awaits
+      let sectionsWritten = alreadyWritten.size;
+      const totalSections = SECTION_CONFIG.length; // 26
+
+      // Run sections in parallel batches (sections sharing a graph run sequentially)
+      const batches = buildParallelSectionGroups(SECTION_CONFIG);
+
+      for (const batch of batches) {
+        await Promise.all(
+          batch.map(section =>
+            PlannerAgent.writeSingleSection(
+              section,
+              provider,
+              SECTION_SYSTEM_PROMPT + customSuffix,
+              modernPath,
+              sectionTools,
+              context,
+              resolvedModel,
+              alreadyWritten,
+              onLog,
+              () => {
+                sectionsWritten++;
+                const pct = 55 + Math.round((sectionsWritten / totalSections) * 35);
+                onProgress?.(Math.min(pct, 90), `Section ${sectionsWritten} / ${totalSections}`);
+              }
+            )
+          )
+        );
+      }
+
+      await TaskContextManager.updateContext(sessionId, { active_phase: 'assembly' });
+      activePhase = 'assembly';
+    }
+
+    // ═════════════════════════════════════════════════════════════════════════
+    // STAGE 5 — Assembly (TypeScript only — no LLM)
+    // Reads all 26 section files. Adds table of contents. Writes Stage1_Analysis.md.
+    // ═════════════════════════════════════════════════════════════════════════
+    if (activePhase === 'assembly') {
+      onLog?.('[PlannerAgent] Stage 5/5: Assembling Stage1_Analysis.md...', 'info');
+
+      const { missingSections } = await assembleSections(modernPath, sessionId, onLog);
+
+      await TaskContextManager.updateContext(sessionId, {
+        active_phase:            'complete',
+        STAGE1_ANALYSIS_WRITTEN: true,
+        MISSING_SECTIONS:        missingSections,
+        STAGE1_COMPLETED_AT:     new Date().toISOString(),
+      });
+
+      onLog?.(
+        missingSections.length > 0
+          ? `[PlannerAgent] WARNING: ${missingSections.length} sections missing: ${missingSections.join(', ')}`
+          : '[PlannerAgent] Stage 1 complete. All 26 sections written.',
+        missingSections.length > 0 ? 'warning' : 'success'
+      );
+      onProgress?.(98, 'Assembling Stage1_Analysis.md');
+    }
+
+    return 'Stage 1 analysis complete.';
+  }
+
+  // ── Private helpers ───────────────────────────────────────────────────────
+
+  /**
+   * Writes a single section file.
+   * Retries ONCE if the file is not found after the first attempt.
+   * Uses a fresh AgentExecutor call per section → fresh context window.
+   */
+  private static async writeSingleSection(
+    section:        SectionConfig,
+    provider:       StreamingProvider,
+    systemPrompt:   string,
+    modernPath:     string,
+    tools:          ReturnType<typeof toolRegistry.getFunctions>,
+    context:        ToolContext,
+    resolvedModel:  string,
+    alreadyWritten: Set<number>,
+    onLog?:         (msg: string, lvl?: 'info' | 'success' | 'error' | 'warning') => void,
+    onSectionDone?: () => void
+  ): Promise<void> {
+    const nn          = String(section.n).padStart(2, '0');
+    const sectionFile = path.join(modernPath, '_analysis', 'sections', `section-${nn}.md`);
+
+    if (alreadyWritten.has(section.n)) {
+      onLog?.(`[PlannerAgent] Section ${section.n} already on disk — skipping.`, 'info');
+      // Already counted in sectionsWritten initial value — do NOT call onSectionDone again
+      return;
+    }
+
+    onLog?.(`[PlannerAgent] Writing section ${section.n}: ${section.name}...`, 'info');
+    const userPrompt = buildSectionUserPrompt(section, modernPath);
+
+    await AgentExecutor.execute(
+      provider, systemPrompt, userPrompt, tools, context,
+      undefined, resolvedModel, `section-${section.n}`
     );
 
-    // ── Phase 1_5 continuation: If agent set ACTIVE_PHASE=1_5, run a second pass ──
-    // This handles large codebases where reading all files used all turns.
-    // Phase 1_5 = write-only pass: load data from task context, write Stage1_Analysis.md.
-    const taskContextAfter = await TaskContextManager.getContext(sessionId);
-    const phaseAfter = taskContextAfter.active_phase;
-
-    if (phaseAfter === '1_5') {
-      onLog?.('📝 Phase 1_5: Writing Stage1_Analysis.md from collected analysis data...', 'info');
-
-      const phase15UserPrompt = `You are now in ACTIVE_PHASE=1_5.
-
-Your file reading is complete. All data is stored in task context under analysis:[file] named keys.
-
-Your ONLY job now is to write Stage1_Analysis.md with ALL 26 sections.
-
-STEPS:
-1. Call get_task_context to load: file-index, lang-profiles, dep-matrix, call-flows, rules-by-file, all analysis:[file] keys.
-2. Write Stage1_Analysis.md using write_file with all 26 sections.
-3. After each section, save SECTION_N_WRITTEN=true.
-4. After all 26 sections, save ACTIVE_PHASE=complete, STAGE1_ANALYSIS_WRITTEN=true.
-
-Sections required (all 26):
-1.Project Identity, 2.Architecture Overview, 3.Source Structure, 4.File Classification,
-5.Domain Models, 6.Dependencies, 7.Functions (Master Catalog), 8.Function Behaviors,
-9.Business Rules, 10.API Contracts, 11.Security & Permissions, 12.Middleware Execution,
-13.Database Operations, 14.Cross-Module Call Flows, 15.Data Transformations,
-16.Configuration, 17.Error Handling, 18.Validation Rules, 19.State Transitions,
-20.Async Processing, 21.Testing & Verification, 22.Transactions, 23.Event Flows,
-24.External Integrations, 25.Scheduled Jobs & Workers, 26.Risk Scorecard.
-
-Do NOT do any file reading. All data is already in task context.
-Write the report NOW.`;
-
-      const phase15Result = await AgentExecutor.execute(
-        provider,
-        systemPrompt,
-        phase15UserPrompt,
-        allPhase1Tools,
-        context,
-        PHASE1_MAX_TURNS,
-        resolvedModel,
-        'planner-agent-phase15'
-      );
-
-      if (phase15Result) {
-        onLog?.('✅ Phase 1_5 complete. Stage1_Analysis.md written.', 'success');
+    // Check file exists AND has meaningful content (> 500 bytes)
+    // A section file < 500 bytes means the agent wrote only the header and stopped.
+    const MIN_SECTION_BYTES = 500;
+    if (await fs.pathExists(sectionFile)) {
+      const stat = await fs.stat(sectionFile);
+      if (stat.size >= MIN_SECTION_BYTES) {
+        onLog?.(`[PlannerAgent] Section ${section.n} written: ${section.name} (${stat.size} bytes)`, 'success');
+        onSectionDone?.();
+        return;
       }
-    }
-
-    // ── Verify output was written ──────────────────────────────────────────
-    const outputFilePath = path.join(modernPath, PHASE1_OUTPUT_FILE);
-    if (!(await fs.pathExists(outputFilePath))) {
-      onLog?.(`⚠️ ${PHASE1_OUTPUT_FILE} was not written by the agent. Writing fallback...`, 'warning');
-      await fs.ensureDir(path.dirname(outputFilePath));
-      await fs.writeFile(
-        outputFilePath,
-        resultText || `# Stage 1 Analysis\n\nAgent did not produce structured output.`,
-        'utf-8'
+      // File exists but content is too thin — treat as failed and retry
+      onLog?.(
+        `[PlannerAgent] Section ${section.n} file is only ${stat.size} bytes (< ${MIN_SECTION_BYTES}). ` +
+        `Content too thin — retrying with explicit instruction.`,
+        'warning'
       );
+    } else {
+      onLog?.(`[PlannerAgent] Section ${section.n} file missing — retrying once.`, 'warning');
     }
 
-    // ── Mark phase complete in task context ───────────────────────────────
-    await TaskContextManager.updateContext(sessionId, { active_phase: 'phase1-complete' });
-    onLog?.(`✅ Phase 1 analysis complete. ${PHASE1_OUTPUT_FILE} written to output workspace.`, 'success');
+    // One retry with explicit reminder — covers both missing and thin files
+    await AgentExecutor.execute(
+      provider,
+      systemPrompt,
+      userPrompt +
+        `\n\nIMPORTANT: The output file was either NOT written or is nearly empty (< ${MIN_SECTION_BYTES} bytes). ` +
+        'You MUST write a COMPLETE section with full content. ' +
+        'Read the graph/data source again and write ALL entries found. Then call write_file to save.',
+      tools, context, undefined, resolvedModel, `section-${section.n}-retry`
+    );
 
-    return resultText;
+    if (await fs.pathExists(sectionFile)) {
+      const retryStat = await fs.stat(sectionFile);
+      if (retryStat.size >= MIN_SECTION_BYTES) {
+        onLog?.(`[PlannerAgent] Section ${section.n} written on retry (${retryStat.size} bytes).`, 'success');
+      } else {
+        onLog?.(`[PlannerAgent] ERROR: Section ${section.n} still thin (${retryStat.size} bytes) after retry — placeholder inserted.`, 'error');
+      }
+    } else {
+      onLog?.(`[PlannerAgent] ERROR: Section ${section.n} failed after retry — will appear as placeholder.`, 'error');
+    }
+    // Always mark section as attempted — keeps progress counter accurate
+    onSectionDone?.();
+  }
+
+  /**
+   * Removes all analysis:[file] keys from task context after Stage 2.
+   * These keys are 2-10 KB each and are no longer needed once their data
+   * has been merged into knowledge graphs (which are stored separately as JSON files).
+   * Removing them keeps Stage 3 and Stage 4 agent context windows small.
+   */
+  private static async cleanupAnalysisKeys(sessionId: string): Promise<void> {
+    const ctx         = await TaskContextManager.getContext(sessionId);
+    const analysisKeys = Object.keys(ctx).filter(k => k.startsWith('analysis:'));
+    if (analysisKeys.length === 0) return;
+
+    const deletions: Record<string, null> = {};
+    analysisKeys.forEach(k => { deletions[k] = null; });
+    try {
+      await TaskContextManager.updateContext(sessionId, deletions);
+    } catch {
+      // Non-fatal — context cleanup is a best-effort optimization
+    }
   }
 }
 
-// ── User Prompt Builder ───────────────────────────────────────────────────────
-// Builds the user task prompt for @FileAnalyzer sub-agent.
-//
-// Rules:
-//  - NO target stack mentioned. Pure legacy documentation only.
-//  - Discovery-first: workspace tools reveal what exists. No assumptions.
-//  - Language-agnostic: adapts to whatever language is found.
+// ── Backward-compat export ────────────────────────────────────────────────────
 
-function buildAnalyzerUserPrompt(legacyPath: string, detectedStack: DetectedStack): string {
-  return `Perform a complete static analysis of the legacy project at: "${legacyPath}"
-
-GOAL: Produce "${PHASE1_OUTPUT_FILE}" covering all 26 required sections.
-Do NOT suggest improvements, target technologies, or migration strategies.
-This is pure documentation of the legacy codebase exactly as it exists.
-
-Initial heuristic scan (treat as approximate — verify everything by reading manifests):
-  Language:        ${detectedStack.language}
-  Framework:       ${detectedStack.framework}
-  Database:        ${detectedStack.database}
-  Package Manager: ${detectedStack.packageManager}
-  File Count:      ${detectedStack.fileCount}
-
-Follow your system prompt workflow in order:
-
-STEP 1 — Resume check:
-  Call get_task_context. If resuming, start from LAST_FILE_ANALYZED.
-
-STEP 2 — Discover the workspace:
-  Call getWorkspaceDirectoryStructure (monorepo check).
-  Call getEnvironmentInfo (runtime versions).
-  Call getGitLog (HIGH_CHURN_FILES, DEAD_CODE_CANDIDATES).
-  Call findFilesByPattern for ALL manifest types to detect language profiles.
-  Call scanAssetFiles for asset inventory.
-  Save LANGUAGE_PROFILES under key "lang-profiles".
-
-STEP 3 — Build MANDATORY_FILE_INDEX:
-  Index every source file discovered. Type determined by content + location, not extension.
-  Save under key "file-index". Save FILE_INDEX_KEY and TOTAL_FILES inline.
-
-STEP 4 — Read and analyze EVERY file:
-  Follow the 4-tier reading strategy (SMALL/MEDIUM/LARGE/ULTRA_LARGE) per system prompt rules.
-  For each file — extract what it contains, adapted to the detected language:
-    callable units, data contracts, entry points, external dependencies,
-    business logic, configuration values, error types.
-  Save under key "analysis:[escaped_path]". Mark DONE in FILE_INDEX.
-  Use batch-read-files for groups of SMALL files. Checkpoint every 10 files.
-
-STEP 5 — Trace cross-module call flows:
-  Identify 5–10 critical use-cases. Trace the full execution path for each.
-  Save under key "call-flows".
-
-STEP 6 — Phase completion audit:
-  Verify DONE_COUNT === TOTAL_FILES before writing the report.
-  Go back and read any PENDING files if found.
-
-STEP 7 — Write "${PHASE1_OUTPUT_FILE}" via write_file:
-  All 26 sections must be present. Adapt content to what was actually found.
-  After each section: save SECTION_[N]_WRITTEN=true.
-  Sections: 1.Project Identity, 2.Architecture, 3.Source Structure, 4.File Classification,
-  5.Domain Models, 6.Dependencies, 7.Functions, 8.Function Behaviors, 9.Business Rules,
-  10.API Contracts, 11.Security, 12.Middleware, 13.Database Operations, 14.Call Flows,
-  15.Data Transformations, 16.Configuration, 17.Error Handling, 18.Validation Rules,
-  19.State Transitions, 20.Async Processing, 21.Testing, 22.Transactions, 23.Event Flows,
-  24.External Integrations, 25.Scheduled Jobs, 26.Risk Scorecard.
-
-STEP 8 — Section completion gate:
-  Verify all 26 SECTION_[N]_WRITTEN=true. Write any missing section.
-  Save ACTIVE_PHASE=complete, STAGE1_ANALYSIS_WRITTEN=true.`;
-}
-
-
+export { buildAnalysisUserPrompt as buildAnalyzerUserPrompt } from '../prompts/file-analysis-prompt.js';

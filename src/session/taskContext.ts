@@ -1,6 +1,7 @@
 import fs from 'fs-extra';
 import path from 'path';
 import { fileURLToPath } from 'url';
+import { writeJsonAtomic, readJsonWithRetry } from './fileUtils.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -20,7 +21,7 @@ export class TaskContextManager {
       return {};
     }
     try {
-      return await fs.readJson(contextPath);
+      return await readJsonWithRetry<Record<string, any>>(contextPath);
     } catch {
       return {};
     }
@@ -31,8 +32,7 @@ export class TaskContextManager {
    */
   static async saveContext(sessionId: string, context: Record<string, any>): Promise<void> {
     const contextPath = this.getContextPath(sessionId);
-    await fs.ensureDir(path.dirname(contextPath));
-    await fs.writeJson(contextPath, context, { spaces: 2 });
+    await writeJsonAtomic(contextPath, context);
   }
 
   /**

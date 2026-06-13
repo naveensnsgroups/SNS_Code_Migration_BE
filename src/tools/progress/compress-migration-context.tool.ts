@@ -39,7 +39,7 @@ export const compressMigrationContextTool: ToolRequest = {
     for (const key of archived) updates[key] = undefined;
 
     await TaskContextManager.updateContext(ctx!.sessionId, updates);
-    ctx!.onLog?.(`🗜️ [Context] Archived ${archived.length} large keys. Kept ${keptKeys.length} HOT keys.`, 'info');
+    ctx!.onLog?.(`[Context] Archived ${archived.length} large keys. Kept ${keptKeys.length} HOT keys.`, 'info');
     return makeToolTextResult(JSON.stringify({ archived, keptKeys, contextSizeReduced: archived.length > 0 }));
   }
 };

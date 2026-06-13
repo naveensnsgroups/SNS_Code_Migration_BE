@@ -49,12 +49,14 @@ export interface ClaudeProviderConfig {
 //   - Consecutive same-role messages are MERGED (Anthropic requires alternating roles)
 
 // Anthropic SDK v0.22 uses these type shapes — defined inline to avoid SDK version drift
-type AnthMessageParam = { role: 'user' | 'assistant'; content: string | AnthContentBlock[] };
-type AnthContentBlock = AnthTextBlock | AnthToolUseBlock | AnthToolResultBlock;
-type AnthTextBlock      = { type: 'text';        text: string };
-type AnthToolUseBlock   = { type: 'tool_use';    id: string; name: string; input: Record<string, unknown> };
-type AnthToolResultBlock= { type: 'tool_result'; tool_use_id: string; content: Array<{ type: 'text'; text: string }>; is_error?: boolean };
-type AnthTool           = { name: string; description: string; input_schema: { type: 'object'; properties: Record<string, unknown>; required?: string[] } };
+type CacheControl      = { type: 'ephemeral' };
+type AnthMessageParam  = { role: 'user' | 'assistant'; content: string | AnthContentBlock[] };
+type AnthContentBlock  = AnthTextBlock | AnthToolUseBlock | AnthToolResultBlock;
+type AnthTextBlock     = { type: 'text';        text: string;                                  cache_control?: CacheControl };
+type AnthToolUseBlock  = { type: 'tool_use';    id: string; name: string; input: Record<string, unknown> };
+type AnthToolResultBlock={ type: 'tool_result'; tool_use_id: string; content: Array<{ type: 'text'; text: string }>; is_error?: boolean; cache_control?: CacheControl };
+type AnthSystemBlock   = { type: 'text';        text: string;                                  cache_control?: CacheControl };
+type AnthTool          = { name: string; description: string; input_schema: { type: 'object'; properties: Record<string, unknown>; required?: string[] }; cache_control?: CacheControl };
 
 function transformToAnthropicMessages(messages: readonly LanguageModelMessage[]): {
   messages: AnthMessageParam[];
@@ -149,7 +151,7 @@ function extractTextFromToolResult(result: ToolCallResult): string {
 // ── Tool Declaration Conversion ───────────────────────────────────────────────
 
 function buildAnthropicTools(tools: ToolRequest[]): AnthTool[] {
-  return tools.map(t => ({
+  const result: AnthTool[] = tools.map(t => ({
     name: t.name,
     description: t.description,
     input_schema: {
@@ -158,6 +160,62 @@ function buildAnthropicTools(tools: ToolRequest[]): AnthTool[] {
       required: t.parameters?.required ?? [],
     },
   }));
+
+  // ── Prompt Caching: mark last tool as cache breakpoint ─────────────────
+  // Anthropic caches everything UP TO this breakpoint (tools are static per session).
+  // Cost on cached turns: ~10% of full tool schema cost.
+  if (result.length > 0) {
+    result[result.length - 1].cache_control = { type: 'ephemeral' };
+  }
+
+  return result;
+}
+
+// ── Message History Cache Breakpoints ────────────────────────────────────────────
+// As the agent loop accumulates tool_use → tool_result turns, the message
+// history grows. The stable part (older turns) can be cached so that each
+// new turn only pays for the new messages, not the full history.
+//
+// Strategy: mark the content of the penultimate user message (the last one
+// that is "settled" and won't change). This gives Anthropic a breakpoint
+// at which to cache the entire conversation up to that point.
+// Anthropic allows 4 breakpoints total:
+//   1 = system prompt (always marked)
+//   2 = last tool definition (marked in buildAnthropicTools)
+//   3-4 = conversation history (marked here in the 2 oldest stable user messages)
+
+function applyMessageCacheBreakpoints(messages: AnthMessageParam[]): AnthMessageParam[] {
+  // Only apply when conversation is long enough to benefit (>= 3 exchanges)
+  if (messages.length < 6) return messages;
+
+  // Find indices of all user messages
+  const userIndices = messages
+    .map((m, i) => (m.role === 'user' ? i : -1))
+    .filter(i => i >= 0);
+
+  // Cache the 2 oldest stable user messages (all except the very last, which is still being built)
+  const stableIndices = new Set(userIndices.slice(0, -1).slice(-2));
+  if (stableIndices.size === 0) return messages;
+
+  return messages.map((msg, i) => {
+    if (!stableIndices.has(i)) return msg;
+
+    const content = msg.content;
+    // Add cache_control to the last content block of this user message
+    if (typeof content === 'string') {
+      return {
+        ...msg,
+        content: [{ type: 'text' as const, text: content, cache_control: { type: 'ephemeral' } as CacheControl }],
+      };
+    }
+    if (Array.isArray(content) && content.length > 0) {
+      const newContent = [...content] as AnthContentBlock[];
+      const last = newContent[newContent.length - 1];
+      newContent[newContent.length - 1] = { ...last, cache_control: { type: 'ephemeral' } } as AnthContentBlock;
+      return { ...msg, content: newContent };
+    }
+    return msg;
+  });
 }
 
 // ── Retry Helpers ─────────────────────────────────────────────────────────────
@@ -214,7 +272,7 @@ export class ClaudeProvider implements StreamingProvider {
         }
 
         const msg = err instanceof Error ? err.message : String(err);
-        const logMsg = `⚠️ Claude API call failed (${msg}). Retrying attempt ${attempt}/${maxRetries} in ${delaySeconds}s...`;
+        const logMsg = `Claude API call failed (${msg}). Retrying attempt ${attempt}/${maxRetries} in ${delaySeconds}s...`;
 
         if (toolCtx?.onLog) {
           toolCtx.onLog(logMsg, 'warning');
@@ -270,6 +328,19 @@ export class ClaudeProvider implements StreamingProvider {
     userRequest: UserRequest,
     toolCtx: ToolContext | undefined
   ): AsyncIterable<LanguageModelStreamPart> {
+    // ── Build cached system prompt (array format with cache_control) ────────────
+    // Anthropic caches the system prompt for 5 minutes.
+    // Cost on cached turns: ~10% of full system prompt token cost.
+    // The system prompt must be >= 1024 tokens to qualify (our prompts are 300-800 lines,
+    // well above threshold).
+    const systemBlocks: AnthSystemBlock[] | undefined = systemPrompt
+      ? [{ type: 'text', text: systemPrompt, cache_control: { type: 'ephemeral' } }]
+      : undefined;
+
+    // ── Apply message history cache breakpoints ───────────────────────────────
+    // Marks stable older user messages so Anthropic caches the conversation history.
+    const cachedMessages = applyMessageCacheBreakpoints(messages);
+
     // ── Create streaming request (with retry) ─────────────────────────────
     // messages.stream() returns a MessageStream directly (not a Promise<MessageStream>)
     // withRetry wraps it in a try/catch for retry on failure
@@ -277,8 +348,8 @@ export class ClaudeProvider implements StreamingProvider {
       async () => this.client.messages.stream({
         model: this.modelName,
         max_tokens: this.config.maxTokens,
-        system: systemPrompt,
-        messages: messages as any,
+        system: systemBlocks as any,   // array with cache_control (Anthropic SDK accepts both string and array)
+        messages: cachedMessages as any,
         tools: anthropicTools as any,
         tool_choice: anthropicTools ? { type: 'auto' } : undefined,
       } as any),
