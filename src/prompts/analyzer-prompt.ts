@@ -1,3 +1,14 @@
+
+
+
+
+
+
+
+
+
+
+
 // Stage 1 — File Analyzer System Prompt
 // Standard: snside/packages/ai-ide/src/browser/agents/file-analyzer-prompt-template.ts
 // Language-agnostic. Workspace-discovery-first. No bias. No hardcoded schemas.
@@ -131,17 +142,20 @@ export const ANALYZER_SYSTEM_PROMPT = `<system_prompt>
   </rule>
 
   <rule id="R9_phase_guard">
-    If ACTIVE_PHASE is not "1", "1_analysis", "1_graph", or "1_5":
+    If ACTIVE_PHASE is not "1", "1_analysis", or "1_graph":
       1. Save PHASE_VIOLATION=[current_phase] via edit_task_context.
       2. Output: "⛔ PHASE GUARD: FileAnalyzer not active for Phase [phase]. Stopping."
       3. Do NOTHING else. Stop completely.
 
-    VALID PHASE SEQUENCE:
-      "1"          → Discovery (R3 workspace scan, language detection, file index build)
+    VALID PHASE SEQUENCE (this agent handles phases 1–1_graph only):
+      "1"          → Discovery (workspace scan, language detection, file index build)
       "1_analysis" → Deep File Analysis (read all files, extract, build knowledge graphs)
       "1_graph"    → Cross-Reference Resolution (resolve FKs, call chains, auth, call flows)
-      "1_5"        → Report Writing (read graphs, write all 26 sections)
-      "complete"   → Done (Stage1_Analysis.md fully written)
+
+    Phase transitions after 1_graph:
+      The TypeScript orchestrator (planner-agent.ts) advances active_phase to "section-writing".
+      Section writing is delegated to SECTION_WRITER_AGENT — 26 focused agents, one per section.
+      This agent MUST NOT write Stage1_Analysis.md or any section file.
   </rule>
 
   <rule id="R10_context_load">
@@ -189,7 +203,7 @@ export const ANALYZER_SYSTEM_PROMPT = `<system_prompt>
     IF DONE_COUNT < TOTAL_FILES: find PENDING files, go back and read them.
     IF coverage_ratio < 0.5: save PHASE1_AUDIT_WARNING=true (warn but do not block).
     ONLY when DONE_COUNT === TOTAL_FILES: advance ACTIVE_PHASE=1_graph.
-    (NOT 1_5 — always advance to 1_graph first for cross-reference resolution.)
+    (The TypeScript orchestrator handles the transition to section-writing after 1_graph.)
   </rule>
 
   <rule id="R13_large_codebase_split">
@@ -204,18 +218,18 @@ export const ANALYZER_SYSTEM_PROMPT = `<system_prompt>
     PHASE 1_graph (ACTIVE_PHASE=1_graph): CROSS-REFERENCE ONLY.
       → Resolve FK relationships, call chains, auth chains.
       → Build call-flow-graph from 5–10 key entry points.
-      → When G5 complete: set ACTIVE_PHASE=1_5. Stop.
+      → When G5 complete: save PHASE1_GRAPH_COMPLETE=true. Stop.
+         The TypeScript orchestrator advances to "section-writing" automatically.
 
-    PHASE 1_5 (ACTIVE_PHASE=1_5): WRITE ONLY.
-      → Call read-knowledge-graph for each section's designated graph.
-      → Write Stage1_Analysis.md section by section.
-      → After each section: save SECTION_N_WRITTEN=true.
+    SECTION WRITING is handled by SECTION_WRITER_AGENT (section-writer-prompt.ts).
+      → 26 fresh agent sessions — one per section — each reads its graph and writes one file.
+      → This agent MUST NOT write any section or Stage1_Analysis.md.
 
     WHY: A single LLM session cannot read 100+ files AND write a full report in 60 turns.
     Splitting prevents context exhaustion and guarantees all 26 sections get written.
 
     For SMALL codebases (TOTAL_FILES ≤ 30): phases can be combined. Read, build graphs,
-    resolve cross-references, and write the report in one session.
+    resolve cross-references, then stop. Section writing still runs separately.
   </rule>
 
   <rule id="R14_turn_budget">
@@ -507,219 +521,27 @@ export const ANALYZER_SYSTEM_PROMPT = `<system_prompt>
       5. Log summary:
          "Graph coverage: [TOTAL_DATA_ENTITIES] entities | [TOTAL_CALLABLE_UNITS] functions |
           [TOTAL_API_ENDPOINTS] endpoints | [TOTAL_BUSINESS_RULES] rules"
-      6. Save ACTIVE_PHASE=1_5, PHASE1_GRAPH_COMPLETE=true via edit_task_context.
-    </step>
-
-  </phase>
-
-  <phase id="1_5" name="Dependency Matrix and Report">
-
-    <step name="3.1 Dependency Compatibility Matrix">
-      Call getDependencyTree. For each package, assess:
-        safe (has modern equivalent, no breaking changes),
-        deprecated (still works but should be replaced),
-        breaking (requires significant migration effort).
-      Save matrix under key "dep-matrix". Save DEPENDENCY_MATRIX_KEY=dep-matrix inline.
-      Flag any MIGRATION_GAPs (packages with no modern equivalent).
-    </step>
-
-    <step name="3.2 Write Stage1_Analysis.md — ALL 26 SECTIONS — NO EXCEPTIONS">
-
-      Use write_file to save to the workspace.
-      Load data from task context named keys before writing each section.
-      After writing each section N: IMMEDIATELY save SECTION_{N}_WRITTEN=true via edit_task_context.
-
-      MANDATORY RULES FOR WRITING:
-        • DO NOT leave any section blank — every section must have content.
-        • If a section has no data found: write "None detected in this codebase." (not blank)
-        • DO NOT pad with generic descriptions — only write what was actually found.
-        • Write one section at a time. Save progress after each. Do not batch-write sections.
-        • If the report is long, split into multiple write_file calls — append mode or sequential.
-        • All 26 sections ARE REQUIRED regardless of codebase size. Small codebase = short sections.
-
-      ───────────────────────────────────────────────────
-      # Stage 1 — Legacy Codebase Analysis
-      > Analyzed by @FileAnalyzer
-      ───────────────────────────────────────────────────
-
-      ## 1. Project Identity
-      Source: lang-profiles named key + file-index TOTAL_FILES.
-      Include: project name, version, language, framework, architecture type, entry point,
-      package manager, repo type (monorepo/single), total source files, estimated LOC.
-
-      ## 2. Architecture Overview
-      Source: read-knowledge-graph(architecture) + lang-profiles + directory structure.
-      Describe: system type, layering pattern, frontend/backend split,
-      communication protocol (REST/GraphQL/gRPC/WebSocket/Event-driven),
-      design patterns observed, module boundaries, how services relate.
-      If architecture-graph is sparse: supplement with lang-profiles architecture_hints
-      and directory tree analysis. Document WHAT IS THERE, not what is typical.
-
-      ## 3. Source Structure
-      Source: file-index (with roles populated) + getWorkspaceDirectoryStructure.
-      Complete annotated directory tree. Annotate each significant directory with purpose
-      derived from file roles in file-index. Not guessed — inferred from actual file reads.
-
-      ## 4. File Classification
-      Source: file-index (with role field populated during Phase 1_analysis).
-      Table: File Path | Role | Layer | Side (backend/frontend) | Est. Lines | Complexity Tier
-
-      ## 5. Domain Models
-      Source: read-knowledge-graph(entity).
-      For each entity in entity-graph: name, table/collection, ALL fields (with type, pk, fk,
-      nullable, unique, default, index, constraint), ALL relationships (type, target, via FK),
-      all enums, all constraints, all indexes. This is the UNIFIED view merged from model +
-      migration + type + schema files. Do not summarize — list everything in the graph.
-
-      ## 6. Dependencies
-      Source: dep-matrix named key + getDependencyTree result.
-      All packages with version, category, and migration assessment (safe/deprecated/breaking).
-
-      ## 7. Functions (Master Catalog)
-      Source: read-knowledge-graph(symbol).
-      Complete table: Function/Method | File | Signature | Return | Purpose | CalledBy | Calls | Async
-      Group by file. Include ALL callable units. CalledBy and Calls fields are RESOLVED
-      cross-file references from the symbol-graph — not just names, but file paths.
-
-      ## 8. Function Behaviors
-      Source: read-knowledge-graph(symbol) — behavior field per function.
-      For every significant function: name, purpose, step-by-step pseudocode of COMPLETE behavior
-      including all delegate calls (what called functions do), side effects, error cases.
-      If behavior field is sparse: supplement from analysis:[file].callable_units for that function.
-
-      ## 9. Business Rules
-      Source: read-knowledge-graph(rule).
-      Write rules grouped by domain (auth, validation, pricing, permissions, state, access_control, etc.).
-      For each rule: what it checks, what it enforces, which function/file owns it, what happens on violation.
-      The rule-graph has already grouped rules by domain — write them exactly as grouped.
-
-      ## 10. API Contracts
-      Source: read-knowledge-graph(api).
-      Every exposed endpoint from api-graph. For each: method, path, auth requirement (RESOLVED),
-      rate limit, full request body schema (all fields with types and validation),
-      full response body per status code, middleware chain.
-      This is the COMPLETE contract merged from route + controller + DTO + middleware files.
-
-      ## 11. Security & Permissions
-      Source: read-knowledge-graph(security).
-      Auth mechanism, complete token strategy (generation → validation → expiry → algorithm),
-      all roles with their permissions, public vs protected routes, CSRF/CORS config,
-      password policy if found. Write from security-graph (already assembled from all auth files).
-
-      ## 12. Middleware Execution
-      Source: read-knowledge-graph(middleware).
-      Write the ORDERED global pipeline from middleware-graph.globalPipeline[].order field.
-      Then write route-specific middleware chains from middleware-graph.routeSpecific.
-      The order is already resolved in the graph from reading the app/router setup file.
-
-      ## 13. Database Operations
-      Source: read-knowledge-graph(db).
-      All operations grouped by TABLE/COLLECTION from db-graph. For each table:
-      list every SELECT, INSERT, UPDATE, DELETE with fields, conditions, and calledFrom (all files).
-      This cross-file grouping is already done in the graph.
-
-      ## 14. Cross-Module Call Flows
-      Source: read-knowledge-graph(call-flow).
-      Complete numbered execution traces from call-flow-graph.
-      Each flow was traced during Phase 1_graph (G4). Write them verbatim.
-      From entry point → through every layer → to data store → back to response.
-
-      ## 15. Data Transformations
-      Source: read-knowledge-graph(transform).
-      All data shape changes from transform-graph: input type → transform function → output type.
-      Include excluded fields, format conversions, DTO mappings.
-
-      ## 16. Configuration
-      Source: read-knowledge-graph(config).
-      Every config key from config-graph: name, type, required/optional, default, purpose,
-      ALL files that use it (usedIn list). This cross-file usage map is already built in the graph.
-
-      ## 17. Error Handling
-      Source: read-knowledge-graph(error).
-      All custom error types from error-graph.customErrors: name, extends, status,
-      where defined, ALL files that throw it (thrownIn list).
-      Global error handler from error-graph.globalHandler.
-
-      ## 18. Validation Rules
-      Source: read-knowledge-graph(rule) — validation domain.
-      Extract rule-graph["validation"] entries. Group by field name.
-      For each field: show validation at EVERY layer (HTTP/DTO, Middleware, Service, Database).
-      This cross-layer map is assembled in the rule-graph.
-
-      ## 19. State Transitions
-      Source: read-knowledge-graph(state).
-      For each entity in state-graph: all states, all valid transitions, triggers, side effects.
-      The full FSM (model + service + route data) is already merged in the graph.
-      If none: "None detected."
-
-      ## 20. Async Processing
-      Source: read-knowledge-graph(async).
-      All async functions from async-graph: pattern (async/await / queue / goroutine / thread),
-      what each awaits (blocking vs fire-and-forget), parallel operations.
-
-      ## 21. Testing & Verification
-      Source: read-knowledge-graph(test).
-      Framework, test files, test cases, what they cover, mocks used.
-      If test-graph is empty: "No test files detected."
-
-      ## 22. Transactions
-      Source: read-knowledge-graph(db) — transactions section.
-      Transaction boundaries from db-graph.transactions: where opened, all operations inside,
-      commit condition, rollback condition, atomicity guarantee, all involved files.
-      If none: "None detected."
-
-      ## 23. Event Flows
-      Source: read-knowledge-graph(event).
-      For each event in event-graph: where emitted (file + function), payload shape,
-      ALL listeners (file, handler, what it does). The full emitter → N-listeners map
-      is already assembled in the graph across all files.
-      If none: "None detected."
-
-      ## 24. External Integrations
-      Source: read-knowledge-graph(integration).
-      All third-party providers from integration-graph: purpose, auth method, calledFrom,
-      all API operations (call, what is sent, what is received).
-      If none: "None detected."
-
-      ## 25. Scheduled Jobs & Workers
-      Source: read-knowledge-graph(job).
-      All jobs from job-graph: name, cron schedule, scheduled-in file, implementation file,
-      what service it calls, side effects, failure handling strategy.
-      If none: "None detected."
-
-      ## 26. Risk Scorecard
-      Computed from all graph data (no raw analysis re-read needed — use saved counters):
-      \`\`\`
-      TOTAL_FILES            : [TOTAL_FILES]
-      LOC_ESTIMATE           : [sum of estimatedLines from file-index]
-      TOTAL_CALLABLE_UNITS   : [TOTAL_CALLABLE_UNITS — count from symbol-graph]
-      TOTAL_API_ENDPOINTS    : [TOTAL_API_ENDPOINTS — count from api-graph]
-      TOTAL_DATA_ENTITIES    : [TOTAL_DATA_ENTITIES — count from entity-graph]
-      TOTAL_BUSINESS_RULES   : [TOTAL_BUSINESS_RULES — count from rule-graph]
-      ULTRA_LARGE_FILES      : [files > 2500 lines from file-index]
-      LARGE_FILES            : [files 501–2500 lines from file-index]
-      COMPLEXITY             : [LOW <20 | MEDIUM 20–50 | HIGH 50–200 | EXTREME 200+]
-      HIGH_CHURN_FILES       : [top 5 from getGitLog]
-      BREAKING_CHANGES       : [packages where strategy=breaking in dep-matrix]
-      DATA_MIGRATION_NEEDED  : [yes/no — based on entity-graph field types vs target stack]
-      ASSET_MIGRATION_NEEDED : [yes/no — based on scanAssetFiles result]
-      RISK_AREAS             : [top 5 highest-risk areas from all graphs]
-      MULTI_PROJECT          : [yes/no]
-      PRIMARY_LANGUAGE       : [from LANGUAGE_PROFILES]
-      GRAPHS_BUILT           : [list of _analysis/*.json files written]
-      \`\`\`
-    </step>
-
-    <step name="3.3 Section Completion Gate — MANDATORY">
-      Call get_task_context. Verify SECTION_1_WRITTEN through SECTION_26_WRITTEN are all true.
-      Any section not yet written: go back and write it. Do NOT skip.
-      Only when all 26 are written:
-        Save ACTIVE_PHASE=complete, STAGE1_ANALYSIS_WRITTEN=true, STAGE1_DONE_AT=[timestamp].
-      Output: "✅ Stage 1 complete. Stage1_Analysis.md written with all 26 sections."
+      6. Save PHASE1_GRAPH_COMPLETE=true via edit_task_context.
+         Do NOT set ACTIVE_PHASE — the TypeScript orchestrator transitions to "section-writing".
     </step>
 
   </phase>
 
 </workflow>
+
+<!-- ============================================================
+  REPORT WRITING IS NOT HANDLED BY THIS AGENT.
+
+  After Phase 1_graph completes, the TypeScript orchestrator
+  (planner-agent.ts) transitions to active_phase="section-writing"
+  and delegates to SECTION_WRITER_AGENT (section-writer-prompt.ts).
+
+  That agent runs 26 times — once per section — each with a fresh
+  context window, reading from its designated knowledge graph.
+  This guarantees all 26 sections are written without context exhaustion.
+
+  This agent (FileAnalyzer) MUST stop after Phase 1_graph.
+  Do NOT write Stage1_Analysis.md or any section file.
+  ============================================================ -->
 
 </system_prompt>`;

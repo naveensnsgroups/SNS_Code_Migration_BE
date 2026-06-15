@@ -29,9 +29,12 @@ export const appendToKnowledgeGraphTool: ToolRequest = {
     'security, transform, error, async, test, integration, job, call-flow, architecture. ' +
     'Data is merged intelligently: entity/symbol/api/db/event graphs merge by key name; ' +
     'rule/transform/test graphs append arrays; security/architecture/middleware/error graphs deep-merge. ' +
-    'MANDATORY after each file read — do NOT skip this step. ' +
-    'IMPORTANT: data:{} (empty object) is REJECTED — you must extract real content from the file first. ' +
-    'Only call this tool when you have actual data to add (functions, DB ops, routes, config keys, etc.).',
+    'CRITICAL RULES: ' +
+    '(1) sourceFile is REQUIRED — always pass the exact file path you just read. ' +
+    '(2) Each sourceFile+graphName combination can only be written ONCE — duplicate calls are rejected automatically. ' +
+    '(3) data:{} (empty object) is REJECTED — you must extract real content from the file first. ' +
+    '(4) After finishing ALL graphs for a file, call edit-task-context to mark it DONE — do NOT call append-to-knowledge-graph again for that file. ' +
+    '(5) If a file genuinely has no data for a graph type, simply skip that graph — do not call this tool with empty data.',
   parameters: {
     type: 'object',
     properties: {
@@ -67,10 +70,12 @@ export const appendToKnowledgeGraphTool: ToolRequest = {
       },
       sourceFile: {
         type: 'string',
-        description: 'The file path that produced this data. Used for audit tracing. Optional but recommended.'
+        description: 'REQUIRED. The exact file path that was just read and produced this data (e.g. "src/models/user.ts"). ' +
+          'Used for deduplication — each sourceFile+graphName pair can only be written once per session. ' +
+          'Always pass this so duplicate calls are automatically detected and rejected.'
       }
     },
-    required: ['graphName', 'data']
+    required: ['graphName', 'data', 'sourceFile']
   },
 
   handler: async (arg_string: string, ctx?: ToolContext) => {
@@ -88,6 +93,18 @@ export const appendToKnowledgeGraphTool: ToolRequest = {
       );
     }
 
+    // ── Require sourceFile (enables deduplication guard) ──────────────────────
+    // Without sourceFile the _sources dedup cannot fire, leading to the LLM
+    // calling append-to-knowledge-graph in an infinite loop. Hard-reject here.
+    if (!args.sourceFile || args.sourceFile.trim() === '') {
+      return makeToolErrorResult(
+        `MISSING sourceFile for graph "${args.graphName}". ` +
+        `You must always pass sourceFile with the exact path of the file you just read. ` +
+        `Example: sourceFile: "src/models/user.ts". ` +
+        `This field is required to prevent duplicate writes.`
+      );
+    }
+
     // ── Reject empty data ──────────────────────────────────────────────────────
     // The LLM sometimes calls this tool with data:{} to "check off" the step
     // without doing the actual extraction work. This causes all graphs to stay
@@ -96,12 +113,13 @@ export const appendToKnowledgeGraphTool: ToolRequest = {
     const topLevelKeys = Object.keys(args.data ?? {});
     if (topLevelKeys.length === 0) {
       return makeToolErrorResult(
-        `EMPTY DATA REJECTED for graph "${args.graphName}". ` +
-        `You called append-to-knowledge-graph with data:{} — this saves nothing and is not allowed. ` +
-        `You must first READ the file content, EXTRACT the relevant data, and BUILD the correct schema. ` +
-        `See the <graph_shapes> section in your system prompt for the required structure for "${args.graphName}". ` +
-        `If this file genuinely has NO data for the "${args.graphName}" graph, simply DO NOT call this tool for that graph. ` +
-        `Only call this tool when you have real data to contribute.`
+        `EMPTY DATA REJECTED for graph "${args.graphName}" (sourceFile: "${args.sourceFile}"). ` +
+        `You called append-to-knowledge-graph with data:{} — this saves nothing. ` +
+        `You have TWO options: ` +
+        `(A) If this file HAS data for "${args.graphName}": READ the file content first, EXTRACT the data, BUILD the correct schema, then call this tool again with real data. ` +
+        `(B) If this file genuinely has NO data for "${args.graphName}": DO NOT call this tool at all. Simply SKIP this graph and move to the next graph type. ` +
+        `When ALL graphs for this file are done (or skipped), call edit-task-context with { "${args.sourceFile?.replace(/[^a-zA-Z0-9]/g, '_')}": "DONE" } to mark the file complete. ` +
+        `See the graph_shapes section in your system prompt for the required schema for "${args.graphName}".`
       );
     }
 
@@ -119,13 +137,37 @@ export const appendToKnowledgeGraphTool: ToolRequest = {
       existing = {}; // If file is corrupt, start fresh
     }
 
+    // ── _sources Deduplication (GraphRAG idempotent pattern) ─────────────────
+    // Track which source files have already contributed to this graph.
+    // If this file already contributed: return early — no duplicate merge.
+    // This prevents resume passes from writing the same symbols/entities twice.
+    const sources: string[] = Array.isArray(existing._sources) ? existing._sources : [];
+
+    if (args.sourceFile && sources.includes(args.sourceFile)) {
+      const existingCount = Object.keys(existing).filter(k => k !== '_sources').length;
+      const skipMsg =
+        `DUPLICATE WRITE BLOCKED: "${args.sourceFile}" has already contributed to the "${args.graphName}" graph. ` +
+        `This call was rejected — no data was written. ` +
+        `ACTION REQUIRED: Do NOT call append-to-knowledge-graph again for this file+graph combination. ` +
+        `Move on to the NEXT graph type for this file, or if all graphs are done, ` +
+        `call edit-task-context to mark this file DONE (read_status="DONE") immediately.`;
+      ctx?.onLog?.(`[KnowledgeGraph] ${skipMsg}`, 'info');
+      return makeToolErrorResult(skipMsg);
+    }
+
     // Merge incoming data using the correct strategy for this graph type
     const merged = mergeGraphData(args.graphName, existing, args.data);
+
+    // Record source contribution so future resume passes can skip it
+    if (args.sourceFile) {
+      merged._sources = [...sources, args.sourceFile];
+    }
 
     // Write merged result back
     await writeJsonAtomic(graphPath, merged);
 
-    const entryCount = Object.keys(merged).length;
+    // Exclude _sources metadata key from entry count (it is internal tracking, not domain data)
+    const entryCount = Object.keys(merged).filter(k => k !== '_sources').length;
     const message = `Graph "${args.graphName}" updated: ${entryCount} top-level entries.`
       + (args.sourceFile ? ` (source: ${args.sourceFile})` : '');
 

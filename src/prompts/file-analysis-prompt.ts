@@ -31,6 +31,22 @@ Shell file-read commands will always produce "system cannot find the file specif
 The getFileContent and batch-read-files tools automatically use the correct workspace path.
 </critical_rule>
 
+<critical_rule id="NO_DIRECTORY_BROWSING">
+NEVER call getWorkspaceFileList or getWorkspaceDirectoryStructure during file analysis.
+
+FORBIDDEN — these cause repeated loops and waste your rate limit quota:
+  ✗ getWorkspaceFileList({ path: "src/components" })
+  ✗ getWorkspaceDirectoryStructure({ ... })
+
+REASON: The complete list of ALL project files is already in FILE_INDEX (loaded from task context).
+Directory browsing re-discovers what you already know and triggers 429 rate limits.
+
+REQUIRED — to find any file:
+  ✓ Search FILE_INDEX by filename or partial path match (it contains every file path)
+  ✓ If not in FILE_INDEX: use searchInWorkspace({ query: "filename" }) — ONE call only
+  ✗ NEVER use getWorkspaceFileList to locate files
+</critical_rule>
+
 <reading_strategy>
 STEP ZERO — before reading ANY file: call extractFileSymbols(path).
 The result gives you: lineCount, readingStrategy field ("SMALL"/"MEDIUM"/"LARGE"/"ULTRA_LARGE"), and symbols[].
@@ -252,8 +268,11 @@ d. Extract what this file CONTAINS. Adapt to the file's language and role:
          Include: { calledFrom: file, requestShape: {}, responseShape: {} }
          This documents which frontend components call which backend endpoints.
 
-e. Save extracted data under key "analysis:[escaped_path]" via edit_task_context.
-   Escaping: replace "/" and "\" with "_", replace "." with "_".
+e. [Analysis data goes to knowledge graphs ONLY — NOT to task context]
+   Do NOT call edit_task_context with analysis data, symbol dumps, or extracted JSON.
+   All extracted data is written in step h via append-to-knowledge-graph.
+   Writing analysis:* keys to task context DOUBLES the data and FILLS context — this is FORBIDDEN.
+   Task context stores ONLY: FILE_INDEX (under named key), LAST_FILE_ANALYZED, CHUNK_PROGRESS flags.
 
 f. Update this file's entry in FILE_INDEX — MANDATORY:
    Set read_status = "DONE"
@@ -466,23 +485,81 @@ architecture-graph:
 </graph_shapes>
 
 <related_files_rule>
-Never analyze a file in isolation when it imports from other project files.
+When reading a file that imports from other local project modules:
 
-When reading a file that imports other modules:
-  1. Note the names of imported local modules.
-  2. Find the source file using findFilesByPattern or searchInWorkspace.
-  3. If the imported file is SMALL or MEDIUM and still PENDING — add it to the current batch.
+STEP 1 — Search FILE_INDEX FIRST (no tool call needed):
+  The FILE_INDEX you loaded at context_loading time contains every project file path.
+  Scan it mentally for the imported filename or partial path.
+  Example: import from "../components/Header" → find "Header.jsx" or "Header.tsx" in FILE_INDEX.
 
-Follow call chains: if a function calls another function in a different file, read that file next.
-Exception: external packages (node_modules, vendor, site-packages, go module cache) — never read.
+STEP 2 — Only if NOT found in FILE_INDEX:
+  Use searchInWorkspace({ query: "Header.jsx" }) — ONE call, targeted query.
+  Do NOT call getWorkspaceFileList. Do NOT browse directories.
+
+STEP 3 — If the imported file is PENDING in FILE_INDEX:
+  Add it to the current batch (for SMALL files) or queue it as the next file to read.
+
+STEP 4 — Follow call chains for direct dependencies only:
+  If function A calls function B in a different file, read that file.
+  Stop after 1 level of call chain — do not recursively follow all imports.
+  Exception: external packages (node_modules, vendor, site-packages) — never read.
+
+IMPORTANT: If an imported file is NOT in FILE_INDEX and searchInWorkspace finds nothing,
+  skip it — it is likely a node_modules package. Never call getWorkspaceFileList to look for it.
 </related_files_rule>
 
 <context_loading>
-At the start of your session: call get_task_context.
-Read only these keys: LAST_FILE_ANALYZED, FILE_INDEX_KEY, TOTAL_FILES.
-Load the file-index by its key name to find which files are PENDING.
-Do not load any analysis:[file] keys — that data is already in the knowledge graphs.
+TWO-LAYER CONTEXT LOAD — MANDATORY (SNS IDE pattern):
+
+HOT load (always, on EVERY session start — one get_task_context call):
+  Load ONLY these small pointer/flag values:
+    LAST_FILE_ANALYZED    ← resume pointer (which file to start from)
+    FILE_INDEX_KEY        ← the KEY NAME under which FILE_INDEX is stored (not the data)
+    TOTAL_FILES           ← total file count
+    CONTEXT_SIZE_WARNING  ← if true, load HOT keys only and skip all optional keys
+  Any CHUNK_PROGRESS:[file] keys present ← load these too (partial-file resume state)
+
+COLD load (on demand — do NOT load at session start):
+  FILE_INDEX data: call get_task_context with key=FILE_INDEX_KEY ONLY when you need
+    the actual file list to find the next PENDING file.
+    Do this ONCE at the start of your file-processing loop, not on every retry.
+
+NEVER load these at any point:
+  analysis:[file] keys — that data is already saved in the knowledge graphs
+  Any value that is a large JSON object (symbol dumps, full analysis objects)
+  Any key not listed above unless specifically needed for CHUNK_PROGRESS resume
+
+WHY: Loading large objects inline on every 429 retry wastes tokens and accelerates
+context compaction, causing the agent to lose progress and re-explore directories.
 </context_loading>
+
+<context_budget_rule>
+CONTEXT WINDOW PROTECTION — MANDATORY (SNS IDE pattern):
+
+1. NAMED KEYS for all large data:
+   FILE_INDEX is stored under its key name (FILE_INDEX_KEY), not inline.
+   CHUNK_PROGRESS:[escaped_path] = last symbol name, stored as a small string.
+   NEVER store large JSON inline in task context.
+
+2. CHECKPOINT after EVERY file:
+   After step h completes: call edit_task_context({ LAST_FILE_ANALYZED: "[path]" }).
+   This is the single most important resume pointer.
+   Without it, a 429 retry or context compaction loses all progress.
+
+3. CONTEXT SIZE GUARD:
+   If you observe task context growing (many CHUNK_PROGRESS keys, large inline values):
+     a. Call edit_task_context({ CONTEXT_SIZE_WARNING: true }).
+     b. Stop writing any large values inline immediately.
+     c. Continue processing the current file normally — do not restart.
+   If CONTEXT_SIZE_WARNING=true when you load HOT context:
+     → Load HOT keys only. Skip all COLD/optional loads.
+     → Continue from LAST_FILE_ANALYZED.
+
+4. NO DOUBLE-WRITE rule:
+   Knowledge graphs (append-to-knowledge-graph) ARE the analysis data store.
+   Task context stores ONLY control state: progress pointers, flags, FILE_INDEX.
+   Never save the same extracted data to both task context AND a knowledge graph.
+</context_budget_rule>
 
 <stop_conditions>
 Stop when:
@@ -494,6 +571,8 @@ Never:
   - Write Stage1_Analysis.md
   - Attempt cross-reference resolution (that is Stage 3)
   - Set ACTIVE_PHASE (the orchestrator controls phase transitions)
+  - Write analysis:* keys to task context (knowledge graphs are the data store)
+  - Load large JSON values inline at session start (HOT load only)
 </stop_conditions>
 `;
 

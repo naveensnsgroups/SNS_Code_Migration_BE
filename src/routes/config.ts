@@ -12,7 +12,7 @@
 import { Router, Request, Response, NextFunction } from 'express';
 import fs from 'fs-extra';
 import path from 'path';
-import { ALL_AGENT_DEFINITIONS } from '../agents/agent-definitions.js';
+import { ALL_AGENT_DEFINITIONS } from '../agents/core/agent-definitions.js';
 import { toolRegistry } from '../core/tool-invocation-registry.js';
 
 const router = Router();
@@ -113,6 +113,30 @@ router.get('/skill-content', async (req: Request, res: Response, next: NextFunct
     }
     const content = await fs.readFile(skillFile, 'utf-8');
     return res.json({ id: skillId, content, timestamp: new Date().toISOString() });
+  } catch (err) { next(err); }
+});
+
+// ── GET /api/config/sessions ──────────────────────────────────────────────────
+// Returns summary of all sessions for FE session restore on page refresh.
+import { SessionManager } from '../session/sessionManager.js';
+
+router.get('/sessions', async (_req: Request, res: Response, next: NextFunction) => {
+  try {
+    const sessions = await SessionManager.listSessions();
+    const summary = sessions
+      .sort((a, b) => (b.startedAt ?? '').localeCompare(a.startedAt ?? ''))
+      .slice(0, 20) // cap at 20 most recent
+      .map(s => ({
+        sessionId:  s.sessionId,
+        status:     s.status,
+        startedAt:  s.startedAt,
+        detectedStack: s.detectedStack ? {
+          language:  s.detectedStack.language,
+          framework: s.detectedStack.framework,
+          fileCount: s.detectedStack.fileCount,
+        } : undefined,
+      }));
+    res.json({ sessions: summary });
   } catch (err) { next(err); }
 });
 

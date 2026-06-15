@@ -1,7 +1,9 @@
 import { Router, Request, Response, NextFunction } from 'express';
 import { SessionManager } from '../session/sessionManager.js';
-import { MigrationOrchestrator } from '../agents/migrationOrchestrator.js';
+import { MigrationOrchestrator } from '../agents/core/migrationOrchestrator.js';
 import { MigrateStartRequest } from '../types.js';
+import { FileWatcherService } from '../services/fileWatcherService.js';
+import fs from 'fs-extra';
 import path from 'path';
 import { fileURLToPath } from 'url';
 
@@ -60,6 +62,19 @@ router.post('/start', async (req: Request, res: Response, next: NextFunction) =>
       });
     }
 
+    // Resolve final modernPath (may have been updated above by localOutputPath override)
+    const updatedSession = await SessionManager.getSession(sessionId);
+    const resolvedModernPath = updatedSession?.modernPath ?? session.modernPath;
+
+    // Ensure output directory exists before watching
+    // (agent may not have created it yet — watcher will catch new files once they appear)
+    await fs.ensureDir(resolvedModernPath);
+
+    // ── Start disk watcher (SNS IDE: ParcelFileSystemWatcherService.watch()) ──
+    // Non-blocking: watcher runs in background, emits SSE 'file_tree_changed' on any
+    // file CREATED/UPDATED/DELETED inside modernPath.
+    FileWatcherService.startWatching(sessionId, resolvedModernPath);
+
     // Launch background worker without blocking the HTTP response
     MigrationOrchestrator.startMigration(sessionId, targetStack, apiKey, apiKeys, agentsConfig);
 
@@ -84,6 +99,10 @@ router.post('/stop', async (req: Request, res: Response, next: NextFunction) => 
     }
 
     MigrationOrchestrator.stopSession(sessionId);
+
+    // ── Stop disk watcher (SNS IDE: Disposable.dispose()) ──────────────────
+    FileWatcherService.stopWatching(sessionId);
+
     res.json({ success: true, message: 'Migration stopping requested.' });
   } catch (err) {
     next(err);

@@ -100,16 +100,24 @@ Save: DEP_RAW_KEY="dep-raw".
 </step>
 
 <step id="6" name="build_file_index">
-Call getWorkspaceFileList to get every file in the workspace.
+MANDATORY: Get ALL files recursively in ONE call — no language assumptions.
 
-INCLUDE:
-  All source files for the detected PRIMARY_LANGUAGE and any additional detected languages.
-  Do not hardcode file extensions — use the detected language to decide what is a source file.
-  Always include: schema files, migration files, config files, test files.
+Call findFilesByPattern("**/*") once.
+  This single call returns every file in the workspace recursively.
+  The tool already excludes: node_modules, .git, dist, build, .next.
+  No need for per-language patterns — this works for any language.
 
-EXCLUDE (build artifacts, dependency caches, compiled output, VCS metadata):
-  node_modules, dist, build, .git, __pycache__, vendor, target, .next,
-  bin, obj, .gradle, .m2, venv, .venv, coverage, .nyc_output, .cache
+From the returned list, EXCLUDE these additional paths:
+  Any path ending in: package-lock.json, yarn.lock, pnpm-lock.yaml, poetry.lock,
+                      .min.js, .min.css, .map, .d.ts
+  Any path containing: __pycache__, vendor, target, .gradle, .m2, venv, .venv,
+                        coverage, .nyc_output, .cache, .next, bin/, obj/
+
+FILE COUNT CROSS-CHECK (MANDATORY before saving):
+  Count your filtered files. Compare to INITIAL_FILE_COUNT in the user prompt.
+  If your count is less than 50% of INITIAL_FILE_COUNT:
+    Something was filtered incorrectly. Relax the exclusion rules and recount.
+  If your count is close (within 20% of INITIAL_FILE_COUNT): proceed.
 
 For each included file, create one entry:
   {
@@ -120,18 +128,21 @@ For each included file, create one entry:
     "read_status": "PENDING"
   }
 
-Type classification rules:
-  source  — application logic (handlers, services, models, controllers, repositories, utils)
-  config  — .env, config.*, settings.*, appsettings.*, application.properties, *.yaml configs
-  schema  — *.sql, *.prisma, *.graphql, migration files, ORM schema definitions
-  test    — files inside test/, tests/, spec/, __tests__/ or matching *.test.*, *.spec.*
-  asset   — images, fonts, CSS, HTML templates, static JSON data files
-  build   — Dockerfile, docker-compose.*, CI/CD pipelines, Makefile, webpack/vite configs
-  doc     — README.*, *.md documentation, docs/, *.txt
+Classify each file's type from its extension — adapt to whatever languages exist:
+  source  — any code file: .js .ts .jsx .tsx .mjs .cjs .py .java .kt .go .rs .php .rb .cs
+             .swift .cpp .c .h .hpp .ex .exs .clj .scala .lua .r .dart .vue .svelte
+  config  — .env, .env.*, config.*, settings.*, appsettings.*, application.properties,
+             *.yaml, *.yml, *.toml, *.ini, tsconfig.json, jest.config.*, webpack.config.*
+  schema  — *.sql, *.prisma, *.graphql, *.gql, migration files, ORM schema files
+  test    — any file in test/, tests/, spec/, __tests__/ or matching *.test.*, *.spec.*
+  asset   — .png .jpg .svg .gif .woff .ttf .eot .css .html .md (non-README)
+  build   — Dockerfile, docker-compose.*, .github/**, Makefile, *.sh, webpack.*, vite.*
+  doc     — README.*, CHANGELOG.*, LICENSE, docs/**, *.txt
 
 Save the complete FILE_INDEX array under key "file-index".
 Save: FILE_INDEX_KEY="file-index", TOTAL_FILES=[count of all entries].
 </step>
+
 
 <step id="7" name="save_and_stop">
 Call todoWrite: title="Discovery complete: [TOTAL_FILES] files indexed", status="completed".
@@ -152,7 +163,10 @@ Initial scan result (treat as approximate — verify by reading manifests):
   Language:        ${detectedStack.language}
   Framework:       ${detectedStack.framework}
   Package Manager: ${detectedStack.packageManager}
-  File Count:      ${detectedStack.fileCount}
+  INITIAL_FILE_COUNT: ${detectedStack.fileCount}
+
+IMPORTANT: Your FILE_INDEX (Step 6) must contain approximately ${detectedStack.fileCount} entries.
+If it contains far fewer, you missed subdirectories — use more findFilesByPattern calls.
 
 Execute steps 1 through 7 from your system prompt in order.
 Save FILE_INDEX_KEY and TOTAL_FILES before stopping.`;

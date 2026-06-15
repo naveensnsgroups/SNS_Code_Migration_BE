@@ -58,8 +58,12 @@ export class SessionManager {
       completedFiles: 0,
       fileTree: [],
       phases: [
-        { id: 'scan',       label: 'Scan Codebase',         status: 'pending' },
-        { id: 'plan',       label: 'Generate Plan',          status: 'pending' },
+        { id: 'scan',             label: 'Stack Detection',   status: 'pending' },
+        { id: 'discovery',        label: 'Discovery',         status: 'pending' },
+        { id: 'file-analysis',    label: 'File Analysis',     status: 'pending' },
+        { id: 'graph-resolution', label: 'Graph Resolution',  status: 'pending' },
+        { id: 'section-writing',  label: 'Section Writing',   status: 'pending' },
+        { id: 'assembly',         label: 'Assembly',          status: 'pending' },
       ],
     };
 
@@ -192,7 +196,7 @@ export class SessionManager {
     try {
       const session = await this.getSession(sessionId);
       if (session) {
-        const { estimateCost } = await import('../agents/agentExecutor.js');
+        const { estimateCost } = await import('../agents/compactor/agent-cost-estimator.js');
         const estimatedCost = estimateCost(inputTokens, outputTokens, modelName);
 
         const ex = session.tokenUsage;

@@ -82,8 +82,12 @@ export const readKnowledgeGraphTool: ToolRequest = {
       );
     }
 
-    const entryCount     = Object.keys(data).length;
-    const graphSizeBytes = JSON.stringify(data).length;
+    // Strip internal _sources metadata before returning to the agent.
+    // _sources is for dedup tracking only — not domain data the LLM needs.
+    const { _sources, ...domainData } = data;
+
+    const entryCount     = Object.keys(domainData).length;
+    const graphSizeBytes = JSON.stringify(domainData).length;
 
     ctx?.onLog?.(
       `[KnowledgeGraph] Read "${args.graphName}-graph": ${entryCount} entries, ${Math.round(graphSizeBytes / 1024)}KB`,
@@ -94,7 +98,7 @@ export const readKnowledgeGraphTool: ToolRequest = {
       exists:         true,
       graphName:      args.graphName,
       graphPath:      `_analysis/${args.graphName}-graph.json`,
-      data,
+      data:           domainData,
       entryCount,
       graphSizeBytes,
       message: `Loaded ${args.graphName}-graph: ${entryCount} top-level entries.`

@@ -3,7 +3,7 @@ import multer from 'multer';
 import fs from 'fs-extra';
 import path from 'path';
 import { SessionManager } from '../session/sessionManager.js';
-import { ScannerAgent, ScannerAgentConfig } from '../agents/scanner-agent.js';
+import { ScannerAgent, ScannerAgentConfig } from '../agents/stage1/scanner-agent.js';
 
 const router = Router();
 const upload = multer({ storage: multer.memoryStorage() });

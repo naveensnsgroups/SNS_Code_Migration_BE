@@ -27,38 +27,25 @@ import {
   ToolCallResult,
   UserRequest,
   StreamingProvider,
-} from '../types/language-model.js';
-import { ToolRequest, ToolContext } from '../types/tool.js';
-import { EventBroadcaster } from '../routes/stream.js';
-import { SessionManager } from '../session/sessionManager.js';
-import { TokenUsage } from '../types.js';
-import { TokenUsageEntry } from '../session/types.js';
+  hasToolError,
+} from '../../types/language-model.js';
+import { ToolRequest, ToolContext } from '../../types/tool.js';
+import { EventBroadcaster } from '../../routes/stream.js';
+import { SessionManager } from '../../session/sessionManager.js';
+import { TokenUsage } from '../../types.js';
+import { TokenUsageEntry } from '../../session/types.js';
 
-// ── Per-provider cost table (USD per 1M tokens) ───────────────────────────────
-export const COST_TABLE: Record<string, [number, number]> = {
-  'claude-opus-4':      [15,    75],
-  'claude-opus-4-5':    [15,    75],
-  'claude-sonnet-4':    [3,     15],
-  'claude-sonnet-4-5':  [3,     15],
-  'claude-3-5-sonnet':  [3,     15],
-  'claude-3-opus':      [15,    75],
-  'claude-3-haiku':     [0.25,  1.25],
-  'gpt-4o':             [2.5,   10],
-  'gpt-4o-mini':        [0.15,  0.6],
-  'gpt-4-turbo':        [10,    30],
-  'gpt-3.5-turbo':      [0.5,   1.5],
-  'gemini-2.5-pro':     [1.25,  10],
-  'gemini-2.0-flash':   [0.075, 0.3],
-  'gemini-1.5-pro':     [1.25,  5],
-  'gemini-1.5-flash':   [0.075, 0.3],
-  'default':            [1,     3],
-};
+// ── Context Compaction (extracted to compactor/agent-context-compactor.ts) ───
+import {
+  resolveCompactionCharBudget,
+  compactMessagesIfNeeded,
+} from '../compactor/agent-context-compactor.js';
 
-export function estimateCost(inputTokens: number, outputTokens: number, model: string): number {
-  const entry = Object.entries(COST_TABLE).find(([key]) => model.toLowerCase().includes(key));
-  const [inCostPerM, outCostPerM] = entry ? entry[1] : COST_TABLE['default'];
-  return Math.round(((inputTokens / 1_000_000) * inCostPerM + (outputTokens / 1_000_000) * outCostPerM) * 10000) / 10000;
-}
+// ── Cost Estimation (extracted to compactor/agent-cost-estimator.ts) ────────────
+// Re-exported for backward compatibility.
+export { COST_TABLE, estimateCost } from '../compactor/agent-cost-estimator.js';
+
+
 
 // ── Rate Limit Retry Helper ───────────────────────────────────────────────────
 // Wraps provider.request() with exponential backoff for 429 / 503 errors.
@@ -144,8 +131,15 @@ export class AgentExecutor {
     let totalInputTokens = 0;
     let totalOutputTokens = 0;
 
+    // Resolve compaction budget once (model is fixed for the lifetime of this execute call)
+    const compactionCharBudget = resolveCompactionCharBudget(modelName);
+
     while (iteration < maxIterations) {
       iteration++;
+
+      // ── Context Compaction (logic in compactor/agent-context-compactor.ts) ──
+      compactMessagesIfNeeded(messages, compactionCharBudget, iteration, context.onLog);
+
       context.onLog?.(`[AI Request] Submitting query to LLM (Turn ${iteration})...`, 'info');
 
       const userRequest: UserRequest = {
@@ -199,12 +193,34 @@ export class AgentExecutor {
                 name: tc.function.name,
                 args: tc.function.arguments ?? '{}',
               });
-            } else if (tc.id && tc.finished && pendingToolCalls.has(tc.id)) {
-              // Tool completed inside the stream (recursive Gemini loop handled it)
-              // The result is already fed back — just log it
-              const existing = pendingToolCalls.get(tc.id)!;
-              context.onLog?.(`[Tool Response] ${existing.name} completed (in-stream).`, 'success');
-              pendingToolCalls.delete(tc.id);
+            } else if (tc.id && tc.finished) {
+              // Tool completed inside the stream (Gemini recursive loop executed it).
+              // SNS IDE pattern: google-language-model.ts calls tool.handler() internally,
+              // yields { finished: true, id, result } — our handlers already ran.
+              // We must still push a tool_result message to keep the history chain intact
+              // (required by Claude/OpenAI providers that validate message sequences).
+              const existing = pendingToolCalls.get(tc.id);
+              if (existing) {
+                // Push tool_result to message history so chain is complete
+                if (tc.result !== undefined) {
+                  messages.push({
+                    actor: 'user',
+                    type: 'tool_result',
+                    tool_use_id: tc.id,
+                    name: existing.name,
+                    content: tc.result as ToolCallResult,
+                    is_error: hasToolError(tc.result as ToolCallResult),
+                  } as ToolResultMessage);
+                }
+                // Broadcast tool_response event to FE (matches manual tool path)
+                EventBroadcaster.broadcast(context.sessionId, 'tool_response', {
+                  toolName:  existing.name,
+                  success:   !hasToolError(tc.result as ToolCallResult),
+                  inStream:  true,
+                });
+                context.onLog?.(`[Tool Response] ${existing.name} completed (in-stream, result recorded).`, 'success');
+                pendingToolCalls.delete(tc.id);
+              }
             }
           }
         }
@@ -274,13 +290,16 @@ export class AgentExecutor {
           }
 
           // Append tool_result to the message chain
+          // is_error MUST reflect the actual outcome:
+          //   true  → Claude/Anthropic treats this as a failure and knows to retry
+          //   false → LLM treats this as success (wrong if tool actually failed)
           messages.push({
             actor: 'user',
             type: 'tool_result',
             tool_use_id: tc.id,
             name: tc.name,
             content: result,
-            is_error: false,
+            is_error: hasToolError(result),  // ← reads actual error status from result
           } as ToolResultMessage);
         }
 
