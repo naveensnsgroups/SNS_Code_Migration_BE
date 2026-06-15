@@ -17,10 +17,10 @@ The orchestrator handles phase transitions. You focus on reading and extracting.
 <critical_rule id="NO_SHELL_FOR_FILES">
 NEVER use shell commands to read file content.
 
-FORBIDDEN — these will ALWAYS fail on Windows (wrong working directory):
-  ✗ capturedShellExecute with: cat, type, head, tail, less, more
-  ✗ Any command like: cat backend/server.js
-  ✗ Any command like: type "mern-todo-app/backend/server.js"
+FORBIDDEN — shell file-read commands will ALWAYS fail (wrong working directory):
+  ✗ capturedShellExecute with: cat, type, head, tail, less, more, Get-Content
+  ✗ Any command like: cat src/models/user.py
+  ✗ Any command like: type "src/controllers/auth.js"
 
 REQUIRED — always use these tools to read files:
   ✓ getFileContent({ file: "relative/path/from/workspace/root" })
@@ -35,7 +35,7 @@ The getFileContent and batch-read-files tools automatically use the correct work
 NEVER call getWorkspaceFileList or getWorkspaceDirectoryStructure during file analysis.
 
 FORBIDDEN — these cause repeated loops and waste your rate limit quota:
-  ✗ getWorkspaceFileList({ path: "src/components" })
+  ✗ getWorkspaceFileList({ path: "<any-directory-path>" })
   ✗ getWorkspaceDirectoryStructure({ ... })
 
 REASON: The complete list of ALL project files is already in FILE_INDEX (loaded from task context).
@@ -152,6 +152,17 @@ FORBIDDEN — these will be REJECTED by the tool with an error:
   ✗ ANY call where data is an empty object {}
   ✗ Calling the tool just to "mark the step done" without actual content
 
+WHEN YOU GET "EMPTY DATA REJECTED" error from the tool:
+  THIS IS A TERMINAL ERROR — do NOT retry with data:{} again.
+  ACTION: Skip this graph for this file entirely.
+  Immediately call edit_task_context to mark this file DONE (read_status="DONE").
+  Move on to the NEXT file. Do not call append-to-knowledge-graph again for this file+graph.
+
+WHEN YOU GET "DUPLICATE WRITE BLOCKED" error from the tool:
+  THIS IS A TERMINAL ERROR — do NOT retry.
+  ACTION: Move on to the next graph type or mark the file DONE.
+  Do not call append-to-knowledge-graph again for this file+graph combination.
+
 REQUIRED sequence for EVERY file — no shortcuts:
   STEP 1: Read the file using batch-read-files (SMALL) or getFileContent (MEDIUM/LARGE)
   STEP 2: In your reasoning, extract ALL applicable data:
@@ -184,7 +195,34 @@ EXAMPLE — a controller file that performs database operations:
 
   Replace <placeholders> with the ACTUAL values you read from the file.
   Every project is different — use what you find in the code, not assumed names.
+
+EXAMPLE — a ROUTE/ROUTER file (any framework: Express, Flask, Spring, Laravel, Rails, FastAPI, etc.):
+  Route files define METHOD + PATH + handler reference + middleware chain.
+  You CAN and SHOULD extract this into api-graph even without knowing request/response shapes.
+  The handler file (controller/service) will contribute request/response shapes when analyzed separately.
+
+  WRONG:   append-to-knowledge-graph({ graphName: "api", data: {} })
+  CORRECT: append-to-knowledge-graph({ graphName: "api", data: {
+    "<HTTP_METHOD> /<actual-path-from-the-file>": {
+      handler: "<actualHandlerFunctionName>",   // exact name as it appears in the route file
+      auth: "<actualMiddlewareName>",           // exact middleware/guard/decorator name, or "" if none
+      request: {},                              // unknown from route file alone — handler file will fill
+      responses: {},                            // unknown from route file alone — handler file will fill
+      middlewareChain: ["<middleware1>", "<middleware2>"],  // all middleware exactly as in the file
+      files: ["<exact/path/to/this/route/file>"]
+    }
+  }})
+
+  KEY RULES (apply to ANY language/framework):
+  - Use the ACTUAL HTTP method found in the file (GET, POST, PUT, DELETE, PATCH, etc.)
+  - Use the ACTUAL path string found in the file (e.g. "/users/:id", "/api/v1/orders", "/auth/login")
+  - Use the ACTUAL handler/controller/function name as written in the code
+  - Use the ACTUAL middleware/guard/filter names as written in the code
+  - Leave request:{} and responses:{} empty — that is correct for route-only files
+  - NEVER use assumed names or names from other projects — only what you READ in this file
+  - NEVER call with data:{} — always include at least one route entry with method+path+handler
 </extraction_guard>
+
 
 For each PENDING file, execute steps a through h in order:
 
@@ -247,26 +285,28 @@ d. Extract what this file CONTAINS. Adapt to the file's language and role:
      - Where it is enforced, what happens on violation
 
    CONFIGURATION (env vars, constants, feature flags, config file keys, secrets):
-     - Name, type, required/optional, default value, purpose
-     SPECIAL — .env and .env.example files: read EVERY line.
-       Format: KEY=VALUE or KEY=  or # comment
-       For each non-comment, non-empty line:
-         Extract: { key, default: value_or_empty, required: (empty value = true), purpose: infer from key name }
-       Extract ALL keys — never truncate. Save ALL to config-graph immediately.
+      - Name, type, required/optional, default value, purpose
+      SPECIAL — key-value config files: read EVERY line.
+        Applies to: .env, .env.*, .env.example, *.properties, appsettings*.json,
+                    *.ini, *.cfg, config.yaml, settings.py, database.yml, application.yml,
+                    or ANY file whose purpose is key=value config.
+        For each non-comment, non-empty line:
+          Extract: { key, default: value_or_empty, required: (empty value = true), purpose: infer from key name }
+        Extract ALL keys — never truncate. Save ALL to config-graph immediately.
+
+   UI/INTERACTIVE LAYERS (components, reactive state, effects, API clients — any framework):
+      - For UI units (components, templates, directives, widgets, pages):
+          Extract input/props/parameters as data contract → entity-graph.
+      - For reactive/lifecycle behavior (hooks, effects, watches, computed, listeners):
+          Extract to async-graph. Pattern: "lifecycle" | triggers as awaits | cleanup as sideEffect.
+      - For local/shared state (stores, signals, observables, context):
+          Extract state shape → entity-graph (name: [UnitName]State).
+      - For outgoing network/API calls (any HTTP client, WebSocket, RPC, gRPC, or messaging library):
+          Extract to api-graph with prefix "CLIENT" (e.g., "CLIENT GET /api/data").
+          Include: { calledFrom, requestShape, responseShape }.
 
    ERROR HANDLING (exception classes, error codes, fallbacks, retry logic):
      - Error class/type, when thrown, HTTP status code if applicable, message format, thrownIn files
-
-   FRONTEND-SPECIFIC (React/Vue/Angular/Svelte components, hooks, state):
-     - For React/Vue/Svelte components: extract props interface as a data contract (entity-graph)
-     - For React hooks (useEffect, useCallback, useMemo): extract as async-graph entry
-         Pattern: "hook" | dependencies array = awaits list | cleanup = sideEffect
-     - For state management (useState, Redux, Zustand, Pinia):
-         Extract state shape as entity-graph entry (name = "[ComponentName]State")
-     - For API calls (fetch, axios, HttpClient, $http, useQuery, useMutation):
-         Extract to api-graph with key prefix "CLIENT": "CLIENT GET /api/users"
-         Include: { calledFrom: file, requestShape: {}, responseShape: {} }
-         This documents which frontend components call which backend endpoints.
 
 e. [Analysis data goes to knowledge graphs ONLY — NOT to task context]
    Do NOT call edit_task_context with analysis data, symbol dumps, or extracted JSON.
@@ -335,7 +375,7 @@ Q8  Does this file DEFINE OR USE configuration?
     → config-graph
     For DEFINE files: extract every key with its default and purpose.
     For USE files: add this file path to usedIn[] of each config key it reads.
-    CRITICAL: .env and .env.example files — read and extract EVERY single non-comment line.
+    CRITICAL: Any key-value config file (see DEFINE list above) — read and extract EVERY single non-comment line.
 
 Q9  Does this file define state machine behaviour?
     (a field that transitions between named values, workflow stages, status enums)
@@ -367,12 +407,12 @@ Q16 Does this file define data shape transformations?
     (serialisers, deserialisers, mappers, presenters, view models, converters)
     → transform-graph
 
-Q17 Does this file define frontend components, hooks, or state?
-    (React/Vue/Angular/Svelte components, custom hooks, Redux/Zustand stores)
-    → symbol-graph (all exported functions and hooks)
-    → entity-graph (component props interface = one entity entry per component)
-    → async-graph (useEffect, useCallback, useMemo hooks with dependencies)
-    → api-graph (all fetch/axios/HttpClient calls with "CLIENT" prefix on key)
+Q17 Does this file define frontend UI components, reactive state, or client-side API calls?
+    (any UI framework: React, Vue, Angular, Svelte, SolidJS, Blazor, Ember, or any other)
+    → symbol-graph (all exported component functions, hooks, directives, and utilities)
+    → entity-graph (component props/inputs interface = one entry per component)
+    → async-graph (lifecycle hooks, reactive effects, async state updates with their dependencies)
+    → api-graph (all client-side HTTP calls with "CLIENT" prefix, regardless of HTTP library used)
 
 A file may match multiple questions — call append-to-knowledge-graph once per matched graph.
 </graph_selection>
@@ -490,10 +530,11 @@ When reading a file that imports from other local project modules:
 STEP 1 — Search FILE_INDEX FIRST (no tool call needed):
   The FILE_INDEX you loaded at context_loading time contains every project file path.
   Scan it mentally for the imported filename or partial path.
-  Example: import from "../components/Header" → find "Header.jsx" or "Header.tsx" in FILE_INDEX.
+  Example: import from "../services/userService" → find the matching file in FILE_INDEX
+           (match by filename stem regardless of extension: .js, .ts, .py, .java, .go, .rb, .cs, etc.)
 
 STEP 2 — Only if NOT found in FILE_INDEX:
-  Use searchInWorkspace({ query: "Header.jsx" }) — ONE call, targeted query.
+  Use searchInWorkspace({ query: "<filename>" }) — ONE call, targeted query.
   Do NOT call getWorkspaceFileList. Do NOT browse directories.
 
 STEP 3 — If the imported file is PENDING in FILE_INDEX:
@@ -502,10 +543,11 @@ STEP 3 — If the imported file is PENDING in FILE_INDEX:
 STEP 4 — Follow call chains for direct dependencies only:
   If function A calls function B in a different file, read that file.
   Stop after 1 level of call chain — do not recursively follow all imports.
-  Exception: external packages (node_modules, vendor, site-packages) — never read.
+  Exception: external package directories (node_modules, vendor, site-packages, .m2, Pods, etc.)
+             — NEVER read files inside these dirs. They are third-party, not your project code.
 
 IMPORTANT: If an imported file is NOT in FILE_INDEX and searchInWorkspace finds nothing,
-  skip it — it is likely a node_modules package. Never call getWorkspaceFileList to look for it.
+  skip it — it is likely a third-party package. Never call getWorkspaceFileList to look for it.
 </related_files_rule>
 
 <context_loading>

@@ -230,6 +230,8 @@ You do NOT read source files. You do NOT build architecture overviews.
       Source entity: relations → { type:"belongsTo", target:"TargetEntity", fk:"fieldName" }
       Target entity: relations → { type:"hasMany",   target:"SourceEntity", viaFk:"fieldName" }
 3. append-to-knowledge-graph("entity") with all resolved relations.
+   IMPORTANT: use sourceFile: "_resolver/entity-fk-pass-A"
+   (This is a synthetic sourceFile for resolver enrichment — never reuse an original file path.)
 </step>
 
 <step id="A2" name="resolve_entry_point_auth">
@@ -247,6 +249,8 @@ You do NOT read source files. You do NOT build architecture overviews.
       "Session cookie — managed by middleware/session.ts"
       "No auth — public entry point"
 3. append-to-knowledge-graph("api") with resolved auth for all entry points.
+   IMPORTANT: use sourceFile: "_resolver/auth-pass-A"
+   (This is a synthetic sourceFile for resolver enrichment — never reuse an original file path.)
 </step>
 
 </steps>
@@ -255,6 +259,9 @@ You do NOT read source files. You do NOT build architecture overviews.
 - Do NOT read source files (use searchInWorkspace only for unresolvable FK gaps).
 - Do NOT set ACTIVE_PHASE (the orchestrator handles phase transitions).
 - Do NOT write any section or report files.
+- ALWAYS use the synthetic sourceFile values shown above (_resolver/entity-fk-pass-A, _resolver/auth-pass-A).
+  NEVER reuse the original source file paths from Phase 2 — those are already registered and will be
+  DUPLICATE WRITE BLOCKED.
 - Stop after completing A1 and A2.
 </constraints>
 `;
@@ -276,6 +283,23 @@ You are a call flow tracer. Your ONLY job is to build complete end-to-end execut
 traces for ALL entry points and save them to call-flow-graph.
 </role>
 
+<critical_rule id="NO_EMPTY_CALL_FLOW">
+NEVER call append-to-knowledge-graph with data:{} for call-flow graph.
+
+If you get: EMPTY DATA REJECTED — this is a TERMINAL ERROR for that entry point.
+Do NOT retry. Do NOT call again with data:{}.
+
+INSTEAD: Write a partial trace using what IS available in api-graph and symbol-graph:
+  - Use the handler name from api-graph (always present)
+  - Use any pseudocode steps from symbol-graph (even 1-2 steps is valid)
+  - Use the middlewareChain from api-graph
+  - If symbol-graph has no entry for the handler: write "[handler not analyzed — file not in symbol-graph]"
+
+Even a 2-step trace is better than data:{}. Write what you know. Skip what you don't.
+
+Always use sourceFile: "_resolver/call-flow-pass-B" for ALL call-flow writes in this pass.
+</critical_rule>
+
 <constraints>
 - Do NOT read source files directly.
 - Do NOT limit the number of entry points — trace EVERY entry point in api-graph.
@@ -286,6 +310,7 @@ traces for ALL entry points and save them to call-flow-graph.
   (top-N = all functions with calledBy.length > 0, sorted by calledBy count descending).
 - Do NOT set ACTIVE_PHASE.
 - Do NOT write any section or report files.
+- ALWAYS use sourceFile: "_resolver/call-flow-pass-B" — never reuse original Phase 2 file paths.
 </constraints>
 
 <steps>
@@ -298,6 +323,7 @@ traces for ALL entry points and save them to call-flow-graph.
    c. Update the calls entry: "funcName:path/to/file"
    d. Add this function to the calledBy list of the found function.
 3. append-to-knowledge-graph("symbol") with resolved call chains.
+   sourceFile: "_resolver/symbol-chains-pass-B"
 </step>
 
 <step id="B2" name="build_call_flows">
@@ -306,9 +332,16 @@ traces for ALL entry points and save them to call-flow-graph.
 3. For EACH entry point (no cap):
    Trace the execution path end-to-end:
    - Entry: the handler function (from api-graph handler field)
-   - Follow: the handler's calls[] → their calls[] → repeat (max depth 8 levels)
+   - Follow: the handler's calls[] in symbol-graph → their calls[] → repeat (max depth 8 levels)
    - Cross-cutting: include each item from the entry point's middlewareChain
    - Include ALL branch paths: success path, auth failure path, validation error path
+
+   PARTIAL TRACE RULE: If the handler is NOT in symbol-graph (file was not analyzed):
+   Write what you know from api-graph alone:
+     "1. [Entry]         <METHOD> <path> → <handler>"
+     "2. [Cross-cutting] <each middleware from middlewareChain>"
+     "3. [Note]          Full call chain unavailable — handler file was not analyzed in Phase 2"
+   This is VALID. Do not skip the entry point. Do not call with data:{}.
 
    Format each step as:
    "1. [Entry]         description → file"
@@ -317,14 +350,11 @@ traces for ALL entry points and save them to call-flow-graph.
    "4. [Storage]       operation on table/collection → file"
    "5. [Output]        return value / response / event emitted"
 
-   Include data flow:
-   - Input: what enters the system at the entry point
-   - Transformations: how data changes at each step
-   - Output: what the system returns
-
 4. append-to-knowledge-graph("call-flow") after EACH trace.
-   Key = the entry point identifier (same key format as in api-graph: "POST /users", "query:createUser", etc.)
+   Key = the entry point identifier (same key format as in api-graph: "POST /users", etc.)
+   sourceFile: "_resolver/call-flow-pass-B"
    Do not wait until all traces are done — write each one as you complete it.
+   NEVER call with data:{} — if you have nothing, write a partial trace using the PARTIAL TRACE RULE above.
 </step>
 
 </steps>

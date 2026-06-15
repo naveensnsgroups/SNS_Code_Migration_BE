@@ -301,9 +301,10 @@ export class PlannerAgent {
       onLog?.(`[PlannerAgent] Stage 2/5: File Analysis (${totalFiles} files)...`, 'info');
       await onPhase?.('file-analysis', 'active');
 
-      let passNumber   = 0;
-      let prevDone     = -1;    // sentinel: tracks progress between passes
-      const MAX_PASSES = 20;    // safety ceiling — no infinite loop ever
+      let passNumber        = 0;
+      let consecutiveStalls  = 0;    // how many passes in a row made zero progress
+      const MAX_PASSES = 20;         // safety ceiling — no infinite loop ever
+      const MAX_STALLS = 2;          // require 2 consecutive zero-progress passes before advancing
 
       while (passNumber < MAX_PASSES) {
         passNumber++;
@@ -312,7 +313,7 @@ export class PlannerAgent {
         taskCtx = await TaskContextManager.getContext(sessionId);
         const lastAnalyzed = taskCtx.LAST_FILE_ANALYZED as string | undefined;
 
-        // Check current done count BEFORE running
+        // Check done count BEFORE running this pass (used for stall detection)
         const fileIndexKey = taskCtx.FILE_INDEX_KEY as string | undefined;
         const fileIndex: any[] = fileIndexKey ? ((taskCtx[fileIndexKey] as any[]) ?? []) : [];
         const doneCount = fileIndex.filter((f: any) => f?.read_status === 'DONE').length;
@@ -344,6 +345,22 @@ export class PlannerAgent {
 
         await PlannerAgent.cleanupAnalysisKeys(sessionId);
 
+        // ── TypeScript-side DONE reconciliation ───────────────────────────────
+        // The LLM often writes knowledge graphs but skips calling edit_task_context
+        // to mark files DONE (hit by 429 / TURN_CAP before reaching that step).
+        // TypeScript reads _sources from every graph file and marks any FILE_INDEX
+        // entry DONE if its path appears in any graph's _sources array.
+        // This is the safety net that makes progress visible regardless of LLM behaviour.
+        const reconciledCount = await PlannerAgent.reconcileFileDoneStatus(
+          sessionId, modernPath
+        );
+        if (reconciledCount > 0) {
+          onLog?.(
+            `[PlannerAgent] Reconciled ${reconciledCount} file(s) as DONE from knowledge graph sources.`,
+            'info'
+          );
+        }
+
         // Re-read context to measure progress made in this pass
         taskCtx = await TaskContextManager.getContext(sessionId);
         const fileIndexKeyAfter   = taskCtx.FILE_INDEX_KEY as string | undefined;
@@ -356,21 +373,32 @@ export class PlannerAgent {
           break;
         }
 
-        // Stall guard: if this pass made zero progress, agent is stuck — advance to next stage
-        if (doneAfter <= prevDone) {
+        // Stall guard: compare THIS pass's progress (doneAfter vs doneCount at pass start)
+        // A 429-interrupted pass may make no DONE marks but still made real progress —
+        // so require 2 consecutive zero-progress passes before advancing.
+        if (doneAfter > doneCount) {
+          // Real progress made this pass — reset stall counter
+          consecutiveStalls = 0;
+          const analysisPct = 5 + Math.min(Math.round((doneAfter / Math.max(totalFiles, 1)) * 40), 40);
+          onProgress?.(analysisPct, `Analyzed ${doneAfter} / ${totalFiles} files`);
+        } else {
+          // Zero progress this pass — increment stall counter
+          consecutiveStalls++;
           onLog?.(
-            `[PlannerAgent] Stall detected after pass ${passNumber} — no new files analyzed. ` +
-            `Advancing with ${doneAfter}/${totalFiles} files done.`,
+            `[PlannerAgent] Pass ${passNumber}: no new files marked DONE (${doneAfter}/${totalFiles}). ` +
+            `Stall ${consecutiveStalls}/${MAX_STALLS}.`,
             'warning'
           );
-          onProgress?.(45, `Stalled at ${doneAfter} / ${totalFiles} files`);
-          break;
+          if (consecutiveStalls >= MAX_STALLS) {
+            onLog?.(
+              `[PlannerAgent] ${MAX_STALLS} consecutive stalled passes — agent is stuck. ` +
+              `Advancing with ${doneAfter}/${totalFiles} files done.`,
+              'warning'
+            );
+            onProgress?.(45, `Stalled at ${doneAfter} / ${totalFiles} files`);
+            break;
+          }
         }
-
-        // Real incremental progress — 5% base + up to 40% for analysis phase
-        const analysisPct = 5 + Math.min(Math.round((doneAfter / Math.max(totalFiles, 1)) * 40), 40);
-        onProgress?.(analysisPct, `Analyzed ${doneAfter} / ${totalFiles} files`);
-        prevDone = doneAfter;
       }
 
       if (passNumber >= MAX_PASSES) {
@@ -850,7 +878,7 @@ export class PlannerAgent {
    * Removing them keeps Stage 3 and Stage 4 agent context windows small.
    */
   private static async cleanupAnalysisKeys(sessionId: string): Promise<void> {
-    const ctx         = await TaskContextManager.getContext(sessionId);
+    const ctx          = await TaskContextManager.getContext(sessionId);
     const analysisKeys = Object.keys(ctx).filter(k => k.startsWith('analysis:'));
     if (analysisKeys.length === 0) return;
 
@@ -861,6 +889,78 @@ export class PlannerAgent {
     } catch {
       // Non-fatal — context cleanup is a best-effort optimization
     }
+  }
+
+  /**
+   * Reconciles FILE_INDEX with knowledge graph _sources.
+   *
+   * Problem: the LLM frequently writes to knowledge graphs but never calls
+   * edit_task_context to mark files DONE — because 429 / TURN_CAP cuts it off
+   * before reaching step f/g. TypeScript can infer which files were processed
+   * by reading the _sources arrays stored in every graph file.
+   *
+   * After every analysis pass, this method:
+   *   1. Reads _sources from all *-graph.json files.
+   *   2. Builds a set of all file paths that contributed data to any graph.
+   *   3. For each FILE_INDEX entry whose path is in that set but is not DONE:
+   *      marks it DONE and saves the updated FILE_INDEX.
+   *
+   * Returns the number of files newly marked DONE.
+   */
+  private static async reconcileFileDoneStatus(
+    sessionId:  string,
+    modernPath: string
+  ): Promise<number> {
+    const analysisDir = path.join(modernPath, '_analysis');
+    if (!(await fs.pathExists(analysisDir))) return 0;
+
+    // ── Step 1: Collect all file paths from every graph's _sources ─────────
+    const allSources = new Set<string>();
+    try {
+      const dirEntries = await fs.readdir(analysisDir);
+      for (const entry of dirEntries) {
+        if (!entry.endsWith('-graph.json')) continue;
+        try {
+          const graphData = await fs.readJson(path.join(analysisDir, entry)) as Record<string, unknown>;
+          if (Array.isArray(graphData._sources)) {
+            for (const src of graphData._sources as string[]) {
+              // Skip synthetic resolver sourceFiles (_resolver/...) — only real project files
+              if (src && !src.startsWith('_resolver/')) {
+                allSources.add(src);
+              }
+            }
+          }
+        } catch { /* corrupt graph file — skip */ }
+      }
+    } catch { return 0; }
+
+    if (allSources.size === 0) return 0;
+
+    // ── Step 2: Load FILE_INDEX from task context ──────────────────────────
+    const ctx = await TaskContextManager.getContext(sessionId);
+    const fileIndexKey = ctx.FILE_INDEX_KEY as string | undefined;
+    if (!fileIndexKey) return 0;
+
+    const fileIndex: any[] = (ctx[fileIndexKey] as any[]) ?? [];
+    if (fileIndex.length === 0) return 0;
+
+    // ── Step 3: Mark DONE for any file that contributed to a graph ─────────
+    let updatedCount = 0;
+    for (const entry of fileIndex) {
+      if (entry?.read_status !== 'DONE' && allSources.has(entry?.path)) {
+        entry.read_status = 'DONE';
+        updatedCount++;
+      }
+    }
+
+    if (updatedCount === 0) return 0;
+
+    // ── Step 4: Persist the updated FILE_INDEX ─────────────────────────────
+    try {
+      await TaskContextManager.updateContext(sessionId, { [fileIndexKey]: fileIndex });
+    } catch { /* non-fatal — will be retried next pass */ }
+
+    return updatedCount;
   }
 }
 
