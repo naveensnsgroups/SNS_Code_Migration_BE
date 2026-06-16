@@ -11,7 +11,7 @@
 //   - AgentRegistry (runtime lookup)
 // =============================================================================
 
-import { AgentDefinition, AgentRegistry } from '../types/agent.js';
+import { AgentDefinition, AgentRegistry } from '../../types/agent.js';
 import {
   FILE_CONTENT_FUNCTION_ID,
   GET_WORKSPACE_DIRECTORY_STRUCTURE_FUNCTION_ID,
@@ -36,13 +36,13 @@ import {
   EDIT_TASK_CONTEXT_FUNCTION_ID,
   APPEND_TO_KNOWLEDGE_GRAPH_FUNCTION_ID,
   READ_KNOWLEDGE_GRAPH_FUNCTION_ID,
-} from '../common/workspace-functions.js';
+} from '../../common/workspace-functions.js';
 import {
   SCANNER_SYSTEM_PROMPT,
-} from '../prompts/scanner-prompt.js';
+} from '../../prompts/scanner-prompt.js';
 import {
   ANALYZER_SYSTEM_PROMPT,
-} from '../prompts/analyzer-prompt.js';
+} from '../../prompts/analyzer-prompt.js';
 
 // =============================================================================
 //  SCANNER AGENT — Codebase Discovery (Pre-Stage 1)
@@ -118,11 +118,10 @@ export const STAGE1_PLANNER_AGENT: AgentDefinition = {
     EXTRACT_FILE_SYMBOLS_FUNCTION_ID,
     SCAN_ASSET_FILES_FUNCTION_ID,
     CAPTURED_SHELL_EXECUTION_ID,
-    TODO_WRITE_FUNCTION_ID,
-    UPDATE_MIGRATION_DASHBOARD_FUNCTION_ID,
-    COMPRESS_MIGRATION_CONTEXT_FUNCTION_ID,
-    WRITE_MIGRATION_FILES_FUNCTION_ID,
-    FIND_MIGRATION_SESSION_FUNCTION_ID,
+    // NOTE: TODO_WRITE, UPDATE_MIGRATION_DASHBOARD, COMPRESS_MIGRATION_CONTEXT,
+    // WRITE_MIGRATION_FILES, FIND_MIGRATION_SESSION, COMPARE_FILES removed —
+    // these are not registered in the tool registry and caused noisy warnings.
+    BATCH_READ_FILES_FUNCTION_ID,
     GET_TASK_CONTEXT_FUNCTION_ID,
     EDIT_TASK_CONTEXT_FUNCTION_ID,
     WRITE_FILE_FUNCTION_ID,
@@ -162,7 +161,7 @@ export const STAGE1_PLANNER_AGENT: AgentDefinition = {
 //   - agentService  (SNS IDE-standard singleton — used by orchestrator dispatch)
 // =============================================================================
 
-import { agentService } from '../core/agent-service.js';
+import { agentService } from '../../core/agent-service.js';
 
 AgentRegistry.register(SCANNER_AGENT);
 AgentRegistry.register(STAGE1_PLANNER_AGENT);
@@ -238,6 +237,7 @@ export const GRAPH_RESOLVER_AGENT: AgentDefinition = {
     SEARCH_IN_WORKSPACE_FUNCTION_ID,
     FIND_FILES_BY_PATTERN_FUNCTION_ID,
     GET_WORKSPACE_DIRECTORY_STRUCTURE_FUNCTION_ID,
+    FILE_CONTENT_FUNCTION_ID,          // Added: FK resolution needs to READ entity files to confirm definitions
     GET_TASK_CONTEXT_FUNCTION_ID,
     EDIT_TASK_CONTEXT_FUNCTION_ID,
     APPEND_TO_KNOWLEDGE_GRAPH_FUNCTION_ID,

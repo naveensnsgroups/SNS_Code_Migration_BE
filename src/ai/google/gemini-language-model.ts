@@ -141,13 +141,24 @@ export interface GeminiProviderConfig {
 function isRateLimitError(err: any): boolean {
   const errMsg = String(err?.message || err || '').toLowerCase();
   const status = err?.status || err?.statusCode || err?.status_code;
+
+  // 429 = rate limit / quota exhausted
   if (status === 429) return true;
+
+  // 503 = "Service Unavailable" / "high demand" — Gemini temporary overload.
+  // Treat as retryable exactly like 429.
+  if (status === 503) return true;
+
   return (
     errMsg.includes('429') ||
+    errMsg.includes('503') ||
     errMsg.includes('resourceexhausted') ||
     errMsg.includes('resource_exhausted') ||
     errMsg.includes('quota') ||
-    errMsg.includes('rate limit')
+    errMsg.includes('rate limit') ||
+    errMsg.includes('high demand') ||           // Gemini 503 message text
+    errMsg.includes('service unavailable') ||   // HTTP 503 standard text
+    errMsg.includes('unavailable')              // gRPC UNAVAILABLE status
   );
 }
 
@@ -167,8 +178,8 @@ export class GeminiProvider {
     toolCtx?: ToolContext
   ): Promise<T> {
     const maxRetries = this.config?.maxRetries ?? 3;
-    const retryDelayRateLimit = this.config?.retryDelayRateLimit ?? 60; // in seconds
-    const retryDelayOther = this.config?.retryDelayOther ?? -1; // in seconds
+    const retryDelayRateLimit = this.config?.retryDelayRateLimit ?? 60; // seconds to wait on 429/503
+    const retryDelayOther = this.config?.retryDelayOther ?? 30;         // seconds to wait on other transient errors (was -1 = no retry)
 
     let attempt = 0;
     while (true) {

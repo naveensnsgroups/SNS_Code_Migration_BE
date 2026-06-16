@@ -13,20 +13,24 @@
 //   - fallback stack is NOT a hardcoded guess — it is the result of runBackupScan()
 // =============================================================================
 
-import { scanProjectDirectory } from '../tools/fileScanner.js';
-import { DetectedStack, FileNode } from '../types.js';
-import { toolRegistry } from '../core/tool-invocation-registry.js';
-import { ToolContext } from '../types/tool.js';
-import { AgentExecutor } from './agentExecutor.js';
-import { AIProviderFactory } from '../ai/provider.js';
-import { StreamingProvider } from '../types/language-model.js';
+import { scanProjectDirectory } from '../../tools/fileScanner.js';
+import { DetectedStack, FileNode } from '../../types.js';
+import { toolRegistry } from '../../core/tool-invocation-registry.js';
+import { ToolContext } from '../../types/tool.js';
+import { AgentExecutor } from '../core/agentExecutor.js';
+import { AIProviderFactory } from '../../ai/provider.js';
+import { StreamingProvider } from '../../types/language-model.js';
+import {
+  GET_WORKSPACE_DIRECTORY_STRUCTURE_FUNCTION_ID,
+  GET_WORKSPACE_FILE_LIST_FUNCTION_ID,
+} from '../../common/workspace-functions.js';
 import {
   SCANNER_SYSTEM_PROMPT,
   buildScannerUserPrompt,
-} from '../prompts/scanner-prompt.js';
+} from '../../prompts/scanner-prompt.js';
 import {
   SCANNER_AGENT,
-} from './agent-definitions.js';
+} from '../core/agent-definitions.js';
 
 // ── Scanner Agent Configuration ───────────────────────────────────────────────
 // Max tool-call turns for the scanner agent.

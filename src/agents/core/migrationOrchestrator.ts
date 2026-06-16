@@ -1,17 +1,22 @@
-import { AIProviderFactory } from '../ai/provider.js';
-import { SessionManager } from '../session/sessionManager.js';
-import { EventBroadcaster } from '../routes/stream.js';
-import { TaskContextManager } from '../session/taskContext.js';
-import { PlannerAgent } from './planner-agent.js';
-import { ShellExecutor } from '../tools/shellExecutor.js';
-import { writeSessionFile } from '../tools/fileWriter.js';
-import { scanProjectDirectory } from '../tools/fileScanner.js';
-import { DetectedStack, TargetStack, MigrationStatus } from '../types.js';
-import { resolveApiKey, resolveModelAlias } from '../ai/index.js';
+import { SessionManager } from '../../session/sessionManager.js';
+import { EventBroadcaster } from '../../routes/stream.js';
+import { TaskContextManager } from '../../session/taskContext.js';
+import { PlannerAgent } from '../stage1/planner-agent.js';
+import { ShellExecutor } from '../../tools/shellExecutor.js';
+import { writeSessionFile } from '../../tools/fileWriter.js';
+import { scanProjectDirectory } from '../../tools/fileScanner.js';
+import { DetectedStack, TargetStack, MigrationStatus } from '../../types.js';
+import { resolveApiKey, resolveModelAlias } from '../../ai/index.js';
 
 export class MigrationOrchestrator {
-  private static pausedSessions: Set<string> = new Set();
+  private static pausedSessions:  Set<string> = new Set();
   private static stoppedSessions: Set<string> = new Set();
+
+  // ── Mutex guard: prevents two concurrent pipelines on the same session ────
+  // SNS IDE equivalent: TaskManager ensures one task runs per workspace at a time.
+  // Without this guard, double-clicking "Start" corrupts FILE_INDEX (two agents
+  // both write edit_task_context simultaneously → one overwrites the other's work).
+  private static activeSessions:  Set<string> = new Set();
 
   /**
    * Request session execution stop
@@ -19,6 +24,7 @@ export class MigrationOrchestrator {
   static stopSession(sessionId: string) {
     this.stoppedSessions.add(sessionId);
     this.pausedSessions.delete(sessionId);
+    this.activeSessions.delete(sessionId);  // release mutex so user can restart cleanly
     ShellExecutor.kill(sessionId);
   }
 
@@ -41,6 +47,14 @@ export class MigrationOrchestrator {
     apiKeys?: any,
     agentsConfig?: any
   ): Promise<void> {
+    // ── Double-start guard ────────────────────────────────────────────────
+    // If a pipeline is already running for this session, do NOT start another.
+    // This prevents FILE_INDEX corruption from two concurrent agent instances.
+    if (this.activeSessions.has(sessionId)) {
+      console.warn(`[MigrationOrchestrator] Session ${sessionId} is already running. Ignoring duplicate startMigration call.`);
+      return;
+    }
+
     // Reset control flags
     this.pausedSessions.delete(sessionId);
     this.stoppedSessions.delete(sessionId);
@@ -48,8 +62,20 @@ export class MigrationOrchestrator {
     const session = await SessionManager.getSession(sessionId);
     if (!session) return;
 
-    // Initialize/reset task context memory — phase must start at 'discovery'
-    await TaskContextManager.saveContext(sessionId, { active_phase: 'discovery' });
+    // Initialize task context ONLY for fresh sessions.
+    // If active_phase already exists, this is a RESUME — preserve all existing state
+    // (TOTAL_FILES, FILE_INDEX, LAST_FILE_ANALYZED, graph data, etc.).
+    // Overwriting on resume would force the pipeline to restart from scratch,
+    // wasting all LLM tokens already spent on the previous run.
+    const existingCtx = await TaskContextManager.getContext(sessionId);
+    const isResume    = !!existingCtx.active_phase && existingCtx.active_phase !== 'complete';
+    if (!isResume) {
+      // Fresh start — initialize task context
+      await TaskContextManager.saveContext(sessionId, { active_phase: 'discovery' });
+    } else {
+      // Resume — log which phase we are resuming from
+      console.log(`[MigrationOrchestrator] Resuming session ${sessionId} from phase "${existingCtx.active_phase}".`);
+    }
 
     // Save target stack configuration to session
     await SessionManager.updateSession(sessionId, {
@@ -60,14 +86,20 @@ export class MigrationOrchestrator {
       agentsConfig,
     });
 
+    // Mark session as active — mutex lock acquired
+    this.activeSessions.add(sessionId);
+
     // Run background sequence
     this.runPipeline(sessionId).catch(async (err) => {
       console.error(`Pipeline error in session ${sessionId}:`, err);
-      
+
       await SessionManager.updateSession(sessionId, { status: 'error', error: err.message });
       await SessionManager.addLog(sessionId, `Pipeline failed: ${err.message}`, 'error');
-      
+
       EventBroadcaster.broadcast(sessionId, 'error', { message: err.message });
+    }).finally(() => {
+      // ── Release mutex lock — session is no longer active ─────────────────
+      this.activeSessions.delete(sessionId);
     });
   }
 
@@ -77,6 +109,8 @@ export class MigrationOrchestrator {
       throw new Error('Session is missing configuration properties.');
     }
 
+    // Only need apiKey to validate it exists — PlannerAgent resolves its own
+    // streaming provider from session config via resolveStreamingProvider()
     const resolvedModel = resolveModelAlias(session.targetStack.model, (session as any).aliasesConfig ?? {});
     const apiKey = resolveApiKey(
       session.targetStack.provider,
@@ -86,16 +120,10 @@ export class MigrationOrchestrator {
     if (!apiKey) {
       throw new Error(`API key for provider "${session.targetStack.provider}" could not be resolved.`);
     }
+    // Suppress unused-var — kept for future Stage 2+ orchestration
+    void resolvedModel;
 
-    const ai = AIProviderFactory.getService(
-      session.targetStack.provider,
-      resolvedModel,
-      apiKey
-    );
-
-    const targetModel = session.targetStack.model;
-
-    // Helpers to check agent configuration dynamically.
+    // ── Agent enable/disable check (from agentsConfig sent by UI) ─────────────
     // agentsConfig can arrive as:
     //   { "agent-id": { enabled, selectedModel } }  ← object from localStorage
     //   [{ id, enabled, selectedModel }]             ← array (future format)
@@ -104,7 +132,6 @@ export class MigrationOrchestrator {
       if (Array.isArray(session.agentsConfig)) {
         return session.agentsConfig.find((a: any) => a.id === agentId);
       }
-      // Plain object keyed by agent ID
       return (session.agentsConfig as Record<string, any>)[agentId];
     };
 
@@ -112,62 +139,6 @@ export class MigrationOrchestrator {
       const agent = resolveAgent(agentId);
       if (agent === undefined) return true; // not in config → enabled by default
       return agent.enabled !== false;
-    };
-
-    const wrapAiService = (aiService: any, agentId: string, modelName: string): any => {
-      const wrapper = Object.create(aiService);
-      wrapper.generateCompletion = async (
-        prompt: any,
-        systemPrompt?: string,
-        tools?: any[]
-      ) => {
-        const response = await aiService.generateCompletion(prompt, systemPrompt, tools);
-        if (response.usage) {
-          await SessionManager.recordTokenUsage(
-            sessionId,
-            response.usage.promptTokens,
-            response.usage.completionTokens,
-            modelName,
-            agentId,
-            response.usage.cachedInputTokens,
-            response.usage.readCachedInputTokens
-          );
-        }
-        return response;
-      };
-      return wrapper;
-    };
-
-    const getAgentService = (agentId: string, defaultAi: any): any => {
-      const agent = resolveAgent(agentId);
-      if (!agent || !agent.selectedModel) {
-        return wrapAiService(defaultAi, agentId, targetModel);
-      }
-
-      // ── Alias resolution: 'alias:reasoning-model' → look up in session.aliasesConfig
-      const resolvedAgentModel = resolveModelAlias(agent.selectedModel, (session as any).aliasesConfig ?? {});
-
-      const parts = resolvedAgentModel.split('/');
-      if (parts.length < 2) {
-        return wrapAiService(defaultAi, agentId, targetModel);
-      }
-
-      const provider = parts[0].toLowerCase();
-      const model = parts.slice(1).join('/');
-
-      const key = resolveApiKey(
-        provider,
-        session.apiKey || '',
-        session.apiKeys
-      );
-
-      try {
-        const service = AIProviderFactory.getService(provider, model, key || 'dummy_key');
-        return wrapAiService(service, agentId, resolvedAgentModel);
-      } catch (err) {
-        console.error(`Failed to get service for agent ${agentId}:`, err);
-        return wrapAiService(defaultAi, agentId, targetModel);
-      }
     };
 
 
@@ -232,38 +203,38 @@ export class MigrationOrchestrator {
     // Mark scan as done
     await updatePhase('scan', 'done');
 
-    // ── Phase 2: Generate Plan ───────────────────────────────────────────
-    let planPhase = session.phases.find(p => p.id === 'plan');
-    if (planPhase && planPhase.status !== 'done') {
-      if (await checkCancellation()) return;
-      await updatePhase('plan', 'active');
-      if (isAgentEnabled('planner-agent')) {
-        const agentAi = getAgentService('planner-agent', ai);
-        await PlannerAgent.run(
-          sessionId,
-          legacyPath,
-          modernPath,
-          session.detectedStack,
-          session.targetStack,
-          agentAi,
-          async (msg, lvl) => log(msg, lvl ?? 'info', 'plan'),
-          (percent, currentFile) => {
-            EventBroadcaster.broadcast(sessionId, 'progress', { percent, currentFile: currentFile ?? '' });
-          }
-        );
-      } else {
-        await log('Skipping Phase 1: Analysis Agent is disabled in settings.', 'warning', 'plan');
-        await writeSessionFile(modernPath, 'Stage1_Analysis.md', '# Legacy Codebase Analysis\n\nSkipped by user settings.');
+    // ── Stage 1: Run all 5 sub-phases via PlannerAgent ──────────────────────
+    if (isAgentEnabled('planner-agent')) {
+      await updatePhase('discovery', 'active');
+      // PlannerAgent resolves its own streaming provider from session config.
+      // Pass null as the deprecated _aiServiceLegacy param.
+      await PlannerAgent.run(
+        sessionId,
+        legacyPath,
+        modernPath,
+        session.detectedStack,
+        session.targetStack,
+        null,  // _aiServiceLegacy — deprecated, ignored by PlannerAgent
+        async (msg, lvl) => log(msg, lvl ?? 'info', 'stage1'),
+        (percent, currentFile) => {
+          EventBroadcaster.broadcast(sessionId, 'progress', { percent, currentFile: currentFile ?? '' });
+        },
+        updatePhase   // ← pass updatePhase so PlannerAgent can broadcast sub-phase transitions
+      );
+    } else {
+      await log('Skipping Stage 1: Analysis Agent is disabled in settings.', 'warning', 'stage1');
+      await writeSessionFile(modernPath, 'Stage1_Analysis.md', '# Legacy Codebase Analysis\n\nSkipped by user settings.');
+      // Mark all sub-phases done if skipped
+      for (const id of ['discovery', 'file-analysis', 'graph-resolution', 'section-writing', 'assembly']) {
+        await updatePhase(id, 'done');
       }
-      await updatePhase('plan', 'done');
-      
-      // Pause pipeline here — let the user review Stage1_Analysis.md before next stage
-      await log('[Pipeline] Stage 1 Analysis complete. Review Stage1_Analysis.md in the output workspace.', 'success', 'plan');
-      
-      // Clear API keys on complete for security
-      await SessionManager.updateSession(sessionId, { status: 'complete', apiKey: undefined, apiKeys: undefined });
-      EventBroadcaster.broadcast(sessionId, 'complete', { success: true });
-      return;
     }
+
+    // Pause pipeline here — let the user review Stage1_Analysis.md before next stage
+    await log('[Pipeline] Stage 1 Analysis complete. Review Stage1_Analysis.md in the output workspace.', 'success', 'stage1');
+
+    // Clear API keys on complete for security
+    await SessionManager.updateSession(sessionId, { status: 'complete', apiKey: undefined, apiKeys: undefined });
+    EventBroadcaster.broadcast(sessionId, 'complete', { success: true });
   }
 }

@@ -97,8 +97,9 @@ export interface SSEEvent {
     | 'heartbeat'
     | 'token_usage'    // Real token counts broadcast from AgentExecutor
     | 'todo_update'    // Per-file progress from todoWrite tool
-    | 'tool_call'      // Structured tool start event — FE sets activeTool state
-    | 'tool_response'; // Structured tool done event  — FE clears activeTool state
+    | 'tool_call'          // Structured tool start event — FE sets activeTool state
+    | 'tool_response'      // Structured tool done event  — FE clears activeTool state
+    | 'file_tree_changed'; // @parcel/watcher detected new/changed/deleted file in modernPath
   data: any;
   timestamp: string;
 }

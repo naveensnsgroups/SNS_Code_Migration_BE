@@ -25,6 +25,17 @@ export interface SectionConfig {
   needsDepsTree?: boolean;         // call getDependencyTree
   specificInstructions: string;    // WHAT to write in this section
   crossRefNote?: string;           // what NOT to repeat (refers to other sections)
+
+  // ── Industry-standard per-section validation ─────────────────────────────
+  // emptyGraphIsValid: true  → "No X found." is a correct complete answer
+  //                            (don't retry, don't mark as failed)
+  // emptyGraphIsValid: false → empty graph means the graph writer MISSED something;
+  //                            retry is warranted
+  emptyGraphIsValid: boolean;
+
+  // minContentBytes: minimum file size considered a complete section.
+  // Replaces the global 500-byte guess with a per-section calibrated threshold.
+  minContentBytes: number;
 }
 
 // ── All 26 Section Configurations ────────────────────────────────────────────
@@ -35,14 +46,21 @@ export const SECTION_CONFIG: SectionConfig[] = [
     name: 'Project Identity',
     graph: null,
     ctxKeys: ['lang-profiles', 'TOTAL_FILES', 'PRIMARY_LANGUAGE', 'MONOREPO', 'MONOREPO_TYPE', 'RUNTIME_VERSIONS'],
+    emptyGraphIsValid: true,    // no graph — reads context keys directly
+    minContentBytes: 300,
     specificInstructions: `Load lang-profiles and inline task context keys.
 Write a comprehensive project identity section including:
-  - Project name and version (from package.json / manifest)
+  - Project name and version
+    (from whichever manifest exists: package.json / composer.json / pyproject.toml /
+    go.mod / pom.xml / build.gradle / Cargo.toml / Gemfile / *.csproj — do NOT assume Node.js)
   - Primary programming language and version
   - Framework and framework version
-  - Architecture type (REST API, GraphQL, MVC, CLI, Worker, etc.)
-  - Entry point file (main file, index, app.ts, etc.)
-  - Package manager (npm, yarn, pip, cargo, maven, etc.)
+  - Architecture type (REST API, GraphQL, MVC, CLI, Worker, Library, etc.)
+  - Entry point file (main file, index, app, cmd/main.go, src/main.rs — whatever the project uses)
+  - Package manager:
+    Node.js → npm / yarn / pnpm | Python → pip / poetry / uv / conda |
+    PHP → composer | Rust → cargo | Java/Kotlin → maven / gradle |
+    Go → go mod | Ruby → bundler | .NET → nuget | C/C++ → conan / vcpkg / cmake
   - Repository type (monorepo / single project)
   - Total source files (TOTAL_FILES from context)
   - Estimated total lines of code (sum of estimatedLines from file-index)
@@ -53,16 +71,26 @@ Write a comprehensive project identity section including:
     n: 2,
     name: 'Architecture Overview',
     graph: 'architecture',
+    emptyGraphIsValid: false,   // architecture graph always populated by resolver
+    minContentBytes: 500,
     specificInstructions: `Call read-knowledge-graph("architecture").
-Use the synthesized_overview key which was built by the Graph Resolver from ALL graphs.
+
+PRIMARY DATA SOURCE: Look for the "synthesized_overview" key in the architecture graph.
+  This was built by the Graph Resolver from ALL graphs combined.
+
+FALLBACK (if synthesized_overview is missing or empty — resolver may have hit context limit):
+  Read entity-graph, api-graph, symbol-graph, and middleware-graph directly.
+  Build the architecture overview from those raw graphs instead.
+  Add this note at top: "> ℹ️ synthesized_overview was not generated — rebuilt from raw graphs."
+
 Write a complete architecture overview including:
   - System type and overall pattern
-  - All layers (HTTP/Controller/Service/Repository/Data) with their files and responsibilities
+  - All layers (Controller/Service/Repository/Data or equivalent for this language) with files
   - ALL modules/domains found (one paragraph per module with entities and endpoints)
   - Cross-module dependency map (which module depends on which)
-  - Communication protocol (REST/GraphQL/gRPC/WebSocket/Event-Driven)
-  - Design patterns observed (Repository, DI, MVC, CQRS, Factory, etc.)
-  - Global middleware pipeline (ordered list from synthesized_overview.globalMiddlewarePipeline)
+  - Communication protocol (REST/GraphQL/gRPC/WebSocket/Event-Driven/CLI/Queue)
+  - Design patterns observed (Repository, DI, MVC, CQRS, Factory, Active Record, etc.)
+  - Global middleware/interceptor pipeline (ordered, from synthesized_overview or middleware-graph)
   - Frontend/Backend split (if frontend exists)
   - Technology decisions and WHY (infer from patterns)
   - Total counts: entities, endpoints, modules, callable units`,
@@ -73,24 +101,28 @@ Write a complete architecture overview including:
     graph: null,
     ctxKeys: ['file-index', 'FILE_INDEX_KEY'],
     needsDirStructure: true,
+    emptyGraphIsValid: true,    // reads dir structure directly — always has output
+    minContentBytes: 400,
     specificInstructions: `Call getWorkspaceDirectoryStructure to get the full tree.
 Load file-index from task context (key from FILE_INDEX_KEY) to get file roles.
 Write a COMPLETE annotated directory tree:
   - Show every folder and file
   - Annotate each significant folder with its purpose (derived from file roles in file-index)
   - Use tree format with purpose annotations on the right:
-    src/
-      controllers/         ← HTTP request handlers — receives req, validates, calls service
-        UserController.ts  ← User CRUD operations (createUser, getUser, updateUser, deleteUser)
-      services/            ← Business logic layer — orchestrates repositories and rules
-  - Highlight: entry point files, schema files, config files, test directories
-  - Note any unusual structure patterns (nested monorepo, shared utilities, etc.)`,
+    <source-root>/
+      <folder-name>/         ← <what this folder contains and why>
+        <filename>.<ext>     ← <what this specific file does>
+      <folder-name>/         ← <what this folder contains and why>
+  - Annotate based on ACTUAL file roles found in the file-index (do NOT invent folder names)
+  - Highlight: entry points, schema/model files, config files, test directories`,
   },
   {
     n: 4,
     name: 'File Classification',
     graph: null,
     ctxKeys: ['file-index', 'FILE_INDEX_KEY'],
+    emptyGraphIsValid: true,    // reads file-index — always has output if files scanned
+    minContentBytes: 400,
     specificInstructions: `Load file-index from task context (key from FILE_INDEX_KEY).
 Write a complete table with ONE ROW per source file:
   | File Path | Role | Layer | Side | Est. Lines | Complexity |
@@ -109,6 +141,8 @@ After the table: summary statistics (count per role, count per complexity tier).
     n: 5,
     name: 'Domain Models',
     graph: 'entity',
+    emptyGraphIsValid: false,   // entity graph empty = resolver missed ORM/schema parsing
+    minContentBytes: 400,
     specificInstructions: `Call read-knowledge-graph("entity").
 For EVERY entity in the graph, write a complete entity specification:
 
@@ -118,11 +152,11 @@ For EVERY entity in the graph, write a complete entity specification:
   - **Fields**:
     | Field | Type | PK | FK | Nullable | Unique | Default | Length | Generated | Index | Enum Values | Constraint |
     |:------|:-----|:---|:---|:---------|:-------|:--------|:-------|:----------|:------|:------------|:-----------|
-    - Include EVERY field \u2014 never truncate
-    - Length: show for VARCHAR/CHAR/TEXT (e.g. "255")
-    - Precision/Scale: show for DECIMAL/NUMERIC (e.g. "10,2")
-    - Enum Values: list ALL valid values for ENUM fields (e.g. "ACTIVE | INACTIVE | PENDING")
-    - Constraint: show check_constraint expression if present (e.g. "age > 0")
+    - Include EVERY field — never truncate
+    - Length: show for VARCHAR/CHAR/TEXT
+    - Precision/Scale: show for DECIMAL/NUMERIC
+    - Enum Values: list ALL valid values for ENUM fields (copy exactly from the schema — do NOT invent values)
+    - Constraint: show the exact CHECK expression from the schema (copy it literally)
     - Generated: mark Y for AUTO_INCREMENT / SERIAL / @Generated fields
     - Column comment: add below the table row if the comment field is present
   - **Relationships**: (all from relations array)
@@ -136,6 +170,12 @@ For EVERY entity in the graph, write a complete entity specification:
   - **Named Constraints**: all items from constraints[] array
   - **Enums**: all enum fields with all valid values (from enums{} object)
 
+RAW SQL / NO-ORM HANDLING:
+  If an entity has no fields[] (project uses raw SQL without ORM, or C structs, or PHP arrays):
+  → Write what IS available: table name, operations observed, files where it appears.
+  → Add note: "> ⚠️ Raw SQL / no ORM detected — field-level schema not available from static analysis."
+  → Do NOT invent field names. Write only what was explicitly found in the code.
+
 Include ALL entities. Do NOT truncate any field list.
 Write enum values as: status: ACTIVE | INACTIVE | PENDING | DELETED`,
   },
@@ -146,103 +186,134 @@ Write enum values as: status: ACTIVE | INACTIVE | PENDING | DELETED`,
     graph: null,
     ctxKeys: ['dep-raw', 'DEP_RAW_KEY'],
     needsDepsTree: true,
+    emptyGraphIsValid: true,    // no deps is valid for C/C++ or script projects
+    minContentBytes: 150,
     specificInstructions: `Call getDependencyTree to get full dependency list.
 Also load dep-raw from task context if available.
 For every dependency found, write a complete table:
   | Package | Version | Category | Purpose | Migration Status |
   |:--------|:--------|:---------|:--------|:----------------|
-  
-  Category: HTTP Framework / Database ORM / Authentication / Validation / 
+
+  Category: HTTP Framework / Database ORM / Authentication / Validation /
              Testing / Logging / Queue / Cache / File / Utility / DevDependency
   Purpose: one sentence describing what this package does in the project
-  Migration Status: 
-    ✅ Safe (well-maintained, has modern equivalent, no breaking API changes)
-    ⚠️ Deprecated (still works but should be replaced — explain why)
-    🔴 Breaking (requires significant migration effort — explain the challenge)
+  Migration Status:
+    ✅ Safe     — well-maintained, has modern equivalent, no breaking API changes
+    ⚠️ Caution — still works but has concerns (deprecated API, security issues, slow updates)
+    🔴 Breaking — requires significant migration effort (explain the specific challenge)
+    ⚪ Unknown  — package from an ecosystem you cannot assess with certainty
+                  (use this for obscure PHP/Java/Ruby/Go packages rather than guessing)
 
-Include ALL packages. After table: list any MIGRATION_GAPSs (packages with no modern equivalent).
+  IMPORTANT: Only assign ✅/⚠️/🔴 if you are certain about this package's status.
+  For packages you do not recognize or cannot assess: always use ⚪ Unknown.
+  Never guess or fabricate migration difficulty for unfamiliar libraries.
+
+Include ALL packages. After table: list any packages with ⚪ Unknown status — flag for manual research.
 Group by Category for readability.`,
   },
   {
     n: 7,
     name: 'Functions Master Catalog',
     graph: 'symbol',
+    emptyGraphIsValid: false,   // symbol graph empty = resolver missed function extraction
+    minContentBytes: 500,
     specificInstructions: `Call read-knowledge-graph("symbol").
-Write a COMPLETE table of ALL functions/methods/handlers in the codebase:
-  | Function | File | Signature | Return Type | Async | Side Effects | Purpose | Called By | Calls |
-  |:---------|:-----|:----------|:------------|:------|:-------------|:--------|:----------|:------|
+Write a COMPLETE catalog of ALL callable units in the codebase.
+
+LANGUAGE NOTE: "Callable unit" means the language-appropriate concept:
+  TypeScript/JavaScript → functions, methods, arrow functions, class methods
+  Python  → functions (def), class methods, async def
+  PHP     → functions, class methods, static methods
+  Java/Kotlin → methods, static methods, constructors
+  Go      → functions, methods on structs
+  Rust    → fn, impl methods, trait implementations
+  C/C++   → functions, member functions
+  Ruby    → def methods, class methods
+  C#      → methods, async Task methods
+  Use the correct terminology for what was actually found.
+
+Table format (one row per callable unit):
+  | Name | File | Signature | Return Type | Async | Side Effects | Purpose | Called By | Calls |
+  |:-----|:-----|:----------|:------------|:------|:-------------|:--------|:----------|:------|
 
 Rules:
   - Include EVERY entry in symbol-graph — no cap, no truncation
-  - Signature: use the full signature string from the graph (e.g. "(userId: string): Promise<User>")
-  - Side Effects: list each one (DB write, event emit, HTTP call, etc.) from sideEffects[] in the graph
-  - Called By: list up to 5 callers (use "..." if more); use "none" for public entry points
-  - Calls: list up to 5 callees with file paths in "funcName:file" format (use "..." if more)
-  - Sort by: Entry Points first (no callers), then Services, then Repositories, then Helpers
-  - Group by file path for readability with a ### heading per file
+  - Signature: exact signature from graph (params + types in language-native format)
+  - Side Effects: from sideEffects[] (DB write / event emit / HTTP call / file I/O / none)
+  - Called By: up to 5 callers ("..." if more); "none" for public entry points
+  - Calls: up to 5 callees as "name:file" format
+  - Sort: Entry Points first → Services → Repositories → Helpers
+  - Group by file path with ### heading per file
 
 After the table:
-  - Summary: total function count, total async count, total with side effects
-  - Top 10 most-called functions (highest calledBy count)
-  - Entry points list (functions with no callers = public API surface)
+  - Summary: total count, total async/concurrent, total with side effects
+  - Top 10 most-called units (highest calledBy count)
+  - Entry points list (no callers = public API surface)
 
-NOTE: Do NOT write pseudocode or behavior descriptions here — that is Section 8.`,
+NOTE: Do NOT write pseudocode or behavior here — that is Section 8.`,
     crossRefNote: 'Do NOT write function pseudocode/behavior here — that is Section 8.',
   },
   {
     n: 8,
     name: 'Function Behaviors',
     graph: 'symbol',
+    emptyGraphIsValid: false,
+    minContentBytes: 500,
     specificInstructions: `Call read-knowledge-graph("symbol").
-Write detailed behavioral specifications for ALL functions. Use TWO tiers:
+Write detailed behavioral specifications for ALL callable units. Use TWO tiers:
+
+LANGUAGE NOTE: Use language-appropriate terminology throughout:
+  "function" (Python/Go/C/Rust/PHP) | "method" (Java/C#/Ruby) | "handler" (HTTP frameworks)
+  Write signatures in the language's native style (def, func, fn, public void, etc.)
 
 TIER 1 — FULL PSEUDOCODE SPECIFICATION:
-Applies to: all exported functions, route handlers, service methods, repository methods.
-For each TIER 1 function, write:
+Applies to: all exported/public callables, route handlers, service methods, repository methods.
+For each TIER 1 callable, write:
 
-### functionName (file: path/to/file.ts)
+### callableName (file: path/to/file)
 **Signature**: exact signature from the graph
 **Input**: param1: Type, param2: Type  (with descriptions of what each param means)
 **Output**: ReturnType  (describe what the return value represents)
-**Side Effects**: list from sideEffects[] field in the graph (DB write / event emit / HTTP call / none)
+**Side Effects**: from sideEffects[] (DB write / event emit / HTTP call / file I/O / none)
 
-**Pseudocode** (from the pseudocode field in the graph — write it exactly as numbered steps):
+**Pseudocode** (from the pseudocode field in the graph — write as numbered steps):
 \`\`\`
 1. [step from pseudocode field]
 2. [step from pseudocode field]
 ...
 \`\`\`
-If the pseudocode field is empty or missing for a function, reconstruct it by reading
-the function's calls[] list and sideEffects[] to infer the steps. Never leave it blank.
+If the pseudocode field is empty or missing: reconstruct from calls[] and sideEffects[].
+Never leave pseudocode blank — even 2-3 steps is better than nothing.
 
 **Error scenarios**:
-  List every error case from the pseudocode steps:
-  - If [condition]: throw [ErrorType]("[message]") → HTTP [status] (if applicable)
+  - If [condition]: throw/raise [ErrorType] → HTTP [status] (if applicable) or process exit
   - If [condition]: return [default] or log warning
 
-**Called by**: list from calledBy[] in the graph
-**Calls**: list from calls[] in the graph
+**Called by**: list from calledBy[]
+**Calls**: list from calls[]
 
 ---
 
 TIER 2 — ONE-LINER TABLE:
-Applies to: private helper functions, internal utilities, pure transformation functions.
-| Function | File | Behavior Summary | Calls | Side Effects |
-(one concise line per function describing what it does)
+Applies to: private/internal helpers, pure utilities, simple transformations.
+| Name | File | Behavior Summary | Calls | Side Effects |
+(one concise line per callable)
 
-Tier classification rule:
-  TIER 1 if: function is exported, OR is a route handler, OR has any sideEffects, OR has business logic
-  TIER 2 if: purely internal private helper with no side effects and no business logic
+Tier rule:
+  TIER 1 if: exported/public, OR route handler, OR has sideEffects, OR has business logic
+  TIER 2 if: purely internal, no side effects, no business logic
 
-Write ALL functions from the graph — no function may be skipped entirely.
+Write ALL callables from the graph — none may be skipped entirely.
 
-NOTE: Do NOT write the function catalog table — that is Section 7. Start directly with behaviors.`,
+NOTE: Do NOT write the catalog table — that is Section 7. Start directly with behaviors.`,
     crossRefNote: 'Do NOT write the function table — that is Section 7.',
   },
   {
     n: 9,
     name: 'Business Rules',
     graph: 'rule',
+    emptyGraphIsValid: true,    // many projects have no explicit rule registry — valid
+    minContentBytes: 120,
     specificInstructions: `Call read-knowledge-graph("rule").
 Write ALL business rules found across ALL domains EXCEPT the "validation" domain
 (validation rules are documented separately in Section 18).
@@ -263,35 +334,50 @@ Do NOT use generic descriptions — write the ACTUAL business rule found in the 
     n: 10,
     name: 'API Contracts',
     graph: 'api',
+    emptyGraphIsValid: true,    // CLI tools, workers, scripts have no API — valid
+    minContentBytes: 120,
     specificInstructions: `Call read-knowledge-graph("api").
-For EVERY endpoint in api-graph, write a complete API contract:
 
-### METHOD /path
-  - **Handler**: function name → file path
-  - **Auth**: resolved auth requirement (JWT Bearer / API Key / None / etc.)
+IMPORTANT — The api-graph key format reveals the invocation type. Handle each type correctly:
+
+  "GET /path" / "POST /path" etc. → HTTP REST endpoint
+  "query:operationName" / "mutation:operationName" → GraphQL operation
+  "command:name" / "cli:name" → CLI command
+  "consumer:topic" / "worker:queue" → Queue/message consumer
+  "rpc:Service.Method" / "grpc:..." → gRPC / RPC method
+  "CLIENT GET /path" / "CLIENT POST /path" → Frontend API call (document separately)
+  "schedule:name" / "cron:name" → Scheduled trigger (cross-ref with Section 25)
+
+For EACH entry in api-graph, write the appropriate contract:
+
+### [Key from graph — e.g. "POST /users" or "mutation:createUser" or "command:deploy"]
+  - **Type**: HTTP REST / GraphQL / CLI / Queue Consumer / gRPC / Frontend Call
+  - **Handler**: callable name → file path
+  - **Auth**: resolved auth requirement (JWT / API Key / Session / None / IAM / etc.)
   - **Rate Limit**: if any
-  - **Middleware Chain**: ordered list (from middlewareChain array)
-  - **Request**:
-    - Headers: (required headers)
-    - Path Params: (if any)
-    - Query Params: (if any)
-    - Body: (full schema with field names, types, required/optional)
-  - **Responses**:
-    - 200/201: success response schema
-    - 400: validation error format
-    - 401: unauthorized format
-    - 403: forbidden format
-    - 404: not found format
-    - 500: server error format
-  - **Files involved**: all files in the request chain
+  - **Middleware/Interceptor Chain**: ordered list (from middlewareChain[])
+  - **Input**:
+    - For HTTP: Headers / Path Params / Query Params / Body schema
+    - For CLI: positional args / flags / options
+    - For Queue: message payload schema
+    - For GraphQL: variables schema
+  - **Output/Responses**:
+    - Success: response shape
+    - Validation error: error format
+    - Auth error: 401/403 format (HTTP) or equivalent
+    - Not found: 404 or equivalent
+    - Server error: 500 or equivalent
+  - **Files involved**: all files in the request/processing chain
 
-Include ALL endpoints. Group by resource/domain for readability.
-After all contracts: API Summary Table (Method | Path | Auth | Handler | Status).`,
+Group by resource/domain for readability.
+After all contracts: Summary Table (Type | Identifier | Auth | Handler | File).`,
   },
   {
     n: 11,
     name: 'Security & Permissions',
     graph: 'security',
+    emptyGraphIsValid: true,    // script/CLI projects may have no auth layer
+    minContentBytes: 150,
     specificInstructions: `Call read-knowledge-graph("security").
 Write a complete security documentation:
 
@@ -322,6 +408,8 @@ Write a complete security documentation:
     n: 12,
     name: 'Middleware Execution Order',
     graph: 'middleware',
+    emptyGraphIsValid: true,    // non-HTTP projects have no middleware
+    minContentBytes: 120,
     specificInstructions: `Call read-knowledge-graph("middleware").
 Write the complete middleware documentation:
 
@@ -351,6 +439,8 @@ Write the complete middleware documentation:
     n: 13,
     name: 'Database Operations',
     graph: 'db',
+    emptyGraphIsValid: true,    // projects without DB (pure API clients, CLIs) valid
+    minContentBytes: 150,
     specificInstructions: `Call read-knowledge-graph("db").
 For EVERY table in db-graph, write all database operations:
 
@@ -358,13 +448,17 @@ For EVERY table in db-graph, write all database operations:
   **Model file**: path
   **Repository file**: path
 
-  **Operations**:
-  | Type | Fields | Condition | Called From (function → file) |
-  |:-----|:-------|:----------|:------------------------------|
-  | SELECT | field1, field2 | WHERE id = ? | findById → UserRepository.ts:45 |
-  | INSERT | field1, field2, field3 | — | create → UserRepository.ts:67 |
-  | UPDATE | field1, field2 | WHERE id = ? | update → UserRepository.ts:89 |
-  | DELETE | — | WHERE id = ? | softDelete → UserRepository.ts:110 |
+  **Operations** — write one row per operation found in the db-graph:
+  | Type   | Fields                           | Condition                    | Called From                               |
+  |:-------|:---------------------------------|:-----------------------------|:------------------------------------------|
+  | SELECT | <field1>, <field2>, ...        | WHERE <column> = <value>    | <functionName> → <repositoryFile>:<line>  |
+  | INSERT | <field1>, <field2>, <field3>   | —                            | <functionName> → <repositoryFile>:<line>  |
+  | UPDATE | <field1>, <field2>             | WHERE <column> = <value>    | <functionName> → <repositoryFile>:<line>  |
+  | DELETE | <pkField>                      | WHERE <column> = <value>    | <functionName> → <repositoryFile>:<line>  |
+  | UPSERT | <field1>, <field2>             | ON CONFLICT <key>            | <functionName> → <repositoryFile>:<line>  |
+
+  Write the ACTUAL values from the db-graph. Never copy the angle-bracket placeholders.
+  Use exact function names, file paths, and conditions from the graph.
 
 Include ALL operations for ALL tables.
 Group by table. Sort: SELECT → INSERT → UPDATE → DELETE.
@@ -376,14 +470,16 @@ NOTE: Do NOT write transaction boundaries — those are in Section 22.`,
     n: 14,
     name: 'Cross-Module Call Flows',
     graph: 'call-flow',
+    emptyGraphIsValid: false,   // resolver always builds at least 1 call flow
+    minContentBytes: 300,
     specificInstructions: `Call read-knowledge-graph("call-flow").
 Write the complete execution trace for EACH call flow in the graph.
 The Graph Resolver built these flows by tracing 5-10 key endpoints end-to-end.
 
 For each flow:
 
-### [Flow Name: e.g., "User Registration", "Product Order Creation"]
-**Entry Point**: METHOD /path
+### [Flow Name: name of the feature/use-case being traced — taken from the call-flow-graph key]
+**Entry Point**: invocation type and identifier (e.g. HTTP method+path, CLI command, queue topic)
 
 \`\`\`
 Step 1:  [layer] description → file:line
@@ -405,6 +501,8 @@ Write ALL flows from call-flow-graph. If only 5-10 flows exist, explain why thos
     n: 15,
     name: 'Data Transformations',
     graph: 'transform',
+    emptyGraphIsValid: true,    // many projects use direct mapping without DTOs
+    minContentBytes: 120,
     specificInstructions: `Call read-knowledge-graph("transform").
 For EVERY transformation in the graph, write:
 
@@ -433,6 +531,8 @@ Include ALL transformations. If graph is empty: write "No explicit transformatio
     n: 16,
     name: 'Configuration & Environment',
     graph: 'config',
+    emptyGraphIsValid: true,    // hardcoded config projects exist
+    minContentBytes: 150,
     specificInstructions: `Call read-knowledge-graph("config").
 For EVERY configuration key in the graph:
 
@@ -463,6 +563,8 @@ Include ALL config keys. Do NOT redact or hide any key names (values are empty �
     n: 17,
     name: 'Error Handling Patterns',
     graph: 'error',
+    emptyGraphIsValid: true,    // some projects use bare throw/catch
+    minContentBytes: 150,
     specificInstructions: `Call read-knowledge-graph("error").
 Write complete error handling documentation:
 
@@ -492,6 +594,8 @@ Write complete error handling documentation:
     n: 18,
     name: 'Validation Rules',
     graph: 'rule',
+    emptyGraphIsValid: true,    // some projects do inline validation without a rule registry
+    minContentBytes: 120,
     specificInstructions: `Call read-knowledge-graph("rule").
 Write ONLY the rules from the "validation" domain.
 (Other business rules from other domains are in Section 9.)
@@ -520,6 +624,8 @@ Include EVERY validation rule found.`,
     n: 19,
     name: 'State Transitions',
     graph: 'state',
+    emptyGraphIsValid: true,    // stateless projects have no FSMs — valid complete answer
+    minContentBytes: 80,
     specificInstructions: `Call read-knowledge-graph("state").
 For EVERY stateful entity in state-graph, write a finite state machine specification:
 
@@ -533,13 +639,15 @@ For EVERY stateful entity in state-graph, write a finite state machine specifica
   | From State | To State | Trigger | Triggered By (function→file) | Side Effects |
   |:-----------|:---------|:--------|:-----------------------------|:-------------|
 
-  **State diagram (text)**:
+  **State diagram (text)** — format with ACTUAL states from the graph:
   \`\`\`
-  PENDING ──[approve]-→ ACTIVE ──[complete]-→ COMPLETED
-                 │                    │
-          [reject]↓             [cancel]↓
-               REJECTED           CANCELLED
+  <STATE_A> ──[<trigger-event>]→ <STATE_B> ──[<trigger-event>]→ <STATE_C>
+                 │                         │
+        [<reject-event>]↓           [<cancel-event>]↓
+              <STATE_D>                 <STATE_E>
   \`\`\`
+  Use the EXACT state names from the state-graph — do NOT assume PENDING/ACTIVE/COMPLETED/REJECTED.
+  Every project has different state names. Copy them exactly from the graph data.
 
   **Invalid transitions**: what happens if code tries to set an invalid state
   (error thrown? silently ignored? logged?)
@@ -551,31 +659,51 @@ Possible implicit states may exist — check entity status/type fields in Sectio
     n: 20,
     name: 'Async Processing Patterns',
     graph: 'async',
+    emptyGraphIsValid: true,    // sync/threaded projects (PHP, C, Java threads) have no async-graph
+    minContentBytes: 100,
     specificInstructions: `Call read-knowledge-graph("async").
-For EVERY async function in the async-graph:
+
+IF THE ASYNC GRAPH IS EMPTY:
+  This is valid for many project types. Determine which case applies:
+  - PHP (synchronous by default): write "PHP executes synchronously per-request. No async patterns."
+  - Java/C# with threads: write "Uses threading model (Thread/ThreadPool) rather than async/await."
+  - C/C++ with pthreads: write "Uses POSIX threads / platform threads rather than coroutines."
+  - Go goroutines: write "Uses goroutines and channels — not captured in async-graph schema."
+  - Ruby/Python with GIL: write "Uses threading with GIL — async patterns minimal."
+  - Purely synchronous script: write "Project is synchronous — no async processing detected."
+  → Do NOT retry or treat this as an error. An empty async-graph on a sync project is correct.
+
+IF THE ASYNC GRAPH HAS ENTRIES:
+For EVERY entry write:
 
 ### Summary Table
-  | Function | File | Pattern | Awaited Operations | Parallel Ops | Fire-and-Forget |
-  
-  Pattern types: sequential-await | Promise.all | Promise.allSettled | 
-                 event-driven | queue-based | callback | streaming
+  | Callable | File | Concurrency Pattern | Awaited/Blocked Operations | Parallel Ops | Fire-and-Forget |
 
-### Detailed Async Specifications (for complex functions)
-  **functionName** (file: path)
-  - Pattern: sequential-await / parallel / mixed
-  - Awaited calls (blocking): list what is awaited and WHY it must be sequential
-  - Parallel operations: what runs in Promise.all / concurrently
-  - Fire-and-forget: what is called without await (and risk if it fails)
-  - Error handling: try/catch coverage, unhandled rejection risk
+  Pattern types:
+    JS/TS: sequential-await | Promise.all | Promise.allSettled | event-driven
+    Python: asyncio.gather | asyncio.wait | async for | trio/anyio
+    Java: CompletableFuture | ExecutorService | reactive streams
+    Go: goroutines + channels | sync.WaitGroup | select
+    General: callback | streaming | queue-based | thread-pool
 
-### Async Risks
-  List any fire-and-forget operations that could lose errors silently.
-  List any missing await keywords detected (where async operations might not be awaited).`,
+### Detailed Async Specifications (for complex callables)
+  **callableName** (file: path)
+  - Pattern: (language-appropriate term)
+  - Blocking operations: what is awaited/blocked on and WHY it must be sequential
+  - Concurrent operations: what runs in parallel / concurrently
+  - Fire-and-forget: what is started without waiting (and risk if it fails)
+  - Error handling: try/catch or equivalent coverage, unhandled rejection/exception risk
+
+### Async/Concurrency Risks
+  Fire-and-forget operations that could lose errors silently.
+  Missing await/sync points where concurrent operations might not be properly joined.`,
   },
   {
     n: 21,
     name: 'Testing & Verification',
     graph: 'test',
+    emptyGraphIsValid: true,    // untested projects are valid (we document gaps)
+    minContentBytes: 80,
     specificInstructions: `Call read-knowledge-graph("test").
 Write complete test coverage documentation:
 
@@ -585,12 +713,12 @@ Write complete test coverage documentation:
   - Test runner command: (npm test / pytest / etc.)
   - Code coverage tool: (istanbul / nyc / coverage.py / etc.)
 
-### Test Files (one section per test file)
-  **path/to/test-file.spec.ts**
+### Test Files (one section per test file found in test-graph)
+  **path/to/test-file** (use the actual file path from the graph, with the project's actual extension)
   - Covers: what module/function it tests
   - Test cases: list ALL test case names/descriptions
   - Mocks: what is mocked (libraries, services, repositories)
-  - Setup/teardown: beforeEach/afterEach patterns
+  - Setup/teardown: setup/teardown hooks used (beforeEach/afterEach or language equivalent)
 
 ### Coverage Summary
   - Total test files: N
@@ -604,6 +732,8 @@ Write complete test coverage documentation:
     n: 22,
     name: 'Transaction Boundaries',
     graph: 'db',
+    emptyGraphIsValid: true,    // no transactions is a valid (and common) answer
+    minContentBytes: 80,
     specificInstructions: `Call read-knowledge-graph("db").
 Write ONLY the transaction boundary documentation.
 (Individual DB operations are in Section 13 — do NOT repeat them here.)
@@ -631,6 +761,8 @@ If no explicit transactions found:
     n: 23,
     name: 'Event Flows',
     graph: 'event',
+    emptyGraphIsValid: true,    // most projects have no event bus — valid complete answer
+    minContentBytes: 80,
     specificInstructions: `Call read-knowledge-graph("event").
 For EVERY event in the event-graph:
 
@@ -656,17 +788,23 @@ For EVERY event in the event-graph:
     n: 24,
     name: 'External Integrations',
     graph: 'integration',
+    emptyGraphIsValid: true,    // internal/self-contained projects have no integrations
+    minContentBytes: 80,
     specificInstructions: `Call read-knowledge-graph("integration").
 For EVERY external integration:
 
-### Provider Name (e.g., Stripe, SendGrid, AWS S3, Twilio)
+### Provider Name
   - **Purpose**: what this integration is used for
   - **Auth method**: API key / OAuth / IAM Role / etc.
   - **Called from**: file(s) that make calls to this provider
   - **SDK/library**: package name and version
-  - **Operations**:
-    | Operation | Endpoint/Method | Sends | Receives |
-    | createPayment | POST /charges | { amount, currency, source } | { id, status } |
+  -   Operations table format:
+  | Operation | Endpoint/Method | Input Payload | Response Shape |
+  |:----------|:----------------|:--------------|:---------------|
+  | <operationName> | <endpoint-or-sdk-method> | { <inputField>: <Type>, ... } | { <responseField>: <Type>, ... } |
+
+  Write the ACTUAL operations found in the integration-graph — not assumed patterns.
+  Use the exact operation names, endpoints, and data shapes from the graph.
   - **Error handling**: how API errors from this provider are handled
   - **Retry logic**: is there retry on failure?
   - **Rate limits**: any rate limit handling?
@@ -676,6 +814,8 @@ For EVERY external integration:
     n: 25,
     name: 'Scheduled Jobs & Workers',
     graph: 'job',
+    emptyGraphIsValid: true,    // most web APIs have no scheduled jobs — valid
+    minContentBytes: 80,
     specificInstructions: `Call read-knowledge-graph("job").
 For EVERY scheduled job or background worker:
 
@@ -701,6 +841,8 @@ For EVERY scheduled job or background worker:
     name: 'Risk Scorecard & Migration Complexity',
     graph: null,
     ctxKeys: ['TOTAL_FILES', 'TOTAL_CALLABLE_UNITS', 'TOTAL_API_ENDPOINTS', 'TOTAL_BUSINESS_RULES', 'TOTAL_DATA_ENTITIES', 'TOTAL_DB_TABLES', 'TOTAL_EVENTS', 'TOTAL_INTEGRATIONS', 'TOTAL_JOBS', 'HIGH_CHURN_FILES', 'DEAD_CODE_CANDIDATES', 'PHASE1_AUDIT_WARNING', 'RUNTIME_VERSIONS', 'PRIMARY_LANGUAGE', 'MONOREPO', 'MULTI_PROJECT'],
+    emptyGraphIsValid: true,    // reads context counters — always has data
+    minContentBytes: 400,
     specificInstructions: `Load all counters from task context via get_task_context.
 Write a comprehensive risk scorecard for migration planning:
 
@@ -788,32 +930,55 @@ Save the result to the output file path given. Then stop.
 3. If a graph or data source is empty: see Rule 7 BEFORE writing "None detected."
 4. Use proper markdown: headers, tables, fenced code blocks, bullet lists.
 5. Be comprehensive — this document is used for code migration planning.
-6. Do not skip any entry in the graph. Every entity, every function, every endpoint.
+6. Do not skip any entry in the graph. Every entity, every callable, every endpoint.
 7. EMPTY GRAPH VALIDATION — MANDATORY before writing "None detected in this codebase":
-   a. Call get_task_context and read: TOTAL_CALLABLE_UNITS, TOTAL_DATA_ENTITIES, TOTAL_API_ENDPOINTS.
-   b. Cross-check:
-      - If this section uses symbol-graph AND it's empty AND TOTAL_CALLABLE_UNITS > 20:
-        → Write this warning at the TOP of the section:
-        "> ⚠️ DATA GAP WARNING: The symbol graph is empty, but [N] callable units were counted.
-        > This indicates a Phase 2 analysis gap. Section content may be incomplete."
-        → Then write "None detected — see warning above." as the section body.
-      - If this section uses entity-graph AND it's empty AND TOTAL_DATA_ENTITIES > 5:
-        → Same warning pattern for entity data.
-      - If this section uses api-graph AND it's empty AND TOTAL_API_ENDPOINTS > 0:
-        → Same warning pattern for API data.
-      - If TOTAL_CALLABLE_UNITS = 0 OR counters are not set: write "None detected." normally.
-        A project genuinely may have no items in a specific graph even if other graphs are populated.
-   c. For sections using graphs OTHER than symbol/entity/api (rule/middleware/db/etc.):
-      Write "None detected in this codebase." normally — these graphs are optional.
+   a. Call get_task_context and read ALL counters:
+      TOTAL_CALLABLE_UNITS, TOTAL_DATA_ENTITIES, TOTAL_API_ENDPOINTS,
+      TOTAL_DB_TABLES, TOTAL_EVENTS, TOTAL_INTEGRATIONS, TOTAL_JOBS.
+   b. Cross-check the graph for THIS section against its counter:
+      Graph         | Counter to check         | Threshold
+      symbol-graph  | TOTAL_CALLABLE_UNITS     | > 20
+      entity-graph  | TOTAL_DATA_ENTITIES      | > 5
+      api-graph     | TOTAL_API_ENDPOINTS      | > 0
+      db-graph      | TOTAL_DB_TABLES          | > 0
+      event-graph   | TOTAL_EVENTS             | > 0
+      integration   | TOTAL_INTEGRATIONS       | > 0
+      job-graph     | TOTAL_JOBS               | > 0
+   c. If the relevant graph is EMPTY and its counter EXCEEDS the threshold above:
+      → Write this DATA GAP WARNING at the TOP of the section:
+      "> ⚠️ DATA GAP WARNING: The [graph-name] is empty, but [counter]=[N] was recorded.
+      > This indicates a Phase 2 or Phase 3 analysis gap. Section content is incomplete.
+      > Re-run the analysis to regenerate this graph."
+      → Then write what you CAN determine from other available graphs.
+   d. If the relevant counter IS 0 or NOT SET:
+      → The project genuinely has none of these items. Write "None detected." normally.
+      → This is NOT an error — many projects have no events, no jobs, no integrations.
+   e. For graphs with no corresponding counter (rule/middleware/security/etc.):
+      → Write "None detected in this codebase." normally.
 </rules>
 
 
 <output_format>
-- Start the file with the section header: ## N. Section Name
-- Write the full section content after the header
-- Use H3 (###) for sub-sections within the section
-- Use tables where the data is tabular
-- Use fenced code blocks with the appropriate language tag for code/schemas
+MANDATORY HEADER — every section file MUST start with this exact format:
+  ## {N}. {Section Name}
+  (where {N} is the section number and {Section Name} is the section title given to you)
+
+  Examples of correct headers:
+    ## 5. Domain Models
+    ## 13. Database Operations
+    ## 26. Risk Scorecard & Migration Complexity
+
+  CRITICAL: Write this header even if the section content is "None detected."
+  The assembler reads every section file by filename only — it does NOT add the header for you.
+  A section file without ## header will have no title in the final document.
+
+CONTENT FORMAT RULES:
+- Write the full section content immediately after the ## header (no blank line between header and content)
+- Use H3 (###) for all sub-sections — never use ## inside a section file (only one ## per file)
+- Use markdown tables for tabular data — include header row + alignment row on every table
+- Use fenced code blocks with the correct language tag: \`\`\`json, \`\`\`sql, \`\`\`typescript, \`\`\`python, etc.
+- Use \`\`\`text for plain-text diagrams (state machines, ASCII flows)
+- Do NOT add a horizontal rule (---) at the end — the assembler adds separators between sections automatically
 </output_format>
 
 <stop_condition>

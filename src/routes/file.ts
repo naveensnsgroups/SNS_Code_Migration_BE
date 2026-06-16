@@ -109,4 +109,40 @@ router.get('/', async (req: Request, res: Response, next: NextFunction) => {
   }
 });
 
+/**
+ * GET /api/file/download
+ * Query: sessionId, file (filename, e.g. 'Stage1_Analysis.md')
+ * Streams the file as a download attachment.
+ */
+router.get('/download', async (req: Request, res: Response, next: NextFunction) => {
+  try {
+    const { sessionId, file } = req.query;
+    if (!sessionId || !file) {
+      res.status(400).json({ error: 'Missing sessionId or file', code: 'BAD_REQUEST' });
+      return;
+    }
+
+    const session = await SessionManager.getSession(sessionId as string);
+    if (!session) {
+      res.status(404).json({ error: 'Session not found', code: 'NOT_FOUND' });
+      return;
+    }
+
+    const safeFile     = path.basename(file as string);
+    const filePath     = path.join(session.modernPath, safeFile);
+
+    if (!(await fs.pathExists(filePath))) {
+      res.status(404).json({ error: `File "${safeFile}" not found. Run Stage 1 first.`, code: 'NOT_FOUND' });
+      return;
+    }
+
+    res.setHeader('Content-Disposition', `attachment; filename="${safeFile}"`);
+    res.setHeader('Content-Type', 'text/markdown; charset=utf-8');
+    const stream = fs.createReadStream(filePath);
+    stream.pipe(res);
+  } catch (err) {
+    next(err);
+  }
+});
+
 export default router;

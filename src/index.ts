@@ -17,7 +17,7 @@ import { errorHandler } from './middleware/errorHandler.js';
 // registerAllTools() populates toolRegistry with all 25 ToolRequest objects.
 // agent-definitions.ts registers all agents into agentService on import.
 import { registerAllTools } from './tools/index.js';
-import './agents/agent-definitions.js';
+import './agents/core/agent-definitions.js';
 
 // Import routes
 import scanRouter from './routes/scan.js';
@@ -62,6 +62,22 @@ app.get('/health', (req, res) => {
 app.use(errorHandler);
 
 // Listen
-app.listen(PORT, () => {
+const server = app.listen(PORT, () => {
   console.log(`[Code Migration Backend] Server started on http://localhost:${PORT}`);
 });
+
+// ── Graceful Shutdown — SNS IDE: Disposable.dispose() pattern ─────────────────
+// Stop all @parcel/watcher subscriptions to release OS handles cleanly.
+import { FileWatcherService } from './services/fileWatcherService.js';
+
+async function gracefulShutdown(signal: string): Promise<void> {
+  console.log(`[Server] Received ${signal} — stopping all file watchers...`);
+  await FileWatcherService.stopAll();
+  server.close(() => {
+    console.log('[Server] HTTP server closed. Exiting.');
+    process.exit(0);
+  });
+}
+
+process.on('SIGTERM', () => gracefulShutdown('SIGTERM'));
+process.on('SIGINT',  () => gracefulShutdown('SIGINT'));

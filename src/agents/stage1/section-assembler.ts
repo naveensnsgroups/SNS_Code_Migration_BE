@@ -104,15 +104,40 @@ export async function assembleSections(
     }
   }
 
-  // Write the complete document
-  const fullDocument = header + sectionContents.join('\n\n---\n\n') + '\n';
+  // ── Completeness Status Table (TypeScript only — no LLM) ───────────────────
+  // Shows ✅/❌ per section at the top of Stage1_Analysis.md.
+  // Lets the user see at a glance which sections need re-running.
+  const completenessCount = 26 - missingSections.length;
+  const statusRows = SECTION_NUMBERS.map(n => {
+    const done = !missingSections.includes(n);
+    return `| ${String(n).padStart(2)} | ${SECTION_NAMES[n].padEnd(40)} | ${done ? '✅ Written' : '❌ Missing'} |`;
+  });
+
+  const statusBlock = [
+    '## Analysis Completeness Report',
+    '',
+    `> **${completenessCount}/26 sections written** · Generated: ${new Date().toISOString()}`,
+    missingSections.length > 0
+      ? `> ⚠️ ${missingSections.length} section(s) incomplete — re-run the analyzer to complete them.`
+      : '> ✅ All 26 sections written successfully.',
+    '',
+    '| #  | Section Name                             | Status    |',
+    '|:---|:-----------------------------------------|:----------|',
+    ...statusRows,
+    '',
+    '---',
+    '',
+  ].join('\n');
+
+  // Write the complete document: header + completeness table + all sections
+  const fullDocument = header + statusBlock + sectionContents.join('\n\n---\n\n') + '\n';
   await fs.writeFile(outputFile, fullDocument, 'utf-8');
 
   const totalSize = Buffer.byteLength(fullDocument, 'utf-8');
   const sizeKb    = Math.round(totalSize / 1024);
 
   onLog?.(
-    `Stage1_Analysis.md assembled: ${26 - missingSections.length}/26 sections, ${sizeKb} KB`,
+    `Stage1_Analysis.md assembled: ${completenessCount}/26 sections, ${sizeKb} KB`,
     'success'
   );
 
