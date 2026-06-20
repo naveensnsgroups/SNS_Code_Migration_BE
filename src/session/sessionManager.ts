@@ -1,6 +1,7 @@
 import fs from 'fs-extra';
 import path from 'path';
 import { fileURLToPath } from 'url';
+import { randomUUID } from 'crypto';                    // Fix 9: ESM import (require is not available in ESM)
 import { MigrationSession, LogEntry, TokenUsageEntry } from './types.js';
 import { FileNode } from '../types.js';
 import { writeJsonAtomic, readJsonWithRetry } from './fileUtils.js';
@@ -31,10 +32,10 @@ export class SessionManager {
   }
 
   /**
-   * Generates a unique session ID
+   * Generates a unique session ID (cryptographically random — Fix 9)
    */
   static generateSessionId(): string {
-    return Math.random().toString(36).substring(2, 10);
+    return randomUUID().replace(/-/g, '').substring(0, 12);
   }
 
   /**

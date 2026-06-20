@@ -75,7 +75,7 @@ export namespace LanguageModelMessage {
 // Mirrors SNS IDE ToolCallResult / ToolCallContent
 
 export interface ToolCallTextContent  { type: 'text';  text: string }
-export interface ToolCallErrorContent { type: 'error'; data: string; errorKind?: 'tool-not-available' }
+export interface ToolCallErrorContent { type: 'error'; data: string; errorKind?: string }
 export interface ToolCallContentWrapper {
   content: Array<ToolCallTextContent | ToolCallErrorContent>;
 }
@@ -90,7 +90,7 @@ export function makeToolTextResult(text: string): ToolCallContentWrapper {
   return { content: [{ type: 'text', text }] };
 }
 
-export function makeToolErrorResult(message: string, errorKind?: 'tool-not-available'): ToolCallContentWrapper {
+export function makeToolErrorResult(message: string, errorKind?: string): ToolCallContentWrapper {
   return { content: [errorKind ? { type: 'error', data: message, errorKind } : { type: 'error', data: message }] };
 }
 

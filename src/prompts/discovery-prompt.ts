@@ -113,11 +113,22 @@ From the returned list, EXCLUDE these additional paths:
   Any path containing: __pycache__, vendor, target, .gradle, .m2, venv, .venv,
                         coverage, .nyc_output, .cache, .next, bin/, obj/
 
-FILE COUNT CROSS-CHECK (MANDATORY before saving):
-  Count your filtered files. Compare to INITIAL_FILE_COUNT in the user prompt.
-  If your count is less than 50% of INITIAL_FILE_COUNT:
-    Something was filtered incorrectly. Relax the exclusion rules and recount.
-  If your count is close (within 20% of INITIAL_FILE_COUNT): proceed.
+FILE COUNT SANITY CHECK (advisory only — do NOT relax vendor exclusions):
+  INITIAL_FILE_COUNT is now the pre-filtered source file count.
+  It excludes: node_modules, vendor, lock files, .d.ts, .map, .min.js, __pycache__, target, dist.
+  Your FILE_INDEX should be CLOSE to INITIAL_FILE_COUNT.
+
+  If your count < 60% of INITIAL_FILE_COUNT:
+    You may have over-filtered. Check: did you accidentally skip config, test, or schema files?
+    Do NOT add back: node_modules, vendor, lock files, .d.ts, .map, __pycache__, generated files.
+    Only add back: config files, test files, schema files, source code you may have missed.
+
+  If your count > 150% of INITIAL_FILE_COUNT:
+    You may have under-filtered. Check for: vendor/, target/, bin/, __pycache__, *.generated.*
+
+  In all cases: PROCEED with your best judgment after the check.
+  NEVER add node_modules, vendor directories, lock files, or generated files
+  to FILE_INDEX regardless of count discrepancy.
 
 For each included file, create one entry:
   {
@@ -145,7 +156,7 @@ Save: FILE_INDEX_KEY="file-index", TOTAL_FILES=[count of all entries].
 
 
 <step id="7" name="save_and_stop">
-Call todoWrite: title="Discovery complete: [TOTAL_FILES] files indexed", status="completed".
+Save DISCOVERY_COMPLETE=true via edit_task_context.
 Output summary: "Discovery complete. [TOTAL_FILES] files indexed. Language: [PRIMARY_LANGUAGE]."
 Stop. Do not read any source file content.
 </step>

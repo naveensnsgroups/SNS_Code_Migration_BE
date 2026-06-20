@@ -216,7 +216,12 @@ export class MigrationOrchestrator {
         session.targetStack,
         null,  // _aiServiceLegacy — deprecated, ignored by PlannerAgent
         async (msg, lvl) => log(msg, lvl ?? 'info', 'stage1'),
-        (percent, currentFile) => {
+        async (percent, currentFile) => {
+          // Fix 6: persist progress to session.json so SSE reconnect can replay it
+          await SessionManager.updateSession(sessionId, {
+            progress:    percent,
+            currentFile: currentFile ?? '',
+          });
           EventBroadcaster.broadcast(sessionId, 'progress', { percent, currentFile: currentFile ?? '' });
         },
         updatePhase   // ← pass updatePhase so PlannerAgent can broadcast sub-phase transitions

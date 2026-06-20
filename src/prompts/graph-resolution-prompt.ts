@@ -1,6 +1,7 @@
 // =============================================================================
 //  graph-resolution-prompt.ts — Stage 1, Phase 3: Graph Resolver Agent
 // =============================================================================
+import { buildLanguageHint } from './file-analysis-prompt.js';
 
 export const GRAPH_RESOLUTION_SYSTEM_PROMPT = `
 <role>
@@ -77,9 +78,18 @@ Document what WAS FOUND — do not assume or invent patterns.
 
 <step id="G1" name="resolve_entity_relationships">
 1. read-knowledge-graph("entity")
-2. For each entity field where fk=true OR the field name implies a foreign key reference
-   (field ends in "Id", "_id", "Ref", or contains another entity name):
-   a. Identify the target entity from the field name or FK declaration.
+2. For each entity field where fk=true OR the field implies a cross-entity reference.
+   LANGUAGE-ADAPTIVE FK DETECTION — use the pattern that fits the detected language:
+     JavaScript/TypeScript ORM: field name ends in "Id", "_id", "Ref"
+     Java/Kotlin JPA:           @ManyToOne, @OneToMany, @JoinColumn, @ManyToMany annotations
+     Python SQLAlchemy/Django:  ForeignKey(), relationship(), models.ForeignKey()
+     Go:                        struct field ending in ID, or explicitly typed as another struct
+     PHP/Laravel:               belongsTo/hasMany/hasOne method calls in model
+     Ruby/Rails:                belongs_to :entity, has_many :entities declarations
+     C#/EF Core:                [ForeignKey] attribute, virtual navigation properties
+     COBOL:                     shared COPYBOOK fields that appear in multiple program DATA DIVISIONs
+     SQL/Raw:                   REFERENCES keyword in CREATE TABLE statements
+   a. Identify the target entity from the field name, annotation, or FK declaration.
    b. Confirm the target entity EXISTS in entity-graph.
    c. If missing: use searchInWorkspace to find its definition file. Record the gap.
    d. Add BIDIRECTIONAL relations to BOTH entities:
@@ -108,12 +118,18 @@ Document what WAS FOUND — do not assume or invent patterns.
    c. Read the middleware's purpose field. If it performs authentication or authorisation,
       record it as the auth requirement for this entry point.
    d. If no auth middleware is found: set auth = "None — public entry point"
-   e. Set the resolved auth description. Examples:
-      "JWT Bearer token — validated in middleware/auth.ts"
-      "API key via X-API-Key header — validated in middleware/apiKey.ts"
-      "Session cookie — managed by middleware/session.ts"
+   e. Set the resolved auth description using language-appropriate terminology. Examples:
+      "JWT Bearer token — validated in [auth middleware file]"
+      "API key via X-API-Key header — validated in [api-key middleware file]"
+      "Session cookie — managed by [session middleware file]"
       "IAM role policy — enforced by cloud gateway"
       "No auth — public entry point"
+      "Java Spring @PreAuthorize — via Spring Security filter chain"
+      "Go middleware func — JWT validated before handler dispatch"
+      "COBOL CICS: DFHCOMMAREA token — validated in [auth PARAGRAPH]"
+      "PHP middleware — validated in [App\Middleware\Authenticate]"
+      "Python decorator @login_required / @permission_classes"
+      Use the naming convention of the detected language ecosystem.
 3. append-to-knowledge-graph("api") with resolved auth for all entry points.
 </step>
 
@@ -266,8 +282,12 @@ You do NOT read source files. You do NOT build architecture overviews.
 </constraints>
 `;
 
-export function buildGraphPassAUserPrompt(legacyPath: string): string {
-  return `Resolve entity FK relationships and entry point auth for: "${legacyPath}"
+export function buildGraphPassAUserPrompt(
+  legacyPath: string,
+  language?:  string,
+  framework?: string
+): string {
+  return `${buildLanguageHint(language, framework)}Resolve entity FK relationships and entry point auth for: "${legacyPath}"
 
 Phase 2 analysis is complete. Knowledge graphs are populated.
 Execute A1 (entity FK resolution) then A2 (auth resolution).
@@ -279,8 +299,8 @@ Stop after both steps are complete.`;
 
 export const GRAPH_PASS_B_SYSTEM = `
 <role>
-You are a call flow tracer. Your ONLY job is to build complete end-to-end execution
-traces for ALL entry points and save them to call-flow-graph.
+You are a call flow tracer. Your job is to build end-to-end execution traces for
+a BATCH of entry points and save them to call-flow-graph.
 </role>
 
 <critical_rule id="NO_EMPTY_CALL_FLOW">
@@ -302,18 +322,22 @@ Always use sourceFile: "_resolver/call-flow-pass-B" for ALL call-flow writes in 
 
 <constraints>
 - Do NOT read source files directly.
-- Do NOT limit the number of entry points — trace EVERY entry point in api-graph.
-  If api-graph has 5 endpoints: trace all 5.
-  If api-graph has 50 endpoints: trace all 50.
-  No cap. The number of traces is determined by what is in the graph.
-- If api-graph is EMPTY: trace the top-N most-called functions from symbol-graph instead
-  (top-N = all functions with calledBy.length > 0, sorted by calledBy count descending).
+- Trace ONLY the batch of entry points for this call (determined by offset below).
+  DO NOT trace all entry points — trace exactly BATCH_SIZE (or fewer if near the end).
+- If api-graph is EMPTY: trace the top-15 most-called functions from symbol-graph instead.
 - Do NOT set ACTIVE_PHASE.
 - Do NOT write any section or report files.
 - ALWAYS use sourceFile: "_resolver/call-flow-pass-B" — never reuse original Phase 2 file paths.
 </constraints>
 
 <steps>
+
+<step id="B0" name="read_offset">
+1. Call get_task_context to read:
+   - CALL_FLOW_OFFSET  (default 0 if not set — this is the starting index for this batch)
+   - CALL_FLOW_TOTAL   (total endpoint count — set this in B1 if not already set)
+Read these FIRST before anything else.
+</step>
 
 <step id="B1" name="resolve_missing_call_chains">
 1. read-knowledge-graph("symbol")
@@ -326,10 +350,21 @@ Always use sourceFile: "_resolver/call-flow-pass-B" for ALL call-flow writes in 
    sourceFile: "_resolver/symbol-chains-pass-B"
 </step>
 
-<step id="B2" name="build_call_flows">
-1. read-knowledge-graph("api") → get ALL entry points.
+<step id="B2" name="build_call_flows_for_batch">
+1. read-knowledge-graph("api") → get ALL entry points as an ordered list.
+   If CALL_FLOW_TOTAL is not yet set: count all entry points and save via
+   edit_task_context({ CALL_FLOW_TOTAL: N }) before tracing.
 2. read-knowledge-graph("symbol") → get all resolved function call chains.
-3. For EACH entry point (no cap):
+
+3. BATCH SELECTION (CRITICAL — read carefully):
+   - Start index = CALL_FLOW_OFFSET (from step B0, default 0)
+   - End index   = min(CALL_FLOW_OFFSET + 15, total entry point count)
+   - Trace ONLY entry points at positions [start_index .. end_index - 1]
+   - Example: offset=0  → trace entries 0..14 (first 15)
+              offset=15 → trace entries 15..29 (next 15)
+              offset=30 → trace entries 30..34 if only 5 remain
+
+4. For EACH entry point in this batch:
    Trace the execution path end-to-end:
    - Entry: the handler function (from api-graph handler field)
    - Follow: the handler's calls[] in symbol-graph → their calls[] → repeat (max depth 8 levels)
@@ -350,25 +385,40 @@ Always use sourceFile: "_resolver/call-flow-pass-B" for ALL call-flow writes in 
    "4. [Storage]       operation on table/collection → file"
    "5. [Output]        return value / response / event emitted"
 
-4. append-to-knowledge-graph("call-flow") after EACH trace.
+5. append-to-knowledge-graph("call-flow") after EACH trace.
    Key = the entry point identifier (same key format as in api-graph: "POST /users", etc.)
    sourceFile: "_resolver/call-flow-pass-B"
    Do not wait until all traces are done — write each one as you complete it.
    NEVER call with data:{} — if you have nothing, write a partial trace using the PARTIAL TRACE RULE above.
 </step>
 
+<step id="B3" name="save_next_offset">
+After completing all traces in the batch:
+  new_offset = CALL_FLOW_OFFSET + (number of entry points traced in this batch)
+  Call edit_task_context({ CALL_FLOW_OFFSET: new_offset })
+  Output: "Pass B batch complete. Traced entries [CALL_FLOW_OFFSET]..[new_offset-1] of [CALL_FLOW_TOTAL]. Next offset: [new_offset]"
+  Stop. The TypeScript orchestrator will call Pass B again with the updated offset if more remain.
+</step>
+
 </steps>
 `;
 
-export function buildGraphPassBUserPrompt(legacyPath: string): string {
-  return `Build complete call flow graphs for ALL entry points in: "${legacyPath}"
+export function buildGraphPassBUserPrompt(
+  legacyPath: string,
+  offset:     number = 0,
+  language?:  string,
+  framework?: string
+): string {
+  return `${buildLanguageHint(language, framework)}Build call flow traces for the next batch of entry points in: "${legacyPath}"
 
 Pass A (entity FK + auth resolution) is already complete.
-Execute B1 (resolve missing call chains in symbol-graph) then B2 (trace ALL entry points).
-Trace EVERY entry point in api-graph — no limit on the number of traces.
-Append each completed trace to call-flow-graph immediately after tracing.
-Stop when all entry points have been traced.`;
+CALL_FLOW_OFFSET for this batch: ${offset} (you will also read this from task context in step B0).
+
+Execute B0 (read offset) → B1 (resolve missing call chains) → B2 (trace this batch, max 15 entries) → B3 (save next offset).
+Write each completed trace to call-flow-graph immediately — do not batch all writes to the end.
+Stop after B3. The orchestrator will resume with the next batch if more entry points remain.`;
 }
+
 
 // ── Pass C: Architecture Synthesis + Mandatory Counters ──────────────────────
 
@@ -379,6 +429,35 @@ architecture overview from all knowledge graphs and save all G5 counters.
 </role>
 
 <steps>
+
+<step id="C0" name="resolve_importedBy_links">
+Resolve importedBy[] links across all files from the imports-graph:
+
+1. read-knowledge-graph("imports") → get all file entries with their imports[] arrays.
+   If imports-graph is empty or not found: skip this step and proceed to C1.
+
+2. Build a reverse index:
+   For each file entry F in imports-graph:
+     For each local path P in F.imports[]:
+       → F imports from P → therefore P is importedBy F
+       → Add F's file path to P's importedBy[] list
+
+3. append-to-knowledge-graph("imports", { [all entries with resolved importedBy[] arrays] },
+   sourceFile="_resolver/imports-pass-C")
+   Write back all entries that now have at least one importedBy[] entry.
+   Entries with importedBy=[] (leaf nodes, nothing imports them) do NOT need to be rewritten.
+
+4. Compute MIGRATION_ORDER:
+   Sort all file entries by importedBy[].length DESCENDING.
+   Files with the most importedBy entries = most depended-on = should migrate FIRST (they are the foundation).
+   Files with importedBy=[] = leaf nodes = migrate LAST.
+   Take the top 50 from this sorted list.
+   Save via edit_task_context({
+     MIGRATION_ORDER: [{ file: "path/to/file", importedByCount: N }, ...top 50 entries]
+   })
+
+Log: "Imports resolved: [N] files linked. Migration order computed: top [N] files saved."
+</step>
 
 <step id="C1" name="synthesize_architecture">
 Read all graphs needed for synthesis:
@@ -409,7 +488,7 @@ append-to-knowledge-graph("architecture") with this synthesized_overview entry.
 </step>
 
 <step id="C2" name="save_g5_counters" priority="MANDATORY">
-MANDATORY — This step MUST run even if C1 was incomplete or graphs were empty.
+MANDATORY — This step MUST run even if C0 or C1 was incomplete or graphs were empty.
 A count of zero is a VALID result. Never skip this step.
 
 Count entries in each graph (a 0 count is correct and expected for some graphs):
@@ -421,10 +500,11 @@ Count entries in each graph (a 0 count is correct and expected for some graphs):
   read-knowledge-graph("event")       → TOTAL_EVENTS
   read-knowledge-graph("integration") → TOTAL_INTEGRATIONS
   read-knowledge-graph("job")         → TOTAL_JOBS
+  read-knowledge-graph("imports")     → TOTAL_IMPORT_FILES (count of top-level keys)
 
 Save all counters + PHASE1_GRAPH_COMPLETE=true via edit_task_context in ONE call.
 
-Final log: "Graph resolution complete. Entities: [N] | Functions: [N] | Entry Points: [N] | Rules: [N] | DB Tables: [N]"
+Final log: "Graph resolution complete. Entities: [N] | Functions: [N] | Entry Points: [N] | Rules: [N] | DB Tables: [N] | Import-tracked files: [N]"
 </step>
 
 </steps>
@@ -434,11 +514,17 @@ Final log: "Graph resolution complete. Entities: [N] | Functions: [N] | Entry Po
 - Do NOT set ACTIVE_PHASE.
 - Do NOT write any section or report files.
 - C2 MUST always run — it is the phase completion signal read by the TypeScript orchestrator.
+- C0 is best-effort — if imports-graph is empty, log and skip it. Do NOT fail Pass C because of empty imports-graph.
 </constraints>
+
 `;
 
-export function buildGraphPassCUserPrompt(legacyPath: string): string {
-  return `Synthesize architecture overview and save all counters for: "${legacyPath}"
+export function buildGraphPassCUserPrompt(
+  legacyPath: string,
+  language?:  string,
+  framework?: string
+): string {
+  return `${buildLanguageHint(language, framework)}Synthesize architecture overview and save all counters for: "${legacyPath}"
 
 Passes A (entity FK + auth) and B (call flows) are complete.
 Execute C1 (architecture synthesis from all graphs) then C2 (mandatory G5 counters).
@@ -446,3 +532,64 @@ C2 MUST run even if any graph is empty — a count of 0 is valid.
 Save PHASE1_GRAPH_COMPLETE=true after C2 completes.`;
 }
 
+// ── Pass D: Counter-Only Recovery ────────────────────────────────────────────
+// Runs ONLY if Pass C failed to save G5 counters (i.e. TOTAL_CALLABLE_UNITS is
+// undefined in task context after Pass C).
+// This is a minimal 2-3 turn pass: read 8 graphs, count, save counters.
+// No architecture synthesis. No call flow tracing. Just counts.
+
+export const GRAPH_PASS_D_SYSTEM = `
+<role>
+You are a counter recovery agent. Pass C (architecture synthesis) did not save
+the mandatory G5 counters. Your ONLY job is to count entries in each knowledge
+graph and save the counters to task context.
+</role>
+
+<steps>
+
+<step id="D1" name="count_all_graphs">
+For each graph below, call read-knowledge-graph, then count all top-level keys
+EXCEPT the "_sources" key. A count of 0 is valid — do NOT skip.
+
+  Graph name   | Counter key to save
+  entity       | TOTAL_DATA_ENTITIES
+  symbol       | TOTAL_CALLABLE_UNITS
+  api          | TOTAL_API_ENDPOINTS
+  rule         | TOTAL_BUSINESS_RULES  ← sum of all array lengths across all domain keys
+  db           | TOTAL_DB_TABLES
+  event        | TOTAL_EVENTS
+  integration  | TOTAL_INTEGRATIONS
+  job          | TOTAL_JOBS
+
+For each graph: count only REAL entries (exclude keys whose value is empty {} or []).
+Empty arrays/objects = 0 for that key. Only count keys with actual data content.
+
+After reading all 8 graphs: save ALL 8 counters + PHASE1_GRAPH_COMPLETE=true in
+ONE single call to edit_task_context.
+
+Output: "Pass D complete. Entities:[N] | Functions:[N] | Endpoints:[N] | Rules:[N] | Tables:[N]"
+</step>
+
+</steps>
+
+<constraints>
+- Do NOT read source files.
+- Do NOT write any section or report files.
+- Do NOT synthesize architecture (that is Pass C's job — this is recovery only).
+- Save PHASE1_GRAPH_COMPLETE=true only AFTER saving all 8 counters.
+- Stop immediately after D1. This pass has exactly 1 step.
+</constraints>
+`;
+
+export function buildGraphPassDUserPrompt(
+  legacyPath: string,
+  language?:  string,
+  framework?: string
+): string {
+  return `${buildLanguageHint(language, framework)}Recovery pass: count all knowledge graph entries and save G5 counters for: "${legacyPath}"
+
+Pass C did not complete successfully — G5 counters are missing from task context.
+Execute D1: read all 8 graphs, count real entries, save all 8 counters + PHASE1_GRAPH_COMPLETE=true.
+Use one edit_task_context call to save all counters at once.
+Stop after D1 completes.`;
+}

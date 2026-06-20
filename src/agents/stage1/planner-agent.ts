@@ -45,6 +45,8 @@ import {
   buildGraphPassBUserPrompt,
   GRAPH_PASS_C_SYSTEM,
   buildGraphPassCUserPrompt,
+  GRAPH_PASS_D_SYSTEM,           // Fix 4: counter-only recovery pass
+  buildGraphPassDUserPrompt,     // Fix 4: counter-only recovery pass
 } from '../../prompts/graph-resolution-prompt.js';
 import {
   SECTION_SYSTEM_PROMPT,
@@ -157,6 +159,56 @@ async function runWithConcurrencyLimit<T>(
   return results;
 }
 
+// ── GAP 1: Per-Phase Timeout Wrapper ─────────────────────────────────────────
+// Wraps any async operation with a hard timeout.
+// Prevents the pipeline from hanging indefinitely on:
+//   - Network outages or provider downtime
+//   - LLM stuck in an infinite tool loop that rate-limit retry never resolves
+//   - Node process blocking on a single awaited call forever
+//
+// Benefits:
+//   ✅ Server never hangs permanently — always recovers within timeoutMs
+//   ✅ active_phase is already saved before each execute() — resume works after timeout
+//   ✅ Clear error message tells user which phase timed out and how long it waited
+
+function withPhaseTimeout<T>(
+  operation:   Promise<T>,
+  timeoutMs:   number,
+  phaseLabel:  string,
+  onLog?:      (msg: string, lvl?: 'info' | 'success' | 'error' | 'warning') => void
+): Promise<T> {
+  return new Promise<T>((resolve, reject) => {
+    const timer = setTimeout(() => {
+      onLog?.(
+        `[PlannerAgent] ⏱ TIMEOUT: ${phaseLabel} exceeded ${Math.round(timeoutMs / 60_000)} min. ` +
+        `Pipeline will resume from the last saved phase on next run.`,
+        'error'
+      );
+      reject(new Error(
+        `[PlannerAgent] Phase timeout: "${phaseLabel}" did not complete within ` +
+        `${Math.round(timeoutMs / 60_000)} minutes. ` +
+        `active_phase has been saved — restart the pipeline to resume from this phase.`
+      ));
+    }, timeoutMs);
+
+    operation
+      .then(result => { clearTimeout(timer); resolve(result); })
+      .catch(err   => { clearTimeout(timer); reject(err);    });
+  });
+}
+
+// ── Phase timeout limits (conservative — longer than any real execution) ──────
+// Discovery: 6 min   (usually 30–90 sec)
+// Analysis pass: 18 min   (can be long for 200+ file projects)
+// Graph pass: 12 min  (per sub-pass — A/B/C/D)
+// Section: 10 min  (per section — retry adds extra time)
+const PHASE_TIMEOUT_MS = {
+  discovery:     6  * 60_000,
+  analysisPass:  18 * 60_000,
+  graphPass:     12 * 60_000,
+  section:       10 * 60_000,
+} as const;
+
 
 // ── PlannerAgent ──────────────────────────────────────────────────────────────
 
@@ -228,15 +280,20 @@ export class PlannerAgent {
       onLog?.('[PlannerAgent] Stage 1/5: Workspace Discovery...', 'info');
       await onPhase?.('discovery', 'active');
 
-      await AgentExecutor.execute(
-        provider,
-        DISCOVERY_SYSTEM_PROMPT + customSuffix,
-        buildDiscoveryUserPrompt(legacyPath, detectedStack),
-        discoveryTools,
-        context,
-        undefined,       // maxIterations — agent stops naturally; undefined uses the default
-        resolvedModel,
-        'discovery-agent'
+      // GAP 1 applied: discovery has a 6-minute hard timeout
+      await withPhaseTimeout(
+        AgentExecutor.execute(
+          provider,
+          DISCOVERY_SYSTEM_PROMPT + customSuffix,
+          buildDiscoveryUserPrompt(legacyPath, detectedStack),
+          discoveryTools,
+          context,
+          resolvedModel,
+          'discovery-agent'
+        ),
+        PHASE_TIMEOUT_MS.discovery,
+        'discovery',
+        onLog
       );
 
       taskCtx = await TaskContextManager.getContext(sessionId);
@@ -284,9 +341,24 @@ export class PlannerAgent {
       onLog?.(`[PlannerAgent] Discovery complete: ${totalFiles} files indexed.`, 'success');
       onProgress?.(5, 'Workspace Discovery');
       await onPhase?.('discovery', 'done');
+
+      // ── P0 Fix: Remove stale file_index (underscore) key ──────────────────
+      // A prior discovery pass may have written 'file_index' (underscore) while
+      // the current active key is 'file-index' (dash). If the Phase 2 agent reads
+      // the stale key it sees 8 files all DONE and stops immediately — session stuck.
+      // Solution: delete the underscore key immediately after discovery completes.
+      try {
+        const staleCtx = await TaskContextManager.getContext(sessionId);
+        if (staleCtx['file_index'] !== undefined && staleCtx['FILE_INDEX_KEY'] === 'file-index') {
+          await TaskContextManager.updateContext(sessionId, { file_index: null });
+          onLog?.('[PlannerAgent] Cleaned up stale file_index key — preventing Phase 2 key confusion.', 'info');
+        }
+      } catch { /* non-fatal — best-effort cleanup */ }
+
       await onPhase?.('file-analysis', 'active');
       await TaskContextManager.updateContext(sessionId, { active_phase: 'analysis' });
       activePhase = 'analysis';
+
     }
 
     // ═════════════════════════════════════════════════════════════════════════
@@ -304,7 +376,8 @@ export class PlannerAgent {
       let passNumber        = 0;
       let consecutiveStalls  = 0;    // how many passes in a row made zero progress
       const MAX_PASSES = 20;         // safety ceiling — no infinite loop ever
-      const MAX_STALLS = 2;          // require 2 consecutive zero-progress passes before advancing
+      const MAX_STALLS = 4;          // require 4 consecutive zero-progress passes before advancing
+                                     // (2 was too aggressive — free-tier 429s cause false stalls)
 
       while (passNumber < MAX_PASSES) {
         passNumber++;
@@ -332,15 +405,20 @@ export class PlannerAgent {
         const batchSize = computeBatchSize(totalFiles);
         onLog?.(`[PlannerAgent] Session limits: turnCap=${turnCap} files | batchSize=${batchSize} small files/batch (model: ${resolvedModel || 'default'})`, 'info');
 
-        await AgentExecutor.execute(
-          provider,
-          FILE_ANALYSIS_SYSTEM_PROMPT + customSuffix,
-          buildAnalysisUserPrompt(legacyPath, lastAnalyzed, turnCap, batchSize),
-          analysisTools,
-          context,
-          undefined,   // maxIterations — agent stops naturally; undefined uses the default
-          resolvedModel,
-          agentId
+        // GAP 1 applied: each analysis pass has an 18-minute hard timeout
+        await withPhaseTimeout(
+          AgentExecutor.execute(
+            provider,
+            FILE_ANALYSIS_SYSTEM_PROMPT + customSuffix,
+            buildAnalysisUserPrompt(legacyPath, lastAnalyzed, turnCap, batchSize, detectedStack.language, detectedStack.framework),
+            analysisTools,
+            context,
+            resolvedModel,
+            agentId
+          ),
+          PHASE_TIMEOUT_MS.analysisPass,
+          `analysis-pass-${passNumber}`,
+          onLog
         );
 
         await PlannerAgent.cleanupAnalysisKeys(sessionId);
@@ -432,32 +510,149 @@ export class PlannerAgent {
       // Pass C: Architecture synthesis + mandatory G5 counters
       // ═══════════════════════════════════════════════════════════════════════
 
-      onLog?.('[PlannerAgent] Stage 3A/5: Entity & Auth Resolution...', 'info');
-      await AgentExecutor.execute(
-        provider,
-        GRAPH_PASS_A_SYSTEM + customSuffix,
-        buildGraphPassAUserPrompt(legacyPath),
-        graphTools, context, undefined, resolvedModel, 'graph-resolver-entity-auth'
-      );
-      onLog?.('[PlannerAgent] Stage 3A complete — entity FKs + auth resolved.', 'success');
+      onLog?.('[PlannerAgent] Stage 3/5: Graph Resolution...', 'info');
 
-      onLog?.('[PlannerAgent] Stage 3B/5: Call Flow Graph Construction...', 'info');
-      await AgentExecutor.execute(
-        provider,
-        GRAPH_PASS_B_SYSTEM + customSuffix,
-        buildGraphPassBUserPrompt(legacyPath),
-        graphTools, context, undefined, resolvedModel, 'graph-resolver-callflow'
-      );
-      onLog?.('[PlannerAgent] Stage 3B complete — call flows built.', 'success');
+      // ── Graph Quality Gate ─────────────────────────────────────────────────
+      // If Phase 2 produced no data in the 3 primary graphs, running Pass A and
+      // Pass B is wasteful — they only resolve cross-references in existing data.
+      // Root cause: Phase 2 may have used a stale file-index key (all files DONE)
+      // and written zero entries to knowledge graphs.
+      // Action: skip Pass A+B, jump to Pass C (saves counters = all 0) + Pass D.
+      const preGraphCtx = await TaskContextManager.getContext(sessionId);
+      const totalUnitsCheck    = (preGraphCtx.TOTAL_CALLABLE_UNITS as number) ?? 0;
+      const totalEntitiesCheck = (preGraphCtx.TOTAL_DATA_ENTITIES  as number) ?? 0;
+      const totalEndptsCheck   = (preGraphCtx.TOTAL_API_ENDPOINTS  as number) ?? 0;
+      const graphsAreEmpty     = totalUnitsCheck === 0
+                              && totalEntitiesCheck === 0
+                              && totalEndptsCheck === 0;
+
+      if (graphsAreEmpty) {
+        onLog?.(
+          '[PlannerAgent] ⚠️ Graph quality gate: all 3 primary graphs are empty. ' +
+          'Phase 2 may not have written to knowledge graphs (stale file-index key or zero-file session). ' +
+          'Skipping Pass A (entity FK) and Pass B (call flows) — no data to resolve. ' +
+          'Pass C will run to save counters (all = 0). Check Phase 2 logs for root cause.',
+          'warning'
+        );
+        await TaskContextManager.updateContext(sessionId, {
+          GRAPH_QUALITY_GATE_TRIGGERED: true,
+          GRAPH_QUALITY_GATE_REASON: 'All 3 primary graphs empty after Phase 2',
+        });
+      }
+
+      if (!graphsAreEmpty) {
+        onLog?.('[PlannerAgent] Stage 3A/5: Entity & Auth Resolution...', 'info');
+        // GAP 1 applied: graph passes each have a 12-minute hard timeout
+        await withPhaseTimeout(
+          AgentExecutor.execute(
+            provider,
+            GRAPH_PASS_A_SYSTEM + customSuffix,
+            buildGraphPassAUserPrompt(legacyPath, detectedStack.language, detectedStack.framework),
+            graphTools, context, resolvedModel, 'graph-resolver-entity-auth'
+          ),
+          PHASE_TIMEOUT_MS.graphPass,
+          'graph-pass-A',
+          onLog
+        );
+        onLog?.('[PlannerAgent] Stage 3A complete — entity FKs + auth resolved.', 'success');
+        // GAP 4: granular progress — user sees sub-pass completion, not frozen 55%
+        onProgress?.(47, 'Graph: Entity & Auth resolved');
+      } else {
+        onLog?.('[PlannerAgent] Stage 3A skipped — graphs are empty.', 'warning');
+      }
+
+      if (!graphsAreEmpty) {
+        // Fix 3: Pass B now uses offset-based batching (15 endpoints per call).
+        // Each call traces one batch, saves CALL_FLOW_OFFSET, then stops.
+        // The orchestrator loops until offset >= CALL_FLOW_TOTAL (all endpoints traced).
+        // This prevents context exhaustion that previously caused Pass C to never run.
+        onLog?.('[PlannerAgent] Stage 3B/5: Call Flow Graph Construction (batched)...', 'info');
+        const MAX_PASS_B_ROUNDS = 20; // Safety ceiling: 20 × 15 = 300 endpoints max
+        let passBRound = 0;
+        while (passBRound < MAX_PASS_B_ROUNDS) {
+          passBRound++;
+          const ctxBeforeB = await TaskContextManager.getContext(sessionId);
+          const currentOffset = (ctxBeforeB.CALL_FLOW_OFFSET as number) ?? 0;
+          const totalEndpoints = (ctxBeforeB.CALL_FLOW_TOTAL as number) ?? undefined;
+
+          // If total is known and offset has reached or passed it — all traces done
+          if (totalEndpoints !== undefined && currentOffset >= totalEndpoints) {
+            onLog?.(`[PlannerAgent] Pass B complete — all ${totalEndpoints} entry points traced.`, 'success');
+            break;
+          }
+
+          onLog?.(`[PlannerAgent] Pass B round ${passBRound}: tracing batch starting at offset ${currentOffset}...`, 'info');
+          // GAP 1 applied: each Pass B round has a 12-minute timeout
+          await withPhaseTimeout(
+            AgentExecutor.execute(
+              provider,
+              GRAPH_PASS_B_SYSTEM + customSuffix,
+              buildGraphPassBUserPrompt(legacyPath, currentOffset, detectedStack.language, detectedStack.framework),
+              graphTools, context, resolvedModel, 'graph-resolver-callflow'
+            ),
+            PHASE_TIMEOUT_MS.graphPass,
+            `graph-pass-B-round-${passBRound}`,
+            onLog
+          );
+
+          // Read updated offset — if it didn't advance, stop to avoid an infinite loop
+          const ctxAfterB = await TaskContextManager.getContext(sessionId);
+          const newOffset = (ctxAfterB.CALL_FLOW_OFFSET as number) ?? currentOffset;
+          const newTotal  = (ctxAfterB.CALL_FLOW_TOTAL as number) ?? undefined;
+
+          if (newOffset <= currentOffset) {
+            onLog?.(`[PlannerAgent] Pass B round ${passBRound}: offset did not advance (stuck at ${currentOffset}). Stopping Pass B.`, 'warning');
+            break;
+          }
+
+          // GAP 3: Regression guard — offset going BACKWARDS means LLM reset it incorrectly
+          if (newOffset < currentOffset) {
+            onLog?.(
+              `[PlannerAgent] Pass B round ${passBRound}: OFFSET REGRESSION detected ` +
+              `(${currentOffset} → ${newOffset}). LLM reset the counter incorrectly. ` +
+              `Stopping Pass B to prevent re-tracing already completed endpoints.`,
+              'warning'
+            );
+            break;
+          }
+
+          // GAP 4: granular progress per Pass B round
+          if (newTotal && newTotal > 0) {
+            const bPct = 47 + Math.round((newOffset / newTotal) * 3); // 47% → 50%
+            onProgress?.(Math.min(bPct, 50), `Call flow: ${newOffset} / ${newTotal} endpoints`);
+          }
+
+          // Check again with fresh values
+          if (newTotal !== undefined && newOffset >= newTotal) {
+            onLog?.(`[PlannerAgent] Pass B complete — all ${newTotal} entry points traced (${passBRound} rounds).`, 'success');
+            break;
+          }
+        }
+        if (passBRound >= MAX_PASS_B_ROUNDS) {
+          onLog?.(`[PlannerAgent] Pass B hit round cap (${MAX_PASS_B_ROUNDS}). Proceeding to Pass C.`, 'warning');
+        }
+        onLog?.('[PlannerAgent] Stage 3B complete — call flows built.', 'success');
+      } else {
+        onLog?.('[PlannerAgent] Stage 3B skipped — graphs are empty.', 'warning');
+      }
 
       onLog?.('[PlannerAgent] Stage 3C/5: Architecture Synthesis + Counters...', 'info');
-      await AgentExecutor.execute(
-        provider,
-        GRAPH_PASS_C_SYSTEM + customSuffix,
-        buildGraphPassCUserPrompt(legacyPath),
-        graphTools, context, undefined, resolvedModel, 'graph-resolver-architecture'
+      onProgress?.(51, 'Graph: Synthesizing architecture');
+      // GAP 1 applied: Pass C has a 12-minute hard timeout
+      await withPhaseTimeout(
+        AgentExecutor.execute(
+          provider,
+          GRAPH_PASS_C_SYSTEM + customSuffix,
+          buildGraphPassCUserPrompt(legacyPath, detectedStack.language, detectedStack.framework),
+          graphTools, context, resolvedModel, 'graph-resolver-architecture'
+        ),
+        PHASE_TIMEOUT_MS.graphPass,
+        'graph-pass-C',
+        onLog
       );
       onLog?.('[PlannerAgent] Stage 3C complete — architecture synthesized.', 'success');
+      // GAP 4: signal Pass C done before optional Pass D
+      onProgress?.(53, 'Graph: Architecture complete');
 
       // ── Validate outputs from all 3 passes ──────────────────────────────────
       await PlannerAgent.validateGraphResolverOutputs(modernPath, onLog);
@@ -467,12 +662,52 @@ export class PlannerAgent {
       const countersPresent = ctxAfterGraph.TOTAL_CALLABLE_UNITS !== undefined
                            || ctxAfterGraph.TOTAL_DATA_ENTITIES  !== undefined
                            || ctxAfterGraph.TOTAL_API_ENDPOINTS  !== undefined;
+
+      // Fix 4: If Pass C did not save counters, auto-run Pass D (counter-only recovery)
+      // Pass D is a minimal 2-3 turn pass: reads all 8 graphs, counts real entries,
+      // saves all 8 G5 counters. No architecture synthesis — just counts.
       if (!countersPresent) {
         onLog?.(
-          '[PlannerAgent] WARNING: Pass C did not save counters (TOTAL_CALLABLE_UNITS missing). ' +
-          'Section 26 (Risk Scorecard) may show zeros. Check graph-resolver-architecture logs.',
+          '[PlannerAgent] Pass C did not save G5 counters. Auto-running Pass D (counter recovery)...',
           'warning'
         );
+        try {
+          // GAP 1 applied: Pass D (counter recovery) also has a 12-minute timeout
+          await withPhaseTimeout(
+            AgentExecutor.execute(
+              provider,
+              GRAPH_PASS_D_SYSTEM + customSuffix,
+              buildGraphPassDUserPrompt(legacyPath, detectedStack.language, detectedStack.framework),
+              graphTools, context, resolvedModel, 'graph-resolver-counters'
+            ),
+            PHASE_TIMEOUT_MS.graphPass,
+            'graph-pass-D',
+            onLog
+          );
+          const ctxAfterPassD = await TaskContextManager.getContext(sessionId);
+          const passDCounters = ctxAfterPassD.TOTAL_CALLABLE_UNITS !== undefined
+                             || ctxAfterPassD.TOTAL_DATA_ENTITIES   !== undefined
+                             || ctxAfterPassD.TOTAL_API_ENDPOINTS   !== undefined;
+          if (passDCounters) {
+            onLog?.(
+              `[PlannerAgent] Pass D recovered counters: ${ctxAfterPassD.TOTAL_CALLABLE_UNITS ?? 0} functions | ` +
+              `${ctxAfterPassD.TOTAL_DATA_ENTITIES ?? 0} entities | ` +
+              `${ctxAfterPassD.TOTAL_API_ENDPOINTS ?? 0} endpoints`,
+              'success'
+            );
+          } else {
+            onLog?.(
+              '[PlannerAgent] Pass D also failed to save counters. Section 26 will show zeros. ' +
+              'Check graph-resolver-counters logs for details.',
+              'warning'
+            );
+          }
+        } catch (passDErr: any) {
+          onLog?.(
+            `[PlannerAgent] Pass D failed: ${passDErr.message}. Continuing to section writing.`,
+            'warning'
+          );
+        }
       } else {
         onLog?.(
           `[PlannerAgent] Graph counters: ${ctxAfterGraph.TOTAL_CALLABLE_UNITS ?? 0} functions | ` +
@@ -504,9 +739,29 @@ export class PlannerAgent {
       // Check which sections already exist on disk (resume support)
       const alreadyWritten = await getWrittenSections(modernPath);
 
+      // GAP 2: also load sections previously determined N/A (no graph data)
+      // Without this, N/A sections are re-attempted every resume — wasting LLM calls
+      // on sections already confirmed to have no data in this codebase.
+      const taskCtxSections = await TaskContextManager.getContext(sessionId);
+      const naSkippedSections = new Set<number>();
+      for (const key of Object.keys(taskCtxSections)) {
+        if (key.startsWith('SECTION_') && key.endsWith('_STATUS')) {
+          const n = parseInt(key.replace('SECTION_', '').replace('_STATUS', ''), 10);
+          if (!isNaN(n) && taskCtxSections[key] === 'skipped-empty-graph') {
+            naSkippedSections.add(n);
+          }
+        }
+      }
+      if (naSkippedSections.size > 0) {
+        onLog?.(
+          `[PlannerAgent] Resume: ${naSkippedSections.size} section(s) previously marked N/A — skipping LLM calls.`,
+          'info'
+        );
+      }
+
       // Shared counter for real per-section progress (55–90%)
       // JS is single-threaded — counter increments are safe despite parallel awaits
-      let sectionsWritten = alreadyWritten.size;
+      let sectionsWritten = alreadyWritten.size + naSkippedSections.size;
       const totalSections = SECTION_CONFIG.length; // 26
 
       // Run sections in parallel batches (sections sharing a graph run sequentially)
@@ -528,6 +783,10 @@ export class PlannerAgent {
               context,
               resolvedModel,
               alreadyWritten,
+              naSkippedSections,   // GAP 2: pass N/A set so section writer skips them
+              sessionId,           // GAP 2: pass sessionId so N/A status can be persisted
+              detectedStack.language,  // language signal for Claude Code level prompting
+              detectedStack.framework, // framework signal
               onLog,
               () => {
                 sectionsWritten++;
@@ -584,23 +843,35 @@ export class PlannerAgent {
    * Uses a fresh AgentExecutor call per section → fresh context window.
    */
   private static async writeSingleSection(
-    section:        SectionConfig,
-    provider:       StreamingProvider,
-    systemPrompt:   string,
-    modernPath:     string,
-    tools:          ReturnType<typeof toolRegistry.getFunctions>,
-    context:        ToolContext,
-    resolvedModel:  string,
-    alreadyWritten: Set<number>,
-    onLog?:         (msg: string, lvl?: 'info' | 'success' | 'error' | 'warning') => void,
-    onSectionDone?: () => void
+    section:          SectionConfig,
+    provider:         StreamingProvider,
+    systemPrompt:     string,
+    modernPath:       string,
+    tools:            ReturnType<typeof toolRegistry.getFunctions>,
+    context:          ToolContext,
+    resolvedModel:    string,
+    alreadyWritten:   Set<number>,
+    naSkippedSections: Set<number>,  // GAP 2: sections already confirmed N/A on a prior run
+    sessionId:        string,         // GAP 2: needed to persist N/A status
+    language?:        string,         // primary language from detectedStack
+    framework?:       string,         // framework from detectedStack
+    onLog?:           (msg: string, lvl?: 'info' | 'success' | 'error' | 'warning') => void,
+    onSectionDone?:   () => void
   ): Promise<void> {
     const nn          = String(section.n).padStart(2, '0');
     const sectionFile = path.join(modernPath, '_analysis', 'sections', `section-${nn}.md`);
-    const graphsDir   = path.join(modernPath, '_analysis', 'graphs');
+    const graphsDir   = path.join(modernPath, '_analysis'); // Fix: graphs are in _analysis/ directly, not _analysis/graphs/
 
     if (alreadyWritten.has(section.n)) {
       onLog?.(`[PlannerAgent] Section ${section.n} already on disk — skipping.`, 'info');
+      return;
+    }
+
+    // GAP 2: skip sections previously confirmed N/A on a prior run
+    // This prevents re-calling the LLM on sections already proven to have no data
+    if (naSkippedSections.has(section.n)) {
+      onLog?.(`[PlannerAgent] Section ${section.n} previously marked N/A — skipping (no graph data for this codebase).`, 'info');
+      onSectionDone?.();
       return;
     }
 
@@ -614,8 +885,9 @@ export class PlannerAgent {
 
       if (!graphExists) {
         if (section.emptyGraphIsValid) {
-          // Graph doesn't exist and that's acceptable (e.g. no events in this project)
+          // GAP 2: persist N/A status so resume skips this section immediately
           await PlannerAgent.writeEmptySection(sectionFile, section, 'graph file not found — not applicable for this codebase');
+          await TaskContextManager.updateContext(sessionId, { [`SECTION_${section.n}_STATUS`]: 'skipped-empty-graph' });
           onLog?.(`[PlannerAgent] Section ${section.n}: ${section.graph}-graph not found — writing "not applicable" note.`, 'info');
           onSectionDone?.();
           return;
@@ -631,7 +903,9 @@ export class PlannerAgent {
           // Determine if graph has any entries (check common top-level arrays)
           const isEmpty = PlannerAgent.isGraphEmpty(graphData);
           if (isEmpty && section.emptyGraphIsValid) {
+            // GAP 2: persist N/A status so resume skips this section immediately
             await PlannerAgent.writeEmptySection(sectionFile, section, `${section.graph} graph contains no entries — not applicable for this codebase`);
+            await TaskContextManager.updateContext(sessionId, { [`SECTION_${section.n}_STATUS`]: 'skipped-empty-graph' });
             onLog?.(`[PlannerAgent] Section ${section.n}: ${section.graph}-graph is empty — writing "not applicable" note (emptyGraphIsValid=true).`, 'info');
             onSectionDone?.();
             return;
@@ -647,12 +921,17 @@ export class PlannerAgent {
     const minBytes = section.minContentBytes;
 
     onLog?.(`[PlannerAgent] Writing section ${section.n}: ${section.name}...`, 'info');
-    const userPrompt = buildSectionUserPrompt(section, modernPath);
+    const userPrompt = buildSectionUserPrompt(section, modernPath, language, framework);
 
-    // ── First attempt ──────────────────────────────────────────────────────────
-    await AgentExecutor.execute(
-      provider, systemPrompt, userPrompt, tools, context,
-      undefined, resolvedModel, `section-${section.n}`
+    // ── First attempt (GAP 1: 10-minute timeout per section) ───────────────────
+    await withPhaseTimeout(
+      AgentExecutor.execute(
+        provider, systemPrompt, userPrompt, tools, context,
+        resolvedModel, `section-${section.n}`
+      ),
+      PHASE_TIMEOUT_MS.section,
+      `section-${section.n}-first-attempt`,
+      onLog
     );
 
     // ── Validate output ────────────────────────────────────────────────────────
@@ -675,9 +954,15 @@ export class PlannerAgent {
       `and write ALL entries found. Include every item — do not truncate.\n` +
       `Then call write_file to save the complete section.`;
 
-    await AgentExecutor.execute(
-      provider, systemPrompt, retryPrompt, tools, context,
-      undefined, resolvedModel, `section-${section.n}-retry`
+    // GAP 1: retry also has a 10-minute timeout
+    await withPhaseTimeout(
+      AgentExecutor.execute(
+        provider, systemPrompt, retryPrompt, tools, context,
+        resolvedModel, `section-${section.n}-retry`
+      ),
+      PHASE_TIMEOUT_MS.section,
+      `section-${section.n}-retry`,
+      onLog
     );
 
     // ── Validate retry output ─────────────────────────────────────────────────
@@ -763,7 +1048,7 @@ export class PlannerAgent {
   ): Promise<boolean> {
     if (!section.graph) return false;
 
-    const graphFile = path.join(modernPath, '_analysis', 'graphs', `${section.graph}-graph.json`);
+    const graphFile = path.join(modernPath, '_analysis', `${section.graph}-graph.json`); // Fix: no /graphs/ subdirectory
     if (!(await fs.pathExists(graphFile))) return false;
 
     try {
@@ -852,16 +1137,26 @@ export class PlannerAgent {
         const data = JSON.parse(raw) as Record<string, unknown>;
         // Exclude _sources (internal dedup metadata) from domain entry count
         const realKeys = Object.keys(data).filter(k => k !== '_sources');
-        if (realKeys.length === 0) {
+        // Fix 8: Count real data entries — not just key existence.
+        // A key with an empty object/array value (e.g. {synthesized_overview: {}}) is NOT real data.
+        const realEntries = realKeys.filter(k => {
+          const v = data[k];
+          if (Array.isArray(v))                                    return v.length > 0;
+          if (v && typeof v === 'object') return Object.keys(v as object).length > 0;
+          if (typeof v === 'string')                               return (v as string).trim().length > 0;
+          return v !== null && v !== undefined;
+        });
+        if (realEntries.length === 0) {
           onLog?.(
-            `[GraphValidator] ⚠️ ${check.name}-graph: EMPTY. ` +
+            `[GraphValidator] ⚠️ ${check.name}-graph: ${realKeys.length} key(s) but 0 real data entries` +
+            ` (hollow graph — only metadata or empty objects). ` +
             `${check.sectionRef} will use TypeScript fallback or "not applicable" note.` +
             (check.critical ? ' (CRITICAL — check agent logs for errors)' : ''),
             'warning'
           );
         } else {
           onLog?.(
-            `[GraphValidator] ✅ ${check.name}-graph: ${realKeys.length} entries. ${check.sectionRef} ready.`,
+            `[GraphValidator] ✅ ${check.name}-graph: ${realEntries.length} real entries. ${check.sectionRef} ready.`,
             'success'
           );
         }
@@ -946,10 +1241,50 @@ export class PlannerAgent {
 
     // ── Step 3: Mark DONE for any file that contributed to a graph ─────────
     let updatedCount = 0;
+
+    // Non-code file basenames that legitimately contribute to no knowledge graph.
+    // These are always read (or trivially skipped) by the LLM but never appear in
+    // _sources because they have no extractable data. Auto-mark them DONE so they
+    // never block progress by staying PENDING indefinitely.
+    const NON_CODE_BASENAMES = new Set([
+      'package-lock.json', 'yarn.lock', 'pnpm-lock.yaml', 'npm-shrinkwrap.json',
+      'poetry.lock', 'pipfile.lock', 'cargo.lock', 'composer.lock', 'gemfile.lock', 'go.sum',
+      '.gitignore', '.gitattributes', '.npmignore', '.dockerignore', '.eslintignore',
+      '.prettierignore', '.editorconfig', '.nvmrc', '.node-version',
+      'license', 'license.md', 'license.txt', 'changelog.md', 'changelog.txt',
+      'contributing.md', 'security.md', 'readme.md', 'readme.rst', 'readme.txt', 'notice',
+    ]);
+    const NON_CODE_EXTENSIONS = new Set([
+      '.lock', '.log', '.map',
+      '.png', '.jpg', '.jpeg', '.gif', '.svg', '.webp', '.ico',
+      '.woff', '.woff2', '.ttf', '.eot', '.otf',
+    ]);
+    // Auto-mark doc and asset typed files DONE — no graph data expected from these.
+    const NON_CODE_TYPES = new Set(['doc', 'asset']);
+
     for (const entry of fileIndex) {
-      if (entry?.read_status !== 'DONE' && allSources.has(entry?.path)) {
+      if (entry?.read_status === 'DONE') continue;
+
+      // Mark DONE if file contributed to any graph
+      if (allSources.has(entry?.path)) {
         entry.read_status = 'DONE';
         updatedCount++;
+        continue;
+      }
+
+      // Auto-mark DONE if it is a known type (doc/asset) or a known non-code file
+      if (entry?.path) {
+        const basename  = path.basename(entry.path).toLowerCase();
+        const extension = path.extname(entry.path).toLowerCase();
+        const fileType  = (entry.type ?? '').toLowerCase();
+        if (
+          NON_CODE_TYPES.has(fileType) ||
+          NON_CODE_BASENAMES.has(basename) ||
+          NON_CODE_EXTENSIONS.has(extension)
+        ) {
+          entry.read_status = 'DONE';
+          updatedCount++;
+        }
       }
     }
 

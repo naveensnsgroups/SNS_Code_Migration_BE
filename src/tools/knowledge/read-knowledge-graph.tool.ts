@@ -30,7 +30,7 @@ export const readKnowledgeGraphTool: ToolRequest = {
     '14(Call Flows)→call-flow | 15(Transforms)→transform | 16(Config)→config | 17(Errors)→error | ' +
     '18(Validation)→rule | 19(State)→state | 20(Async)→async | 21(Tests)→test | ' +
     '22(Transactions)→db | 23(Events)→event | 24(Integrations)→integration | 25(Jobs)→job | ' +
-    '2(Architecture)→architecture.',
+    '2(Architecture)→architecture | 26(Risk/Migration)→imports (for migration ordering).',
   parameters: {
     type: 'object',
     properties: {
@@ -39,14 +39,29 @@ export const readKnowledgeGraphTool: ToolRequest = {
         description:
           'Name of the graph to read. One of: ' +
           'entity, symbol, rule, api, db, event, config, state, middleware, ' +
-          'security, transform, error, async, test, integration, job, call-flow, architecture.'
+          'security, transform, error, async, test, integration, job, call-flow, architecture, imports.'
+      },
+      filter: {
+        type: 'object',
+        description:
+          'Optional. Filter entries before returning. ' +
+          'Use { pathPrefix: "src/users/" } to return only entries from files in that directory. ' +
+          'Use { keys: ["createUser","updateUser"] } to return only specific top-level keys. ' +
+          'If omitted: returns all entries.'
+      },
+      limit: {
+        type: 'number',
+        description:
+          'Optional. Maximum number of top-level entries to return. ' +
+          'If graph has more entries, returns the first N plus a truncated:true flag. ' +
+          'Use limit=50 for section writing to avoid context overflow.'
       }
     },
     required: ['graphName']
   },
 
   handler: async (arg_string: string, ctx?: ToolContext) => {
-    let args: { graphName: string };
+    let args: { graphName: string; filter?: { pathPrefix?: string; keys?: string[] }; limit?: number };
     try {
       args = typeof arg_string === 'string' ? JSON.parse(arg_string) : arg_string;
     } catch {
@@ -68,6 +83,7 @@ export const readKnowledgeGraphTool: ToolRequest = {
         graphName:  args.graphName,
         data:       {},
         entryCount: 0,
+        truncated:  false,
         message:    `Graph not yet built: _analysis/${args.graphName}-graph.json. ` +
           `Run Phase 1 analysis first so append-to-knowledge-graph can populate this graph.`
       }));
@@ -83,14 +99,58 @@ export const readKnowledgeGraphTool: ToolRequest = {
     }
 
     // Strip internal _sources metadata before returning to the agent.
-    // _sources is for dedup tracking only — not domain data the LLM needs.
     const { _sources, ...domainData } = data;
 
-    const entryCount     = Object.keys(domainData).length;
-    const graphSizeBytes = JSON.stringify(domainData).length;
+    // ── Optional filtering ───────────────────────────────────────────────────────────────
+    let filteredData: Record<string, any> = domainData;
+    const f = args.filter;
+    if (f) {
+      if (f.pathPrefix) {
+        filteredData = Object.fromEntries(
+          Object.entries(domainData).filter(([k]) => k.startsWith(f.pathPrefix!))
+        );
+      } else if (f.keys && Array.isArray(f.keys)) {
+        filteredData = Object.fromEntries(
+          Object.entries(domainData).filter(([k]) => f.keys!.includes(k))
+        );
+      }
+    }
+
+    // ── Optional limit ─────────────────────────────────────────────────────────────────
+    let truncated = false;
+    const limit = typeof args.limit === 'number' && args.limit > 0 ? args.limit : undefined;
+    if (limit && Object.keys(filteredData).length > limit) {
+      const keys = Object.keys(filteredData).slice(0, limit);
+      filteredData = Object.fromEntries(keys.map(k => [k, filteredData[k]]));
+      truncated = true;
+    }
+
+    // ── Quality stats (symbol-graph only) ──────────────────────────────────────────────
+    let qualityStats: Record<string, number> | undefined;
+    if (args.graphName === 'symbol') {
+      const entries = Object.values(domainData) as any[];
+      const withPseudocode  = entries.filter(e => e?.pseudocode && String(e.pseudocode).trim().length > 10).length;
+      const withSideEffects = entries.filter(e => Array.isArray(e?.sideEffects) && e.sideEffects.length > 0).length;
+      const shallowPseudo   = entries.filter(e => {
+        const p = String(e?.pseudocode ?? '');
+        return p.length > 0 && p.split('\n').filter((l: string) => /^\d+\./.test(l.trim())).length < 3;
+      }).length;
+      qualityStats = {
+        totalSymbols:     entries.length,
+        withPseudocode,
+        withSideEffects,
+        shallowPseudocode: shallowPseudo,
+      };
+    }
+
+    const entryCount     = Object.keys(filteredData).length;
+    const totalEntries   = Object.keys(domainData).length;
+    const graphSizeBytes = JSON.stringify(filteredData).length;
 
     ctx?.onLog?.(
-      `[KnowledgeGraph] Read "${args.graphName}-graph": ${entryCount} entries, ${Math.round(graphSizeBytes / 1024)}KB`,
+      `[KnowledgeGraph] Read "${args.graphName}-graph": ${entryCount} entries returned` +
+        (truncated ? ` (${totalEntries} total, truncated)` : '') +
+        `, ${Math.round(graphSizeBytes / 1024)}KB`,
       'info'
     );
 
@@ -98,10 +158,15 @@ export const readKnowledgeGraphTool: ToolRequest = {
       exists:         true,
       graphName:      args.graphName,
       graphPath:      `_analysis/${args.graphName}-graph.json`,
-      data:           domainData,
+      data:           filteredData,
       entryCount,
+      totalEntries,
+      truncated,
       graphSizeBytes,
-      message: `Loaded ${args.graphName}-graph: ${entryCount} top-level entries.`
+      qualityStats,
+      message: `Loaded ${args.graphName}-graph: ${entryCount} entries returned` +
+        (truncated ? ` (truncated — ${totalEntries} total; use filter/limit to page through remaining)` : '') +
+        `.`
     }));
   }
 };

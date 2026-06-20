@@ -6,6 +6,7 @@
 import { ClaudeService }    from './anthropic/claude-service.js';
 import { ClaudeProvider, ClaudeProviderConfig } from './anthropic/anthropic-language-model.js';
 import { GeminiService, GeminiProvider, GeminiProviderConfig } from './google/gemini-language-model.js';
+import { MistralService, MistralProvider, MistralProviderConfig } from './mistral/mistral-language-model.js';
 import { OpenAIService }    from './openai/openai-service.js';
 import { HuggingFaceService } from './huggingface/huggingface-service.js';
 
@@ -69,6 +70,8 @@ export class AIProviderFactory {
         return new OpenAIService(model, apiKey);
       case 'google':
         return new GeminiService(model, apiKey);
+      case 'mistral':
+        return new MistralService(model, apiKey);
       case 'grok':
         return new OpenAIService(model, apiKey, 'https://api.x.ai/v1');
       case 'groq':
@@ -95,7 +98,7 @@ export class AIProviderFactory {
     provider: string,
     model: string,
     apiKey: string,
-    config?: GeminiProviderConfig & ClaudeProviderConfig
+    config?: GeminiProviderConfig & ClaudeProviderConfig & MistralProviderConfig
   ): StreamingProvider {
     switch (provider.toLowerCase()) {
 
@@ -108,6 +111,12 @@ export class AIProviderFactory {
       // No timeout — migration sessions can run for hours on large codebases.
       case 'anthropic':
         return new ClaudeProvider(model, apiKey, config);
+
+      // ── Mistral AI ────────────────────────────────────────────────────────
+      // Uses client.chat.stream() with OpenAI-compatible tool calling.
+      // Models: mistral-large-latest, mistral-small-latest, codestral-latest
+      case 'mistral':
+        return new MistralProvider(model, apiKey, config);
 
       // ── OpenAI-compatible ─────────────────────────────────────────────────
       // All use same OpenAI-compatible streaming API, different baseURLs.
@@ -127,7 +136,7 @@ export class AIProviderFactory {
       default:
         throw new Error(
           `Unsupported streaming provider: "${provider}". ` +
-          `Available: google, anthropic. Coming soon: openai, grok, groq, openrouter.`
+          `Available: google, anthropic, mistral. Coming soon: openai, grok, groq, openrouter.`
         );
     }
   }

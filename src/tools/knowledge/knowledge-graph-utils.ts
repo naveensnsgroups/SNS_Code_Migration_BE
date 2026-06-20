@@ -26,6 +26,7 @@ const ENTITY_INDEXED_GRAPHS = new Set([
   'integration',  // { "Stripe": { purpose, auth, operations:[...] } }
   'job',          // { "Daily Report": { schedule, implementation, ... } }
   'call-flow',    // { "POST /users": { steps:[...] } }
+  'imports',      // { "src/file.ts": { imports:[...], importedBy:[...], externalPackages:[...] } }
 ]);
 
 /**

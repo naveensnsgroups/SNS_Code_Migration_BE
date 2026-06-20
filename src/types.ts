@@ -43,7 +43,7 @@ export interface TargetStack {
   outputMode: 'direct' | 'suggest';
 }
 
-export type AIProvider = 'anthropic' | 'openai' | 'google' | 'grok' | 'groq' | 'openrouter' | 'huggingface';
+export type AIProvider = 'anthropic' | 'openai' | 'google' | 'grok' | 'groq' | 'openrouter' | 'mistral' | 'huggingface';
 
 export interface FileNode {
   name: string;

@@ -15,7 +15,7 @@
 //      from './compactor/agent-context-compactor.js';
 // =============================================================================
 
-import { LanguageModelMessage } from '../../types/language-model.js';
+import { LanguageModelMessage, TextMessage } from '../../types/language-model.js';
 
 // ── Provider-Family Context Limits ────────────────────────────────────────────
 //
@@ -135,11 +135,27 @@ export function compactMessagesIfNeeded(
   const before = messages.length;
   messages.splice(0, messages.length, ...head, ...tail);
 
+  // ── Context Bridge Message ────────────────────────────────────────────────────
+  // After compaction the LLM's middle conversation history (tool results from
+  // earlier turns) is silently dropped. Without a bridge, the LLM may think it
+  // has no context and restart from the beginning — re-reading files it already
+  // processed. This user TextMessage (valid in Claude + Gemini) tells the LLM
+  // exactly what happened and how to recover using the on-disk checkpoint.
+  messages.push({
+    actor: 'user',
+    type:  'text',
+    text:
+      `[SYSTEM: Context window compacted — ${before - messages.length} stale conversation turns removed to free context space. ` +
+      `Your analysis work is NOT lost — all extracted data was written to knowledge graph files on disk. ` +
+      `To resume: call get_task_context to check LAST_FILE_ANALYZED, then continue processing ` +
+      `the next PENDING file from FILE_INDEX. Do not restart from the beginning.]`,
+  } as TextMessage);
+
   onLog?.(
     `[ContextCompactor] Turn ${iteration}: ` +
     `${Math.round(currentChars / 1000)}K chars > ${Math.round(budget / 1000)}K budget. ` +
-    `Compacted ${before} → ${messages.length} messages ` +
-    `(kept last ${Math.round(tailChars / 1000)}K chars of history).`,
+    `Compacted ${before} → ${messages.length - 1} messages ` +
+    `(kept last ${Math.round(tailChars / 1000)}K chars of history + injected context bridge).`,
     'info'
   );
 
