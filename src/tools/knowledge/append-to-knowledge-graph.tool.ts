@@ -26,8 +26,8 @@ export const appendToKnowledgeGraphTool: ToolRequest = {
     'build cross-file knowledge graphs. Instead of loading 50+ raw per-file analysis keys at ' +
     'report time, the agent reads the pre-merged graphs. ' +
     'Valid graphName values: entity, symbol, rule, api, db, event, config, state, middleware, ' +
-    'security, transform, error, async, test, integration, job, call-flow, architecture. ' +
-    'Data is merged intelligently: entity/symbol/api/db/event graphs merge by key name; ' +
+    'security, transform, error, async, test, integration, job, call-flow, architecture, imports. ' +
+    'Data is merged intelligently: entity/symbol/api/db/event/imports graphs merge by key name; ' +
     'rule/transform/test graphs append arrays; security/architecture/middleware/error graphs deep-merge. ' +
     'CRITICAL RULES: ' +
     '(1) sourceFile is REQUIRED — always pass the exact file path you just read. ' +
@@ -43,7 +43,7 @@ export const appendToKnowledgeGraphTool: ToolRequest = {
         description:
           'Name of the knowledge graph to update. Must be one of: ' +
           'entity, symbol, rule, api, db, event, config, state, middleware, ' +
-          'security, transform, error, async, test, integration, job, call-flow, architecture.'
+          'security, transform, error, async, test, integration, job, call-flow, architecture, imports.'
       },
       data: {
         type: 'object',
@@ -51,7 +51,7 @@ export const appendToKnowledgeGraphTool: ToolRequest = {
           'Data to merge into the graph. Shape must match the graph schema. ' +
           'entity-graph: { "EntityName": { table, files:[...], fields:[...], relations:[...] } } ' +
           'symbol-graph: { "funcName": { file, signature, isAsync, calledBy:[...], calls:[...] } } ' +
-          'rule-graph: { "domain": [{ rule, enforcement, violation, relatedFiles:[...] }] } ' +
+          'rule-graph: { "domain": [{ rule, type, enforcement, violation, pseudocode:[...], relatedFiles:[...], migratable:bool }] } ' +
           'api-graph: { "METHOD /path": { handler, auth, request:{}, responses:{}, middlewareChain:[...] } } ' +
           'db-graph: { "tableName": { operations:[{ type, fields, condition, function, calledFrom:[...] }] } } ' +
           'event-graph: { "event.name": { emittedIn, payload, listeners:[{ file, handler, does }] } } ' +
@@ -66,7 +66,8 @@ export const appendToKnowledgeGraphTool: ToolRequest = {
           'integration-graph: { "Provider": { purpose, auth, calledFrom, operations:[...] } } ' +
           'job-graph: { "Job Name": { schedule, scheduledIn, implementation, calls, type } } ' +
           'call-flow-graph: { "Use Case": { steps:[...] } } ' +
-          'architecture-graph: { type, layers:[...], patterns:[...], modules:[...], entryPoint }'
+          'architecture-graph: { type, layers:[...], patterns:[...], modules:[...], entryPoint } ' +
+          'imports-graph: { "relative/path/file.ts": { imports:[...localPaths], importedBy:[...localPaths], externalPackages:[...packageNames] } }'
       },
       sourceFile: {
         type: 'string',
@@ -118,12 +119,25 @@ export const appendToKnowledgeGraphTool: ToolRequest = {
         `You have TWO options: ` +
         `(A) If this file HAS data for "${args.graphName}": READ the file content first, EXTRACT the data, BUILD the correct schema, then call this tool again with real data. ` +
         `(B) If this file genuinely has NO data for "${args.graphName}": DO NOT call this tool at all. Simply SKIP this graph and move to the next graph type. ` +
-        `When ALL graphs for this file are done (or skipped), call edit-task-context with { "${args.sourceFile?.replace(/[^a-zA-Z0-9]/g, '_')}": "DONE" } to mark the file complete. ` +
+        `When ALL graphs for this file are done (or skipped): update read_status="DONE" for this file ` +
+        `inside the FILE_INDEX array and re-save the full array via edit_task_context({ "file-index": [updatedArray] }). ` +
         `See the graph_shapes section in your system prompt for the required schema for "${args.graphName}".`
       );
     }
 
-    const analysisDir = path.join(ctx!.modernPath, '_analysis');
+    // ── Null guard: modernPath must be set in ToolContext ─────────────────────
+    // Without modernPath the graph file path cannot be computed.
+    // agentExecutor.ts catch block would convert a TypeError into a tool error,
+    // but the message "Path must be a string" gives the LLM no actionable guidance.
+    if (!ctx?.modernPath) {
+      return makeToolErrorResult(
+        'append-to-knowledge-graph: modernPath not set in tool context. ' +
+        'This is an internal configuration error — the session may not have initialized correctly. ' +
+        'Do not retry this tool call. Report the error and stop.'
+      );
+    }
+
+    const analysisDir = path.join(ctx.modernPath, '_analysis');
     await fs.ensureDir(analysisDir);
     const graphPath = path.join(analysisDir, `${args.graphName}-graph.json`);
 

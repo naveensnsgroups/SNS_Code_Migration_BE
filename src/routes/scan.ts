@@ -26,7 +26,6 @@ router.post('/', upload.array('files'), async (req: Request, res: Response, next
     const session = await SessionManager.createSession(sessionId);
     
     await SessionManager.addLog(sessionId, `Initializing session ${sessionId}...`, 'info');
-    await SessionManager.addLog(sessionId, `Receiving and unpacking ${files.length} files...`, 'info');
 
     // 2. Write uploaded files to sessions/<sessionId>/legacy/ preserving their subfolder structure
     let paths: string[] = [];
@@ -53,6 +52,18 @@ router.post('/', upload.array('files'), async (req: Request, res: Response, next
     const cleanPaths = paths
       .map(p => p.replace(/\\/g, '/'))
       .filter(p => p && !p.includes('.git/') && !p.includes('node_modules/'));
+
+    // Log the real count: files that will actually be written (excludes .git, node_modules)
+    const rawCount = files.length;
+    const writtenCount = cleanPaths.length;
+    const skippedCount = rawCount - writtenCount;
+    await SessionManager.addLog(
+      sessionId,
+      skippedCount > 0
+        ? `Receiving and unpacking ${writtenCount} source files (${rawCount} total — ${skippedCount} excluded: .git / node_modules)...`
+        : `Receiving and unpacking ${writtenCount} files...`,
+      'info'
+    );
 
     if (cleanPaths.length > 0) {
       const firstPath = cleanPaths[0];
@@ -107,6 +118,7 @@ router.post('/', upload.array('files'), async (req: Request, res: Response, next
     // Run scanner agent in the background asynchronously
     ScannerAgent.run(
       session.projectPath,
+      session.modernPath,    // needed for scan-result.json persistence + idempotency
       aiConfig,
       async (msg, lvl) => {
         const entry = await SessionManager.addLog(sessionId, msg, lvl ?? 'info');
@@ -117,17 +129,22 @@ router.post('/', upload.array('files'), async (req: Request, res: Response, next
       // Update session settings on completion
       await SessionManager.updateSession(sessionId, {
         detectedStack: scanResult.detectedStack,
-        fileTree: scanResult.fileTree,
-        totalFiles: scanResult.fileList.length,
+        fileTree:      scanResult.fileTree,
+        totalFiles:    scanResult.filteredFileCount,
+        rawFileCount:  scanResult.rawFileCount,
       });
 
       // Broadcast scan completion to SSE clients
       const { EventBroadcaster } = await import('./stream.js');
       EventBroadcaster.broadcast(sessionId, 'complete', {
-        success: true,
-        detectedStack: scanResult.detectedStack,
-        fileTree: scanResult.fileTree,
-        isScan: true,
+        success:           true,
+        detectedStack:     scanResult.detectedStack,
+        fileTree:          scanResult.fileTree,
+        filteredFileCount: scanResult.filteredFileCount,
+        rawFileCount:      scanResult.rawFileCount,
+        manifestsFound:    scanResult.manifestsFound,
+        confidence:        scanResult.confidence,
+        isScan:            true,
       });
     }).catch(async (err: any) => {
       console.error(`Background scan error for session ${sessionId}:`, err);

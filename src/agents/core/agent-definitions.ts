@@ -41,8 +41,8 @@ import {
   SCANNER_SYSTEM_PROMPT,
 } from '../../prompts/scanner-prompt.js';
 import {
-  ANALYZER_SYSTEM_PROMPT,
-} from '../../prompts/analyzer-prompt.js';
+  FILE_ANALYSIS_SYSTEM_PROMPT,
+} from '../../prompts/file-analysis-prompt.js';
 
 // =============================================================================
 //  SCANNER AGENT — Codebase Discovery (Pre-Stage 1)
@@ -141,8 +141,8 @@ export const STAGE1_PLANNER_AGENT: AgentDefinition = {
       defaultVariant: {
         id: 'migration-planner-stage1-system-default',
         label: 'Stage 1 Planner System Prompt',
-        // Template is stored in prompts/analyzer-prompt.ts — not inlined here
-        template: ANALYZER_SYSTEM_PROMPT,
+        // Template is stored in prompts/file-analysis-prompt.ts — single source of truth
+        template: FILE_ANALYSIS_SYSTEM_PROMPT,
       }
     }
   ],

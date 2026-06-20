@@ -72,6 +72,40 @@ router.get('/:sessionId', async (req: Request, res: Response) => {
     res.write(`data: ${JSON.stringify(sseEvent)}\n\n`);
   }
 
+  // Fix 6: After logs, replay persisted progress + phase state so the UI
+  // restores correctly on tab refresh / network reconnect.
+  // Without this, the progress bar resets to 0% and all phases show "pending",
+  // causing users to think the analysis failed and click Start again (duplicate run).
+  try {
+    const sessionState = await SessionManager.getSession(sessionId);
+    if (sessionState) {
+      const ts = new Date().toLocaleTimeString('en-US', { hour12: false });
+
+      // Replay last known progress
+      if (sessionState.progress !== undefined) {
+        res.write(`data: ${JSON.stringify({
+          type: 'progress',
+          data: { percent: sessionState.progress, currentFile: sessionState.currentFile ?? '' },
+          timestamp: ts,
+        })}\n\n`);
+      }
+
+      // Replay phase statuses for all non-pending phases
+      for (const phase of sessionState.phases ?? []) {
+        if (phase.status !== 'pending') {
+          res.write(`data: ${JSON.stringify({
+            type: 'phase_change',
+            data: { phaseId: phase.id, status: phase.status, phase: phase.id },
+            timestamp: ts,
+          })}\n\n`);
+        }
+      }
+    }
+  } catch (stateErr) {
+    // Non-fatal: if state replay fails, client just starts from scratch
+    console.warn(`[SSE] State replay failed for session ${sessionId}:`, stateErr);
+  }
+
   // Keep connection alive with a heartbeat every 25 seconds
   const heartbeatInterval = setInterval(() => {
     const heartbeat: SSEEvent = {

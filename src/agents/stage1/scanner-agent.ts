@@ -1,72 +1,33 @@
-// =============================================================================
-//  scanner-agent.ts — Codebase Scanner Agent (SNS IDE Standard)
-//
-//  Runs before Stage 1. Quickly detects the technology stack by reading
-//  manifest files and project structure.
-//
-//  Rules:
-//   - NO hardcoded values: no model names, no API keys, no default stack strings
-//   - Provider, model, and API key come from route parameters (passed in)
-//   - System prompt imported from prompts/scanner-prompt.ts
-//   - Tool IDs imported from common/workspace-functions.ts
-//   - Agent definition imported from agent-definitions.ts (SCANNER_AGENT)
-//   - fallback stack is NOT a hardcoded guess — it is the result of runBackupScan()
-// =============================================================================
-
-import { scanProjectDirectory } from '../../tools/fileScanner.js';
+import { scanProjectDirectory, computeFilteredFileCount, findManifestFiles } from '../../tools/fileScanner.js';
+import fs   from 'fs-extra';
+import path from 'path';
 import { DetectedStack, FileNode } from '../../types.js';
 import { toolRegistry } from '../../core/tool-invocation-registry.js';
 import { ToolContext } from '../../types/tool.js';
 import { AgentExecutor } from '../core/agentExecutor.js';
 import { AIProviderFactory } from '../../ai/provider.js';
 import { StreamingProvider } from '../../types/language-model.js';
-import {
-  GET_WORKSPACE_DIRECTORY_STRUCTURE_FUNCTION_ID,
-  GET_WORKSPACE_FILE_LIST_FUNCTION_ID,
-} from '../../common/workspace-functions.js';
-import {
-  SCANNER_SYSTEM_PROMPT,
-  buildScannerUserPrompt,
-} from '../../prompts/scanner-prompt.js';
-import {
-  SCANNER_AGENT,
-} from '../core/agent-definitions.js';
+import { SCANNER_SYSTEM_PROMPT, buildScannerUserPrompt } from '../../prompts/scanner-prompt.js';
+import { SCANNER_AGENT } from '../core/agent-definitions.js';
 
-// ── Scanner Agent Configuration ───────────────────────────────────────────────
-// Max tool-call turns for the scanner agent.
-// Defined as a named constant — not hardcoded inline.
-const SCANNER_MAX_TURNS = 10;
-
-// ── Default "Not Detected" Values ─────────────────────────────────────────────
-// These are placeholder values used ONLY before runBackupScan() runs.
-// They are overwritten by either AI detection or the backup scan.
-// They are NOT the "result" — they are initial null-state markers.
-const STACK_NOT_DETECTED = 'Not Detected';
-const STACK_UNKNOWN_LANGUAGE = 'Unknown';
+const STACK_NOT_DETECTED            = 'Not Detected';
+const STACK_UNKNOWN_LANGUAGE        = 'Unknown';
 const STACK_UNKNOWN_PACKAGE_MANAGER = 'Not Detected';
 
-// NOTE: adaptTool() removed — all tools are now ToolRequest from the toolRegistry.
-// Use toolRegistry.getFunctions(...SCANNER_AGENT.functions) to get scanner tools.
-
-// ── Public Interface ──────────────────────────────────────────────────────────
-
 export interface ScanAgentResult {
-  detectedStack: DetectedStack;
-  fileTree: FileNode[];
-  fileList: string[];
-  summary: string;
+  detectedStack:     DetectedStack;
+  fileTree:          FileNode[];
+  fileList:          string[];
+  filteredFileCount: number;
+  rawFileCount:      number;
+  confidence:        'ai' | 'backup' | 'extension-fallback';
+  manifestsFound:    string[];
+  summary:           string;
 }
 
-/**
- * Configuration passed from the scan route.
- * Keeps all provider/model/API config out of this file.
- */
 export interface ScannerAgentConfig {
-  /** AI provider name: 'google' | 'anthropic' | 'openai' | 'openrouter' etc. */
   provider?: string;
-  /** Model identifier (e.g. the value from aliasesConfig['fast-model']). */
   model?: string;
-  /** API key for the provider. */
   apiKey?: string;
   maxRetries?: number;
   retryDelayRateLimit?: number;
@@ -74,78 +35,68 @@ export interface ScannerAgentConfig {
   timeoutMs?: number;
 }
 
-// ── ScannerAgent ──────────────────────────────────────────────────────────────
-
 export class ScannerAgent {
-  /**
-   * Scans the project directory and detects the technology stack.
-   *
-   * Step 1: Scan filesystem structure with scanProjectDirectory().
-   * Step 2: If AI config is provided, run the LLM agent for accurate stack detection.
-   * Step 3: If AI is unavailable or fails, fall back to static manifest inspection.
-   *
-   * @param projectPath  Absolute path to the project to scan.
-   * @param config       Optional AI provider config from the route request body.
-   * @param onLog        Log callback — streams messages to session logs + SSE.
-   */
   static async run(
     projectPath: string,
-    config?: ScannerAgentConfig,
-    onLog?: (message: string, level?: 'info' | 'success' | 'error' | 'warning') => void
+    modernPath:  string,
+    config?:     ScannerAgentConfig,
+    onLog?:      (message: string, level?: 'info' | 'success' | 'error' | 'warning') => void
   ): Promise<ScanAgentResult> {
+    const cached = await readCachedScanResult(modernPath, onLog);
+    if (cached) return cached;
+
     onLog?.('Scanning directory structure...', 'info');
     const { fileTree, fileList } = await scanProjectDirectory(projectPath);
-    onLog?.(`Found ${fileList.length} files. Analyzing stack manifests...`, 'info');
 
-    // ── Tool context (read-only — scanner never writes) ───────────────────
+    const rawFileCount      = fileList.length;
+    const filteredFileCount = computeFilteredFileCount(fileList);
+    const manifestFiles     = findManifestFiles(fileList);
+    onLog?.(
+      `[Phase 0] ${rawFileCount} total files. ` +
+      `${filteredFileCount} source files (filtered). ` +
+      `${manifestFiles.length} manifest file(s) detected.`,
+      'info'
+    );
+
     const sessionId = `scan-${Date.now().toString(36)}`;
     const context: ToolContext = {
       sessionId,
       legacyPath: projectPath,
-      modernPath: projectPath,   // Scanner is read-only; modernPath = legacyPath
+      modernPath:  projectPath,
       onLog: (msg, lvl) => onLog?.(msg, lvl),
     };
 
-    // ── Build ToolRequest[] from SCANNER_AGENT.functions ─────────────────
-    // Uses the agent definition's declared function list — no hardcoded names.
-    // toolRegistry.getFunctions() returns ToolRequest[] — SNS IDE standard.
     const scanTools = toolRegistry.getFunctions(...SCANNER_AGENT.functions);
 
-    // ── Initial "not yet detected" state ─────────────────────────────────
-    // These values are placeholders. runBackupScan() or the AI will fill them in.
     let detectedStack: DetectedStack = {
       language:            STACK_UNKNOWN_LANGUAGE,
       framework:           STACK_NOT_DETECTED,
       database:            STACK_NOT_DETECTED,
       packageManager:      STACK_UNKNOWN_PACKAGE_MANAGER,
-      fileCount:           fileList.length,
+      fileCount:           filteredFileCount,
       frontend:            STACK_NOT_DETECTED,
       apiLayer:            STACK_NOT_DETECTED,
       backend:             STACK_NOT_DETECTED,
       databaseLayer:       STACK_NOT_DETECTED,
       cloudInfrastructure: STACK_NOT_DETECTED,
     };
-    let summary = `Project contains ${fileList.length} files.`;
+    let summary    = `Project contains ${filteredFileCount} source files.`;
+    let confidence: ScanAgentResult['confidence'] = 'extension-fallback';
 
-    // ── AI-powered stack detection ─────────────────────────────────────────
     if (config?.provider && config?.apiKey) {
       try {
         onLog?.('Querying autonomous codebase scanner agent for stack verification...', 'info');
 
-        // Resolve model: use the provided model, or default to the agent's
-        // languageModelRequirements[0].identifier (minus the 'alias:' prefix).
-        // The ACTUAL alias resolution happens in the scan route (caller's responsibility).
         const resolvedModel = config.model
           || SCANNER_AGENT.languageModelRequirements[0]?.identifier?.replace('alias:', '')
           || 'fast-model';
 
         const providerConfig = {
-          maxRetries: config.maxRetries,
-          retryDelayRateLimit: config.retryDelayRateLimit,
-          retryDelayOther: config.retryDelayOther,
+          maxRetries:           config.maxRetries,
+          retryDelayRateLimit:  config.retryDelayRateLimit,
+          retryDelayOther:      config.retryDelayOther,
         };
 
-        // Build provider using AIProviderFactory.
         const provider: StreamingProvider = AIProviderFactory.getStreamingProvider(
           config.provider,
           resolvedModel,
@@ -153,37 +104,23 @@ export class ScannerAgent {
           providerConfig
         );
 
-        // User prompt comes from the prompts file — not hardcoded here.
-        const userPrompt = buildScannerUserPrompt(projectPath);
+        const userPrompt = buildScannerUserPrompt(projectPath, rawFileCount, manifestFiles);
 
         const executorResponse = await AgentExecutor.execute(
           provider,
-          SCANNER_SYSTEM_PROMPT,   // System prompt from prompts/scanner-prompt.ts
-          userPrompt,              // User prompt from buildScannerUserPrompt()
-          scanTools,               // Tools from SCANNER_AGENT.functions
+          SCANNER_SYSTEM_PROMPT,
+          userPrompt,
+          scanTools,
           context,
-          SCANNER_MAX_TURNS,       // Named constant — not inline number
           resolvedModel,
           'scanner-agent'
         );
 
-        // ── Parse the agent's JSON response — bulletproof extraction ────────
-        // LLM can return any of these patterns:
-        //   1. Raw:           { "language": "C++", ... }
-        //   2. Fenced:        ```json\n{ ... }\n```
-        //   3. Text+JSON:     "Here is the result:\n{ ... }"
-        //   4. Double-object: { ... }\n{ ... }   ← take only FIRST match
-        //   5. Comments:      { // inline comment\n "key": "val" }
-        //   6. Trailing text: { ... }\nSome explanation after
-
-        // Step 1: Strip markdown code fences (```json...``` or ```...```)
         const stripped = executorResponse
           .replace(/```json\s*/gi, '')
           .replace(/```\s*/gi, '')
           .trim();
 
-        // Step 2: Extract the FIRST complete {...} block (handles text before/after JSON)
-        // Uses a stack-based extractor to find the matching closing brace correctly
         const jsonToParse = extractFirstJsonObject(stripped);
 
         let parsed: Record<string, string> = {};
@@ -191,12 +128,12 @@ export class ScannerAgent {
           parsed = JSON.parse(jsonToParse);
         } catch (err: any) {
           onLog?.(
-            `AI scanner returned non-JSON response — using static backup scan instead. Error: ${err.message}`,
+            `[Phase 0] AI scanner returned non-JSON response. Error: ${err.message}. ` +
+            'Stack left as Not Detected — Phase 1 Discovery will classify.',
             'warning'
           );
         }
 
-        // Apply only fields that were successfully detected (parsed may be empty {})
         if (parsed.language)            detectedStack.language            = parsed.language;
         if (parsed.framework)           detectedStack.framework           = parsed.framework;
         if (parsed.database)            detectedStack.database            = parsed.database;
@@ -208,68 +145,148 @@ export class ScannerAgent {
         if (parsed.cloudInfrastructure) detectedStack.cloudInfrastructure = parsed.cloudInfrastructure;
         if (parsed.summary)             summary                           = parsed.summary;
 
-        // If parsed had no usable fields (Gemini returned only text, parsed = {}),
-        // run backup scan to ensure detectedStack is fully populated.
         const aiDetectedAnything = !!(parsed.language || parsed.framework || parsed.backend);
         if (!aiDetectedAnything) {
-          await runBackupScan(projectPath, fileList, detectedStack);
-          summary = buildSummaryString(fileList.length, detectedStack);
+          onLog?.(
+            '[Phase 0] AI agent returned no structured fields. ' +
+            'Stack left as Not Detected — Phase 1 Discovery will classify.',
+            'warning'
+          );
+          confidence = 'extension-fallback';
+        } else {
+          confidence = 'ai';
         }
 
         onLog?.(
-          `Stack detection complete. ` +
+          `[Phase 0] Stack detection complete. ` +
           `Detected: ${detectedStack.language} / ${detectedStack.framework} / ${detectedStack.database}`,
           'success'
         );
       } catch (err: unknown) {
         const message = err instanceof Error ? err.message : 'Unknown error';
-        onLog?.(`AI stack analysis error: ${message}. Running static backup scan.`, 'warning');
-        await runBackupScan(projectPath, fileList, detectedStack);
-        summary = buildSummaryString(fileList.length, detectedStack);
+        onLog?.(
+          `[Phase 0] AI stack analysis error: ${message}. ` +
+          'Stack left as Not Detected — Phase 1 Discovery will classify.',
+          'warning'
+        );
+        confidence = 'extension-fallback';
       }
     } else {
-      onLog?.('No AI service specified. Running local static backup scan.', 'info');
-      await runBackupScan(projectPath, fileList, detectedStack);
-      summary = buildSummaryString(fileList.length, detectedStack);
+      onLog?.(
+        '[Phase 0] No AI provider configured. ' +
+        'Stack left as Not Detected — Phase 1 Discovery will classify.',
+        'info'
+      );
+      confidence = 'extension-fallback';
     }
 
-    return { detectedStack, fileTree, fileList, summary };
+    detectedStack.fileCount = filteredFileCount;
+    summary = buildSummaryString(filteredFileCount, detectedStack);
+
+    await writeScanResult(modernPath, detectedStack, filteredFileCount, rawFileCount, confidence, manifestFiles, summary);
+
+    return {
+      detectedStack,
+      fileTree,
+      fileList,
+      filteredFileCount,
+      rawFileCount,
+      confidence,
+      manifestsFound: manifestFiles,
+      summary,
+    };
   }
 }
 
-// ── Summary Builder ───────────────────────────────────────────────────────────
-// Extracted to avoid duplicated string formatting in multiple code paths.
 function buildSummaryString(fileCount: number, stack: DetectedStack): string {
-  return `Project contains ${fileCount} files. ` +
+  return `Project contains ${fileCount} source files. ` +
     `Detected: ${stack.language} / ${stack.framework} / ${stack.database}`;
 }
 
+async function readCachedScanResult(
+  modernPath: string,
+  onLog?: (msg: string, level?: 'info' | 'success' | 'error' | 'warning') => void
+): Promise<ScanAgentResult | null> {
+  try {
+    const resultFile = path.join(modernPath, '_analysis', 'scan-result.json');
+    if (await fs.pathExists(resultFile)) {
+      const cached = await fs.readJson(resultFile) as Record<string, any>;
+      onLog?.(
+        `[Phase 0] scan-result.json found on disk (scanned: ${cached.scannedAt ?? 'unknown'}). ` +
+        `Skipping re-scan — using cached result.`,
+        'info'
+      );
+      return {
+        detectedStack: {
+          language:            cached.language            ?? STACK_UNKNOWN_LANGUAGE,
+          framework:           cached.framework           ?? STACK_NOT_DETECTED,
+          database:            cached.database            ?? STACK_NOT_DETECTED,
+          packageManager:      cached.packageManager      ?? STACK_UNKNOWN_PACKAGE_MANAGER,
+          fileCount:           cached.filteredFileCount   ?? 0,
+          frontend:            cached.frontend            ?? STACK_NOT_DETECTED,
+          apiLayer:            cached.apiLayer            ?? STACK_NOT_DETECTED,
+          backend:             cached.backend             ?? STACK_NOT_DETECTED,
+          databaseLayer:       cached.databaseLayer       ?? STACK_NOT_DETECTED,
+          cloudInfrastructure: cached.cloudInfrastructure ?? STACK_NOT_DETECTED,
+        },
+        fileTree:          [],
+        fileList:          [],
+        filteredFileCount: cached.filteredFileCount ?? 0,
+        rawFileCount:      cached.rawFileCount      ?? 0,
+        confidence:        (cached.confidence as ScanAgentResult['confidence']) ?? 'extension-fallback',
+        manifestsFound:    cached.manifestsFound    ?? [],
+        summary:           cached.summary           ?? '',
+      };
+    }
+  } catch {
+    /* cache miss — proceed with fresh scan */
+  }
+  return null;
+}
 
-// ── JSON Extraction Utilities ─────────────────────────────────────────────────
+async function writeScanResult(
+  modernPath:        string,
+  detectedStack:     DetectedStack,
+  filteredFileCount: number,
+  rawFileCount:      number,
+  confidence:        ScanAgentResult['confidence'],
+  manifestsFound:    string[],
+  summary:           string
+): Promise<void> {
+  try {
+    const analysisDir = path.join(modernPath, '_analysis');
+    await fs.ensureDir(analysisDir);
+    await fs.writeJson(
+      path.join(analysisDir, 'scan-result.json'),
+      {
+        language:            detectedStack.language,
+        framework:           detectedStack.framework,
+        database:            detectedStack.database,
+        packageManager:      detectedStack.packageManager,
+        frontend:            detectedStack.frontend,
+        apiLayer:            detectedStack.apiLayer,
+        backend:             detectedStack.backend,
+        databaseLayer:       detectedStack.databaseLayer,
+        cloudInfrastructure: detectedStack.cloudInfrastructure,
+        filteredFileCount,
+        rawFileCount,
+        confidence,
+        manifestsFound,
+        summary,
+        scannedAt: new Date().toISOString(),
+      },
+      { spaces: 2 }
+    );
+  } catch (err) {
+    console.warn('[Phase 0] Could not write scan-result.json:', err);
+  }
+}
 
-/**
- * Extracts the FIRST valid {...} JSON object from LLM text output.
- *
- * Handles all common LLM output patterns:
- *   1. Raw JSON:        { "language": "C++", ... }
- *   2. Fenced:          ```json\n{...}\n``` (fences stripped by caller)
- *   3. Prefixed text:   "Here's the result:\n{ ... }"
- *   4. Double objects:  { ... }\n{ ... }  → takes only FIRST block
- *   5. Inline comments: { // comment\n "key": "val" }
- *   6. Trailing commas: { "key": "val", }
- *
- * Uses stack-based brace counting (not greedy regex) to avoid
- * "Unexpected non-whitespace character after JSON" on multi-object responses.
- */
 function extractFirstJsonObject(text: string): string {
-  // Step 1: Remove // line comments outside of string values
   const withoutComments = removeLineComments(text);
-
-  // Step 2: Find the first opening brace
   const start = withoutComments.indexOf('{');
   if (start === -1) return text.trim();
 
-  // Step 3: Stack-count braces to find the matching closing brace
   let depth = 0;
   let inString = false;
   let escape = false;
@@ -277,11 +294,11 @@ function extractFirstJsonObject(text: string): string {
 
   for (let i = start; i < withoutComments.length; i++) {
     const ch = withoutComments[i];
-    if (escape)      { escape = false; continue; }
+    if (escape)               { escape = false; continue; }
     if (ch === '\\' && inString) { escape = true; continue; }
-    if (ch === '"')  { inString = !inString; continue; }
-    if (inString)    continue;
-    if (ch === '{')  depth++;
+    if (ch === '"')           { inString = !inString; continue; }
+    if (inString)             continue;
+    if (ch === '{')           depth++;
     else if (ch === '}') {
       depth--;
       if (depth === 0) { end = i; break; }
@@ -289,26 +306,20 @@ function extractFirstJsonObject(text: string): string {
   }
 
   if (end === -1) return withoutComments.trim();
-
-  // Step 4: Extract and remove trailing commas
   return removeTrailingCommas(withoutComments.slice(start, end + 1));
 }
 
-/**
- * Removes // line comments that are NOT inside JSON string values.
- * Preserves URLs (http://, https://).
- */
 function removeLineComments(text: string): string {
   return text.split('\n').map(line => {
     let inStr = false;
     let esc = false;
     for (let i = 0; i < line.length - 1; i++) {
       const ch = line[i];
-      if (esc)        { esc = false; continue; }
+      if (esc)         { esc = false; continue; }
       if (ch === '\\') { esc = true; continue; }
-      if (ch === '"') { inStr = !inStr; continue; }
+      if (ch === '"')  { inStr = !inStr; continue; }
       if (!inStr && ch === '/' && line[i + 1] === '/') {
-        if (/https?:\s*$/.test(line.slice(0, i))) continue; // preserve URLs
+        if (/https?:\s*$/.test(line.slice(0, i))) continue;
         return line.slice(0, i).trimEnd();
       }
     }
@@ -316,307 +327,6 @@ function removeLineComments(text: string): string {
   }).join('\n');
 }
 
-/** Removes trailing commas before } or ] (invalid JSON but common in LLM output). */
 function removeTrailingCommas(str: string): string {
   return str.replace(/,(\s*[}\]])/g, '$1');
-}
-
-// ── Static Backup Scan ────────────────────────────────────────────────────────
-// Inspects manifest files without AI. Used when no AI config is provided
-// or when the AI agent fails. Results override the placeholder values above.
-async function runBackupScan(
-  projectPath: string,
-  fileList: string[],
-  stack: DetectedStack
-): Promise<void> {
-  const hasPkgJson   = fileList.some(f => f.endsWith('package.json'));
-  const hasReqTxt    = fileList.some(f => f.endsWith('requirements.txt'));
-  const hasPomXml    = fileList.some(f => f.endsWith('pom.xml'));
-  const hasGradle    = fileList.some(f => f.endsWith('build.gradle'));
-  const hasGoMod     = fileList.some(f => f.endsWith('go.mod'));
-  const hasCargo     = fileList.some(f => f.endsWith('Cargo.toml'));
-  const hasComposer  = fileList.some(f => f.endsWith('composer.json'));
-
-  const fs   = await import('fs-extra');
-  const path = await import('path');
-
-  // Reset to unknown before backup scan populates
-  stack.language            = STACK_UNKNOWN_LANGUAGE;
-  stack.framework           = STACK_NOT_DETECTED;
-  stack.database            = STACK_NOT_DETECTED;
-  stack.packageManager      = STACK_UNKNOWN_PACKAGE_MANAGER;
-  stack.frontend            = STACK_NOT_DETECTED;
-  stack.apiLayer            = STACK_NOT_DETECTED;
-  stack.backend             = STACK_NOT_DETECTED;
-  stack.databaseLayer       = STACK_NOT_DETECTED;
-  stack.cloudInfrastructure = STACK_NOT_DETECTED;
-
-  if (hasPkgJson) {
-    stack.language       = 'JavaScript';
-    stack.packageManager = 'npm';
-    stack.framework      = 'Generic Node.js App';
-    stack.backend        = 'Node.js Backend';
-
-    const hasYarnLock = fileList.some(f => f.endsWith('yarn.lock'));
-    const hasPnpmLock = fileList.some(f => f.endsWith('pnpm-lock.yaml'));
-    if (hasYarnLock) stack.packageManager = 'yarn';
-    else if (hasPnpmLock) stack.packageManager = 'pnpm';
-
-    const pkgFile = fileList.find(f => f.endsWith('package.json'));
-    if (pkgFile) {
-      try {
-        const pkg = await fs.default.readJson(path.default.join(projectPath, pkgFile));
-        const deps = { ...(pkg.dependencies || {}), ...(pkg.devDependencies || {}) };
-
-        if (deps.typescript) stack.language = 'TypeScript';
-
-        if (deps['@nestjs/core']) {
-          stack.framework = 'NestJS';
-          stack.backend   = 'NestJS Backend';
-          stack.apiLayer  = 'REST API (NestJS)';
-        } else if (deps.next) {
-          stack.framework = 'Next.js';
-          stack.frontend  = 'Next.js App';
-          stack.backend   = 'Next.js Server';
-        } else if (deps.express) {
-          stack.framework = 'Express.js';
-          stack.backend   = 'Express.js Backend';
-          stack.apiLayer  = 'REST API (Express)';
-        } else if (deps.react) {
-          stack.framework = 'React';
-          stack.frontend  = 'React SPA';
-        }
-
-        if (deps.mongodb || deps.mongoose) {
-          stack.database      = 'MongoDB';
-          stack.databaseLayer = 'MongoDB (Mongoose)';
-        } else if (deps.pg) {
-          stack.database      = 'PostgreSQL';
-          stack.databaseLayer = 'PostgreSQL';
-        } else if (deps.mysql || deps.mysql2) {
-          stack.database      = 'MySQL';
-          stack.databaseLayer = 'MySQL';
-        } else if (deps.sqlite3 || deps['better-sqlite3']) {
-          stack.database      = 'SQLite';
-          stack.databaseLayer = 'SQLite';
-        }
-      } catch { /* file unreadable — leave defaults */ }
-    }
-
-  } else if (hasReqTxt) {
-    stack.language       = 'Python';
-    stack.packageManager = 'pip';
-    stack.framework      = 'Generic Python Project';
-    stack.backend        = 'Python Application';
-
-    const reqFile = fileList.find(f => f.endsWith('requirements.txt'));
-    if (reqFile) {
-      try {
-        const content = await fs.default.readFile(path.default.join(projectPath, reqFile), 'utf-8');
-        const lines = content.toLowerCase();
-        if (lines.includes('django')) {
-          stack.framework = 'Django';
-          stack.backend   = 'Django Application';
-          stack.apiLayer  = 'Django Views/REST';
-        } else if (lines.includes('flask')) {
-          stack.framework = 'Flask';
-          stack.backend   = 'Flask Application';
-          stack.apiLayer  = 'REST API (Flask)';
-        } else if (lines.includes('fastapi')) {
-          stack.framework = 'FastAPI';
-          stack.backend   = 'FastAPI Service';
-          stack.apiLayer  = 'REST API (FastAPI)';
-        }
-        if (lines.includes('sqlalchemy')) stack.databaseLayer = 'SQLAlchemy ORM';
-        if (lines.includes('psycopg2')) {
-          stack.database      = 'PostgreSQL';
-          stack.databaseLayer = stack.databaseLayer !== STACK_NOT_DETECTED
-            ? `PostgreSQL (${stack.databaseLayer})`
-            : 'PostgreSQL';
-        } else if (lines.includes('pymongo')) {
-          stack.database      = 'MongoDB';
-          stack.databaseLayer = 'MongoDB';
-        } else if (lines.includes('pymysql') || lines.includes('mysqlclient')) {
-          stack.database = 'MySQL';
-        }
-      } catch { /* leave defaults */ }
-    }
-
-  } else if (hasGoMod) {
-    stack.language       = 'Go';
-    stack.packageManager = 'go mod';
-    stack.framework      = 'Standard Library';
-    stack.backend        = 'Go Service';
-
-    const goModFile = fileList.find(f => f.endsWith('go.mod'));
-    if (goModFile) {
-      try {
-        const content = await fs.default.readFile(path.default.join(projectPath, goModFile), 'utf-8');
-        if (content.includes('github.com/gin-gonic/gin')) {
-          stack.framework = 'Gin';
-          stack.backend   = 'Gin Service';
-          stack.apiLayer  = 'REST API (Gin)';
-        } else if (content.includes('github.com/gofiber/fiber')) {
-          stack.framework = 'Fiber';
-          stack.backend   = 'Fiber Service';
-          stack.apiLayer  = 'REST API (Fiber)';
-        } else if (content.includes('github.com/labstack/echo')) {
-          stack.framework = 'Echo';
-          stack.backend   = 'Echo Service';
-          stack.apiLayer  = 'REST API (Echo)';
-        }
-        if (content.includes('github.com/lib/pq')) {
-          stack.database      = 'PostgreSQL';
-          stack.databaseLayer = 'PostgreSQL';
-        } else if (content.includes('github.com/go-sql-driver/mysql')) {
-          stack.database      = 'MySQL';
-          stack.databaseLayer = 'MySQL';
-        }
-      } catch { /* leave defaults */ }
-    }
-
-  } else if (hasPomXml || hasGradle) {
-    stack.language       = 'Java';
-    stack.packageManager = hasPomXml ? 'maven' : 'gradle';
-    stack.framework      = 'Generic Java Project';
-    stack.backend        = 'Java Application';
-
-    const manifestFile = fileList.find(f => f.endsWith('pom.xml') || f.endsWith('build.gradle'));
-    if (manifestFile) {
-      try {
-        const content = await fs.default.readFile(path.default.join(projectPath, manifestFile), 'utf-8');
-        if (content.includes('spring-boot')) {
-          stack.framework = 'Spring Boot';
-          stack.backend   = 'Spring Boot App';
-          stack.apiLayer  = 'REST API (Spring Boot)';
-        }
-        if (content.includes('hibernate')) stack.databaseLayer = 'Hibernate ORM';
-        if (content.includes('postgresql')) stack.database = 'PostgreSQL';
-        else if (content.includes('mysql')) stack.database = 'MySQL';
-      } catch { /* leave defaults */ }
-    }
-
-  } else if (hasCargo) {
-    stack.language       = 'Rust';
-    stack.packageManager = 'cargo';
-    stack.framework      = 'Generic Rust Project';
-    stack.backend        = 'Rust Server';
-
-    const cargoFile = fileList.find(f => f.endsWith('Cargo.toml'));
-    if (cargoFile) {
-      try {
-        const content = await fs.default.readFile(path.default.join(projectPath, cargoFile), 'utf-8');
-        if (content.includes('actix-web')) {
-          stack.framework = 'Actix-web';
-          stack.backend   = 'Actix-web Service';
-          stack.apiLayer  = 'REST API (Actix-web)';
-        } else if (content.includes('axum')) {
-          stack.framework = 'Axum';
-          stack.backend   = 'Axum Service';
-          stack.apiLayer  = 'REST API (Axum)';
-        } else if (content.includes('rocket')) {
-          stack.framework = 'Rocket';
-          stack.backend   = 'Rocket Service';
-          stack.apiLayer  = 'REST API (Rocket)';
-        }
-        if (content.includes('diesel')) stack.databaseLayer = 'Diesel ORM';
-        else if (content.includes('sqlx')) stack.databaseLayer = 'SQLx Toolkit';
-        if (content.includes('postgres')) stack.database = 'PostgreSQL';
-        else if (content.includes('mysql')) stack.database = 'MySQL';
-      } catch { /* leave defaults */ }
-    }
-
-  } else if (hasComposer) {
-    stack.language       = 'PHP';
-    stack.packageManager = 'composer';
-    stack.framework      = 'Generic PHP Project';
-    stack.backend        = 'PHP Application';
-
-    const composerFile = fileList.find(f => f.endsWith('composer.json'));
-    if (composerFile) {
-      try {
-        const composer = await fs.default.readJson(path.default.join(projectPath, composerFile));
-        const deps = { ...(composer.require || {}), ...(composer['require-dev'] || {}) };
-        if (deps['laravel/framework']) {
-          stack.framework = 'Laravel';
-          stack.backend   = 'Laravel Engine';
-          stack.apiLayer  = 'REST API (Laravel)';
-          stack.frontend  = 'Blade Views / HTML';
-        } else if (deps['symfony/symfony']) {
-          stack.framework = 'Symfony';
-          stack.backend   = 'Symfony App';
-          stack.apiLayer  = 'Symfony API';
-        }
-        if (deps['doctrine/orm']) stack.databaseLayer = 'Doctrine ORM';
-        const keys = Object.keys(deps).join(' ');
-        if (keys.includes('pgsql') || keys.includes('pdo_pgsql')) stack.database = 'PostgreSQL';
-        else if (keys.includes('mysql') || keys.includes('pdo_mysql')) stack.database = 'MySQL';
-      } catch { /* leave defaults */ }
-    }
-
-  } else {
-    // Fall back to file-extension dominance analysis
-    const ignoreExts = new Set([
-      '.md', '.txt', '.json', '.yaml', '.yml', '.xml',
-      '.exe', '.dll', '.bin', '.pdf', '.png', '.jpg',
-      '.jpeg', '.gif', '.ico', '.svg', '.woff', '.woff2'
-    ]);
-    const extCounts: Record<string, number> = {};
-    for (const f of fileList) {
-      const ext = path.default.extname(f).toLowerCase();
-      if (ext && !ignoreExts.has(ext)) {
-        extCounts[ext] = (extCounts[ext] || 0) + 1;
-      }
-    }
-    const keys = Object.keys(extCounts);
-    const maxExt = keys.length > 0
-      ? keys.reduce((a, b) => extCounts[a] > extCounts[b] ? a : b)
-      : '';
-
-    if (maxExt === '.py') {
-      stack.language = 'Python'; stack.packageManager = 'pip';
-      stack.framework = 'Generic Python Project'; stack.backend = 'Python Script';
-    } else if (maxExt === '.java') {
-      stack.language = 'Java'; stack.packageManager = 'maven';
-      stack.framework = 'Generic Java Project'; stack.backend = 'Java Program';
-    } else if (maxExt === '.cpp' || maxExt === '.c' || maxExt === '.h' || maxExt === '.hpp') {
-      stack.language = 'C++'; stack.packageManager = 'CMake';
-      stack.framework = 'Generic C++ Project'; stack.backend = 'Native C++ Program';
-    } else if (maxExt === '.go') {
-      stack.language = 'Go'; stack.packageManager = 'go mod';
-      stack.framework = 'Generic Go Project'; stack.backend = 'Go Service';
-    } else if (maxExt === '.rs') {
-      stack.language = 'Rust'; stack.packageManager = 'cargo';
-      stack.framework = 'Generic Rust Project'; stack.backend = 'Rust Executable';
-    } else if (maxExt === '.cs') {
-      stack.language = 'C#'; stack.packageManager = 'nuget';
-      stack.framework = 'Generic .NET Project'; stack.backend = '.NET Core App';
-    } else if (maxExt === '.php') {
-      stack.language = 'PHP'; stack.packageManager = 'composer';
-      stack.framework = 'Generic PHP Project'; stack.backend = 'PHP Web Script';
-    } else if (maxExt === '.js' || maxExt === '.ts' || maxExt === '.tsx' || maxExt === '.jsx') {
-      stack.language = maxExt.startsWith('.t') ? 'TypeScript' : 'JavaScript';
-      stack.packageManager = 'npm';
-      stack.framework = 'Generic Node.js App'; stack.backend = 'Node.js Program';
-    }
-    // If no extension matches, language stays 'Unknown' — which is correct
-  }
-
-  // Detect Cloud / Infrastructure
-  const hasDockerfile    = fileList.some(f => f.toLowerCase().includes('dockerfile'));
-  const hasDockerCompose = fileList.some(f => f.toLowerCase().includes('docker-compose') || f.toLowerCase().includes('docker-stack'));
-  const hasTerraform     = fileList.some(f => f.endsWith('.tf'));
-  const hasK8s           = fileList.some(f => f.includes('k8s/') || f.includes('kubernetes/') || f.endsWith('k8s.yaml') || f.endsWith('k8s.yml'));
-
-  if (hasDockerfile && hasDockerCompose) {
-    stack.cloudInfrastructure = 'Docker & Compose';
-  } else if (hasDockerfile) {
-    stack.cloudInfrastructure = 'Docker';
-  } else if (hasK8s) {
-    stack.cloudInfrastructure = 'Kubernetes';
-  } else if (hasTerraform) {
-    stack.cloudInfrastructure = 'Terraform';
-  } else {
-    stack.cloudInfrastructure = 'None';
-  }
 }

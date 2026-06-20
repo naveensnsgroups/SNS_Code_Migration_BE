@@ -26,7 +26,9 @@ export interface MigrationSession {
   targetStack?: TargetStack;
   apiKey?: string;
   totalFiles: number;
+  rawFileCount?: number;
   completedFiles: number;
+  progress?: number;       // 0-100 — persisted for SSE reconnect replay (Fix 6)
   currentFile?: string;
   startedAt?: string;
   completedAt?: string;

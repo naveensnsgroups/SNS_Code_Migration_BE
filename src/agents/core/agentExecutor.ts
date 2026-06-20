@@ -41,13 +41,54 @@ import {
   compactMessagesIfNeeded,
 } from '../compactor/agent-context-compactor.js';
 
+// ── Agent Loop Configuration (all thresholds, error types, recovery messages) ─
+// Mirrors the provider-family prefix pattern from agent-context-compactor.ts.
+// Zero hardcoded values in this file — all config lives in agent-loop-config.ts.
+import {
+  resolveLoopConfig,
+  classifyToolError,
+  buildRecoveryMessage,
+  resetStateForErrorType,
+  createLoopState,
+  LoopState,
+} from './agent-loop-config.js';
+
 // ── Cost Estimation (extracted to compactor/agent-cost-estimator.ts) ────────────
 // Re-exported for backward compatibility.
 export { COST_TABLE, estimateCost } from '../compactor/agent-cost-estimator.js';
 
 
 
+// ── Canonical JSON Normalization ─────────────────────────────────────────────
+// LLMs produce non-deterministic JSON key ordering across retries.
+// Identical tool calls can arrive as:
+//   { "data": {}, "graphName": "api", "sourceFile": "x.js" }  ← key order A
+//   { "graphName": "api", "data": {}, "sourceFile": "x.js" }  ← key order B
+// Without normalization these produce different fingerprints, bypassing the
+// duplicate detection guard. sortKeysDeep recursively sorts all object keys
+// before JSON.stringify — producing the same canonical string for both.
+function sortKeysDeep(val: unknown): unknown {
+  if (Array.isArray(val)) return val.map(sortKeysDeep);
+  if (val !== null && typeof val === 'object') {
+    const obj = val as Record<string, unknown>;
+    return Object.keys(obj)
+      .sort()
+      .reduce<Record<string, unknown>>((acc, k) => { acc[k] = sortKeysDeep(obj[k]); return acc; }, {});
+  }
+  return val;
+}
+
+/** Produces a canonical, key-order-independent fingerprint for a tool call. */
+function normalizeToolArgs(rawArgs: string): string {
+  try {
+    return JSON.stringify(sortKeysDeep(JSON.parse(rawArgs)));
+  } catch {
+    return rawArgs; // fallback: unparseable args — use raw string
+  }
+}
+
 // ── Rate Limit Retry Helper ───────────────────────────────────────────────────
+
 // Wraps provider.request() with exponential backoff for 429 / 503 errors.
 // Free-tier models (Gemini 15 RPM, Claude/OpenAI limits) can hit rate limits
 // during multi-pass analysis. This retries transparently instead of crashing.
@@ -114,12 +155,15 @@ export class AgentExecutor {
     userPrompt: string,
     tools: ToolRequest[],
     context: ToolContext,
-    // Agent stops naturally when it has no more tool calls — this is only a safety net
-    // against infinite loops caused by bugs. Set very high so it is never reached in practice.
-    maxIterations = 10_000,
     modelName = '',
     agentId = 'migration-agent'
   ): Promise<string> {
+    // ── Resolve configs once — reused every turn (same pattern as compactor) ──
+    // loopConfig: all thresholds for this provider family (no hardcoded values)
+    // loopState:  mutable in-memory counters (fingerprints, noProgressTurns)
+    const loopConfig = resolveLoopConfig(modelName);
+    const loopState: LoopState = createLoopState();
+
     // ── Initialize message chain (SNS IDE LanguageModelMessage[]) ─────────
     const messages: LanguageModelMessage[] = [
       { actor: 'system', type: 'text', text: systemPrompt } as TextMessage,
@@ -134,7 +178,7 @@ export class AgentExecutor {
     // Resolve compaction budget once (model is fixed for the lifetime of this execute call)
     const compactionCharBudget = resolveCompactionCharBudget(modelName);
 
-    while (iteration < maxIterations) {
+    while (iteration < loopConfig.maxIterations) {
       iteration++;
 
       // ── Context Compaction (logic in compactor/agent-context-compactor.ts) ──
@@ -228,6 +272,38 @@ export class AgentExecutor {
 
       if (turnText) lastTextResponse = turnText;
 
+      // ── Reasoning Loop Detection ──────────────────────────────────────────
+      // Threshold and snippet size come from loopConfig (provider-family aware).
+      // flash-lite: 5K chars. gemini/gpt/groq: 10K. claude: 15K.
+      // Recovery message built by buildRecoveryMessage() — no inline strings here.
+      if (
+        turnText.length > loopConfig.reasoningLoopThreshold &&
+        pendingToolCalls.size === 0 &&
+        iteration > 1
+      ) {
+        const snippet  = turnText.slice(0, loopConfig.reasoningLoopSnippet);
+        const dropped  = Math.round((turnText.length - loopConfig.reasoningLoopSnippet) / 1_000);
+        const truncated = snippet +
+          `\n[...${dropped}K chars of repeated planning text omitted by orchestrator...]`;
+
+        // Push truncated text as AI turn (keeps message chain valid)
+        messages.push({ actor: 'ai', type: 'text', text: truncated } as TextMessage);
+
+        // Recovery message from config — no inline string
+        const recoveryMsg = buildRecoveryMessage(
+          'reasoning-loop', '', loopConfig, { turnChars: turnText.length }
+        );
+        messages.push({ actor: 'user', type: 'text', text: recoveryMsg } as TextMessage);
+
+        resetStateForErrorType(loopState, 'reasoning-loop');
+        context.onLog?.(
+          `[AgentExecutor] REASONING LOOP (${loopConfig.reasoningLoopThreshold / 1_000}K threshold): ` +
+          `Turn ${iteration} generated ${Math.round(turnText.length / 1_000)}K chars, zero tool calls — injected recovery.`,
+          'warning'
+        );
+        continue;
+      }
+
       // ── If there are pending tool calls (not handled by stream recursion) ─
       // This path handles non-Gemini providers / fallback cases
       if (pendingToolCalls.size > 0) {
@@ -253,54 +329,140 @@ export class AgentExecutor {
           if (!tool) {
             const errMsg = `Tool '${tc.name}' not registered. Available: ${tools.map(t => t.name).join(', ')}`;
             context.onLog?.(`[AgentExecutor] ${errMsg}`, 'warning');
-            result = makeToolErrorResult(errMsg, 'tool-not-available');
+            result = makeToolErrorResult(
+              buildRecoveryMessage('tool-not-found', tc.name, loopConfig),
+              'tool-not-found'
+            );
           } else {
-            context.onLog?.(`[Tool Call] Executing tool "${tc.name}"...`, 'info');
+            // ── Duplicate Call Fingerprint Detection ────────────────────────
+            // Sliding window: block calls where (name + args) was already seen
+            // fingerprintMaxDupes times. Costs vary by provider family.
+            // Window and threshold from loopConfig — no hardcoded values here.
+            const fingerprint  = `${tc.name}::${normalizeToolArgs(tc.args)}`;
+            const dupeCount    = loopState.toolCallFingerprints.filter(f => f === fingerprint).length;
 
-            // Broadcast structured tool_call event — FE receives clean JSON (no log parsing)
-            let parsedArgs: Record<string, unknown> = {};
-            try { parsedArgs = JSON.parse(tc.args) as Record<string, unknown>; } catch { /* keep empty */ }
-            EventBroadcaster.broadcast(context.sessionId, 'tool_call', {
-              name:    tc.name,
-              args:    parsedArgs,
-              agentId,
-            });
+            if (dupeCount >= loopConfig.fingerprintMaxDupes) {
+              // Block duplicate — return structured error, don't call real tool
+              const dupeMsg = buildRecoveryMessage('duplicate-blocked', tc.name, loopConfig);
+              context.onLog?.(
+                `[AgentExecutor] DUPLICATE BLOCKED: "${tc.name}" with same args already called ` +
+                `${dupeCount}x (limit: ${loopConfig.fingerprintMaxDupes}).`,
+                'warning'
+              );
+              result = makeToolErrorResult(dupeMsg, 'duplicate-blocked');
+              // Do NOT reset fingerprints — they are correctly blocking this call
+            } else {
+              context.onLog?.(`[Tool Call] Executing tool "${tc.name}"...`, 'info');
 
-            try {
-              // ← SNS IDE standard: pass raw JSON arg_string
-              result = await tool.handler(tc.args, { ...context, toolCallId: tc.id });
-              context.onLog?.(`[Tool Response] Completed "${tc.name}" successfully.`, 'success');
-
-              // Broadcast tool_response (success)
-              EventBroadcaster.broadcast(context.sessionId, 'tool_response', {
-                name:    tc.name,
-                success: true,
+              // Broadcast structured tool_call event
+              let parsedArgs: Record<string, unknown> = {};
+              try { parsedArgs = JSON.parse(tc.args) as Record<string, unknown>; } catch { /* keep empty */ }
+              EventBroadcaster.broadcast(context.sessionId, 'tool_call', {
+                name: tc.name, args: parsedArgs, agentId,
               });
-            } catch (err: unknown) {
-              const errMsg = err instanceof Error ? err.message : 'Unknown tool execution error';
-              context.onLog?.(`[Tool Error] Failed executing "${tc.name}": ${errMsg}`, 'error');
 
-              // Broadcast tool_response (failure)
-              EventBroadcaster.broadcast(context.sessionId, 'tool_response', {
-                name:    tc.name,
-                success: false,
-              });
-              result = makeToolErrorResult(errMsg);
+              try {
+                // ← SNS IDE standard: pass raw JSON arg_string
+                result = await tool.handler(tc.args, { ...context, toolCallId: tc.id });
+                context.onLog?.(`[Tool Response] Completed "${tc.name}" successfully.`, 'success');
+                EventBroadcaster.broadcast(context.sessionId, 'tool_response', {
+                  name: tc.name, success: true,
+                });
+
+                // Track fingerprint only on real (non-blocked) calls
+                loopState.toolCallFingerprints.push(fingerprint);
+                if (loopState.toolCallFingerprints.length > loopConfig.fingerprintWindow) {
+                  loopState.toolCallFingerprints.shift(); // drop oldest
+                }
+                // On success: clear entries for THIS tool only
+                // (different args for same tool = legitimate new call — clear old prints)
+                if (!hasToolError(result)) {
+                  loopState.toolCallFingerprints = loopState.toolCallFingerprints
+                    .filter(f => !f.startsWith(`${tc.name}::`));
+                }
+              } catch (err: unknown) {
+                const errMsg = err instanceof Error ? err.message : 'Unknown tool execution error';
+                context.onLog?.(`[Tool Error] Failed executing "${tc.name}": ${errMsg}`, 'error');
+                EventBroadcaster.broadcast(context.sessionId, 'tool_response', {
+                  name: tc.name, success: false,
+                });
+                result = makeToolErrorResult(errMsg);
+
+                // Track fingerprint for failed calls too (enables stuck detection)
+                loopState.toolCallFingerprints.push(fingerprint);
+                if (loopState.toolCallFingerprints.length > loopConfig.fingerprintWindow) {
+                  loopState.toolCallFingerprints.shift();
+                }
+              }
             }
           }
 
           // Append tool_result to the message chain
-          // is_error MUST reflect the actual outcome:
-          //   true  → Claude/Anthropic treats this as a failure and knows to retry
-          //   false → LLM treats this as success (wrong if tool actually failed)
           messages.push({
             actor: 'user',
             type: 'tool_result',
             tool_use_id: tc.id,
             name: tc.name,
             content: result,
-            is_error: hasToolError(result),  // ← reads actual error status from result
+            is_error: hasToolError(result),
           } as ToolResultMessage);
+        }
+
+        // ── Stuck Tool Detection ─────────────────────────────────────────────
+        // Window size and error threshold from loopConfig (not hardcoded).
+        // Recovery message from buildRecoveryMessage() — no inline strings.
+        {
+          const allResults = messages.filter(m => m.type === 'tool_result') as ToolResultMessage[];
+          const lastN      = allResults.slice(-loopConfig.stuckToolWindow);
+          if (lastN.length >= loopConfig.stuckToolWindow) {
+            const firstName        = lastN[0].name;
+            const allSameToolErrors = lastN.every(
+              r => r.name === firstName && r.is_error === true
+            );
+            if (allSameToolErrors) {
+              const stuckMsg = buildRecoveryMessage('stuck-tool', firstName, loopConfig);
+              messages.push({ actor: 'user', type: 'text', text: stuckMsg } as TextMessage);
+              resetStateForErrorType(loopState, 'stuck-tool');
+              context.onLog?.(
+                `[AgentExecutor] STUCK DETECTED: "${firstName}" failed ` +
+                `${loopConfig.stuckToolMaxErrors}x in a row — injected recovery.`,
+                'warning'
+              );
+            }
+          }
+        }
+
+        // ── No-Progress Detection ────────────────────────────────────────────
+        // If ALL tools this turn returned is_error:true → no state change made.
+        // After noProgressMaxTurns consecutive all-error turns → emergency recovery.
+        {
+          const thisTurnIds    = [...pendingToolCalls.keys()];
+          const allResults     = messages.filter(m => m.type === 'tool_result') as ToolResultMessage[];
+          const thisTurnErrors = thisTurnIds
+            .map(id => {
+              // findLast not in ES2020 target — manual reverse search
+              const matches = allResults.filter(r => r.tool_use_id === id);
+              return matches.length > 0 ? matches[matches.length - 1] : undefined;
+            })
+            .filter((r): r is ToolResultMessage => r !== undefined)
+            .filter(r => r.is_error === true).length;
+
+          if (thisTurnIds.length > 0 && thisTurnErrors === thisTurnIds.length) {
+            // All tools this turn errored — no progress
+            loopState.noProgressTurns++;
+            if (loopState.noProgressTurns >= loopConfig.noProgressMaxTurns) {
+              const noProgressMsg = buildRecoveryMessage('no-progress', '', loopConfig);
+              messages.push({ actor: 'user', type: 'text', text: noProgressMsg } as TextMessage);
+              resetStateForErrorType(loopState, 'no-progress');
+              context.onLog?.(
+                `[AgentExecutor] NO_PROGRESS: ${loopConfig.noProgressMaxTurns} consecutive all-error turns — injected emergency recovery.`,
+                'warning'
+              );
+            }
+          } else if (thisTurnErrors < thisTurnIds.length) {
+            // At least one tool succeeded → real progress → reset counter
+            loopState.noProgressTurns = 0;
+          }
         }
 
         // Loop back for the next LLM turn with tool results
@@ -314,9 +476,9 @@ export class AgentExecutor {
 
     // ── Max Iterations ─────────────────────────────────────────────────────
     context.onLog?.(
-      `[AgentExecutor] Max ${maxIterations} iterations reached. Agent may have written output files.`,
+      `[AgentExecutor] Max ${loopConfig.maxIterations} iterations reached. Agent may have written output files.`,
       'warning'
     );
-    return lastTextResponse || `Agent completed ${maxIterations} turns. Check output workspace for generated files.`;
+    return lastTextResponse || `Agent completed ${loopConfig.maxIterations} turns. Check output workspace for generated files.`;
   }
 }

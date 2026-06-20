@@ -128,14 +128,31 @@ Write a complete table with ONE ROW per source file:
   | File Path | Role | Layer | Side | Est. Lines | Complexity |
   |:----------|:-----|:------|:-----|:-----------|:-----------|
   
-  Role: Controller / Service / Repository / Model / Middleware / Route / Config / 
-        Migration / Schema / Helper / Utility / Auth / Event / Job / Test / DTO / Type
-  Layer: HTTP / Business / Data / Infrastructure / Cross-cutting
+  Role — use the terminology that matches the detected language:
+    Web frameworks (Node/Express, Django, Laravel, Spring, Rails, Go):
+      Controller / Service / Repository / Model / Middleware / Route /
+      Migration / Schema / Helper / Utility / Auth / Event / Job / Test / DTO / Type
+    COBOL:
+      PARAGRAPH / COPYBOOK / DIVISION / SECTION / PROGRAM / JCL-Job
+    Java/Kotlin non-web:
+      Entity / @Configuration / @Bean / @Component / Scheduler / Aspect
+    Python non-web:
+      Script / Celery-Task / Signal / Serializer / Management-Command
+    Go:
+      Package / Goroutine-Worker / gRPC-Handler
+    C/C++:
+      Header / Implementation / CMake-Target
+    Generic (unknown or mixed):
+      Module / Procedure / Function-File / Interface / Struct-File
+    If uncertain: use the closest web-framework equivalent and add "(inferred)"
+
+  Layer: HTTP / Business / Data / Infrastructure / Cross-cutting / Unknown
   Side: Backend / Frontend / Shared / Build
   Complexity: LOW (simple CRUD) / MEDIUM (business logic) / HIGH (complex orchestration)
 
 Include ALL files. Do not truncate the table. Use "..." only when role is genuinely unclear.
 After the table: summary statistics (count per role, count per complexity tier).`,
+
   },
   {
     n: 5,
@@ -233,8 +250,8 @@ LANGUAGE NOTE: "Callable unit" means the language-appropriate concept:
   Use the correct terminology for what was actually found.
 
 Table format (one row per callable unit):
-  | Name | File | Signature | Return Type | Async | Side Effects | Purpose | Called By | Calls |
-  |:-----|:-----|:----------|:------------|:------|:-------------|:--------|:----------|:------|
+  | Name | File | Signature | Return Type | Execution Model | Side Effects | Purpose | Called By | Calls |
+  |:-----|:-----|:----------|:------------|:----------------|:-------------|:--------|:----------|:------|
 
 Rules:
   - Include EVERY entry in symbol-graph — no cap, no truncation
@@ -246,7 +263,9 @@ Rules:
   - Group by file path with ### heading per file
 
 After the table:
-  - Summary: total count, total async/concurrent, total with side effects
+  - Execution Model column: value from executionModel field
+    ("async" | "sync" | "concurrent" | "procedural" | "reactive")
+  - Summary: total count, breakdown by executionModel type, total with side effects
   - Top 10 most-called units (highest calledBy count)
   - Entry points list (no callers = public API surface)
 
@@ -470,7 +489,7 @@ NOTE: Do NOT write transaction boundaries — those are in Section 22.`,
     n: 14,
     name: 'Cross-Module Call Flows',
     graph: 'call-flow',
-    emptyGraphIsValid: false,   // resolver always builds at least 1 call flow
+    emptyGraphIsValid: true,    // partial call flows are valid — write what the graph contains
     minContentBytes: 300,
     specificInstructions: `Call read-knowledge-graph("call-flow").
 Write the complete execution trace for EACH call flow in the graph.
@@ -839,10 +858,10 @@ For EVERY scheduled job or background worker:
   {
     n: 26,
     name: 'Risk Scorecard & Migration Complexity',
-    graph: null,
-    ctxKeys: ['TOTAL_FILES', 'TOTAL_CALLABLE_UNITS', 'TOTAL_API_ENDPOINTS', 'TOTAL_BUSINESS_RULES', 'TOTAL_DATA_ENTITIES', 'TOTAL_DB_TABLES', 'TOTAL_EVENTS', 'TOTAL_INTEGRATIONS', 'TOTAL_JOBS', 'HIGH_CHURN_FILES', 'DEAD_CODE_CANDIDATES', 'PHASE1_AUDIT_WARNING', 'RUNTIME_VERSIONS', 'PRIMARY_LANGUAGE', 'MONOREPO', 'MULTI_PROJECT'],
+    graph: 'imports',
+    ctxKeys: ['TOTAL_FILES', 'TOTAL_CALLABLE_UNITS', 'TOTAL_API_ENDPOINTS', 'TOTAL_BUSINESS_RULES', 'TOTAL_DATA_ENTITIES', 'TOTAL_DB_TABLES', 'TOTAL_EVENTS', 'TOTAL_INTEGRATIONS', 'TOTAL_JOBS', 'HIGH_CHURN_FILES', 'DEAD_CODE_CANDIDATES', 'PHASE1_AUDIT_WARNING', 'RUNTIME_VERSIONS', 'PRIMARY_LANGUAGE', 'MONOREPO', 'MULTI_PROJECT', 'MIGRATION_ORDER'],
     emptyGraphIsValid: true,    // reads context counters — always has data
-    minContentBytes: 400,
+    minContentBytes: 1000,
     specificInstructions: `Load all counters from task context via get_task_context.
 Write a comprehensive risk scorecard for migration planning:
 
@@ -905,7 +924,50 @@ Write a comprehensive risk scorecard for migration planning:
 ### Top 5 Migration Risks
   1. [Specific risk identified from analysis]
   2. [Specific risk identified from analysis]
-  ... (based on actual findings, not generic advice)`,
+  ... (based on actual findings, not generic advice)
+
+### Migration Ordering (from imports-graph)
+  Load MIGRATION_ORDER from task context (computed by Graph Resolver from file dependency graph).
+
+  IF MIGRATION_ORDER exists in context:
+    Write as a numbered table (top 20 entries):
+    | Priority | File | Depended on by N files | Notes |
+    |:---------|:-----|:-----------------------|:------|
+    Note below the table: "Migrate these files first — they are the foundation. Migrating leaf files first causes broken imports in their consumers."
+
+  IF MIGRATION_ORDER not in context:
+    Call read-knowledge-graph("imports") with limit=100
+    Sort entries by importedBy[].length descending
+    Write the same table from sorted results.
+    If imports-graph is also empty: write "Migration ordering not available — re-run analysis with imports graph enabled."
+
+### Per-Module Migration Difficulty (from rule-graph + integration-graph)
+  Call read-knowledge-graph("rule") → for each domain, count entries where migratable=false
+  Call read-knowledge-graph("integration") → list all external SDK providers
+
+  Write a module-level difficulty table:
+  | Module/Domain | Non-Auto Rules | External SDKs | Difficulty | Reason |
+  |:-------------|:---------------|:--------------|:-----------|:-------|
+
+  Difficulty scale:
+    EASY    → all rules migratable:true, no deprecated SDKs, standard CRUD patterns
+    MEDIUM  → 1–3 rules migratable:false OR one SDK with a known modern equivalent
+    HARD    → 4+ rules migratable:false OR vendor-locked SDK OR complex state machine
+    BLOCKER → pattern with NO known modern equivalent — requires human architectural decision
+
+### Business Rules Requiring Human Review
+  From rule-graph: list ALL entries where migratable=false
+  | Domain | Rule | Reason Cannot Auto-Migrate | File | Recommendation |
+  |:-------|:-----|:---------------------------|:-----|:---------------|
+
+  If all rules are migratable: write "All business rules are auto-migratable to the target stack."
+
+### External Integration Risk
+  From integration-graph: list all providers
+  | Provider | Current Usage | Migration Path Exists? | Risk Level |
+  |:---------|:-------------|:-----------------------|:----------|
+
+  If integration-graph empty: write "No external integrations detected."`,
   },
 ];
 
@@ -950,10 +1012,17 @@ Save the result to the output file path given. Then stop.
       > This indicates a Phase 2 or Phase 3 analysis gap. Section content is incomplete.
       > Re-run the analysis to regenerate this graph."
       → Then write what you CAN determine from other available graphs.
-   d. If the relevant counter IS 0 or NOT SET:
+   d. If the relevant counter IS exactly the number 0:
       → The project genuinely has none of these items. Write "None detected." normally.
       → This is NOT an error — many projects have no events, no jobs, no integrations.
-   e. For graphs with no corresponding counter (rule/middleware/security/etc.):
+   e. If the relevant counter is MISSING / NOT SET (the key does not exist in task context):
+      → This means Phase 3 (graph resolution) did not complete — counters were never saved.
+      → Write this ANALYSIS GAP WARNING at the TOP of the section:
+      "> ⚠️ ANALYSIS GAP: G5 counters were not saved (Phase 3 may not have completed).
+      > The 'None detected' result below may be incorrect. Re-run the full analysis."
+      → Then write "None detected (counter not set — re-run to verify)."
+      → This is DIFFERENT from d above: 0 means zero, missing means unknown.
+   f. For graphs with no corresponding counter (rule/middleware/security/etc.):
       → Write "None detected in this codebase." normally.
 </rules>
 
@@ -990,12 +1059,19 @@ Do not write any other section. Do not set ACTIVE_PHASE.
 
 // ── User Prompt Builder ───────────────────────────────────────────────────────
 
-export function buildSectionUserPrompt(section: SectionConfig, modernPath: string): string {
+import { buildLanguageHint } from './file-analysis-prompt.js';
+
+export function buildSectionUserPrompt(
+  section:    SectionConfig,
+  modernPath: string,
+  language?:  string,
+  framework?: string
+): string {
   const sectionNum = String(section.n).padStart(2, '0');
   const outputFile = `_analysis/sections/section-${sectionNum}.md`;
 
   const lines: string[] = [
-    `Write Section ${section.n}: ${section.name}`,
+    buildLanguageHint(language, framework) + `Write Section ${section.n}: ${section.name}`,
     '',
   ];
 
@@ -1011,6 +1087,7 @@ export function buildSectionUserPrompt(section: SectionConfig, modernPath: strin
   }
   if (section.needsDepsTree) {
     lines.push('ALSO CALL: getDependencyTree to get all package dependencies.');
+
   }
 
   lines.push('');

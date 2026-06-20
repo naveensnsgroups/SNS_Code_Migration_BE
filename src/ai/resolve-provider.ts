@@ -35,6 +35,7 @@ export function resolveApiKey(
     if (p === 'anthropic'   && k.anthropic)   return k.anthropic;
     if (p === 'openai'      && k.openai)      return k.openai;
     if (p === 'google'      && k.google)      return k.google;
+    if (p === 'mistral'     && k.mistral)     return k.mistral;
     if (p === 'grok'        && k.grok)        return k.grok;
     if (p === 'groq'        && k.groq)        return k.groq;
     if (p === 'openrouter'  && k.openrouter)  return k.openrouter;
@@ -48,6 +49,7 @@ export function resolveApiKey(
   if (p === 'anthropic')   return process.env.ANTHROPIC_API_KEY  || '';
   if (p === 'openai')      return process.env.OPENAI_API_KEY     || '';
   if (p === 'google')      return process.env.GEMINI_API_KEY     || process.env.GOOGLE_API_KEY || '';
+  if (p === 'mistral')     return process.env.MISTRAL_API_KEY    || '';
   if (p === 'grok')        return process.env.XAI_API_KEY        || '';
   if (p === 'groq')        return process.env.GROQ_API_KEY       || '';
   if (p === 'openrouter')  return process.env.OPENROUTER_API_KEY || '';
@@ -105,14 +107,22 @@ export async function resolveStreamingProvider(
     s?.apiKeys
   );
 
+  const isGoogle  = targetStack.provider === 'google';
+  const isMistral = targetStack.provider === 'mistral';
+  const isClaude  = targetStack.provider === 'anthropic';
+
   const provider = AIProviderFactory.getStreamingProvider(
     targetStack.provider,
     resolvedModel,
     apiKey,
     {
-      maxRetries:          s?.googleMaxRetries,
-      retryDelayRateLimit: s?.googleRetryDelayRateLimit,
-      retryDelayOther:     s?.googleRetryDelayOther,
+      // Google retry config — only applied when provider === 'google'
+      maxRetries:          isGoogle  ? (s?.googleMaxRetries          ?? undefined) : isMistral ? (s?.mistralMaxRetries ?? undefined) : undefined,
+      retryDelayRateLimit: isGoogle  ? (s?.googleRetryDelayRateLimit ?? undefined) : isMistral ? (s?.mistralRetryDelayRateLimit ?? undefined) : undefined,
+      retryDelayOther:     isGoogle  ? (s?.googleRetryDelayOther     ?? undefined) : isMistral ? (s?.mistralRetryDelayOther ?? undefined) : undefined,
+      // Claude retry config
+      retryDelayOnRateLimitError: isClaude ? (s?.claudeRetryDelayOnRateLimitError ?? undefined) : undefined,
+      retryDelayOnOtherErrors:    isClaude ? (s?.claudeRetryDelayOnOtherErrors    ?? undefined) : undefined,
     }
   );
 
