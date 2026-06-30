@@ -7,6 +7,17 @@ import fs from 'fs-extra';
 import path from 'path';
 import { fileURLToPath } from 'url';
 
+// ── Path safety helper ────────────────────────────────────────────────────────
+// Returns true if `candidate` is the same as, a child of, or a parent of `reference`.
+// Used to prevent the migration output path from overlapping with the source path.
+function pathsOverlap(candidate: string, reference: string): boolean {
+  const a = path.resolve(candidate).replace(/[\\/]+$/, '').toLowerCase();
+  const b = path.resolve(reference).replace(/[\\/]+$/, '').toLowerCase();
+  const sep = path.sep.toLowerCase();
+  // Same, child-of, or parent-of
+  return a === b || a.startsWith(b + sep) || b.startsWith(a + sep);
+}
+
 const router = Router();
 
 const __filename = fileURLToPath(import.meta.url);
@@ -34,11 +45,32 @@ router.post('/start', async (req: Request, res: Response, next: NextFunction) =>
       return;
     }
 
-    // Override modernPath if localOutputPath is specified
+    // ── Override modernPath if localOutputPath is specified ───────────────────
+    // SAFETY GUARD: reject if the output path overlaps with the source project path.
+    // If modernPath === projectPath (or is a parent/child of it), the Discovery Agent
+    // would scan the output folder instead of the source — causing TOTAL_FILES=0.
     if (localOutputPath && localOutputPath.trim() !== '') {
       const targetModernPath = path.resolve(localOutputPath);
+      const sourcePath       = path.resolve(session.projectPath);
+
+      if (pathsOverlap(targetModernPath, sourcePath)) {
+        res.status(400).json({
+          error:
+            `Invalid localOutputPath: "${targetModernPath}" overlaps with the source project path "${sourcePath}". ` +
+            'The migration output folder must be completely separate from the source project. ' +
+            'Please choose a different output directory (e.g. a sibling folder like "E:\\my-project-modern\\") ' +
+            'or leave the field blank to use the default session output folder.',
+          code: 'OUTPUT_PATH_OVERLAPS_SOURCE',
+        });
+        return;
+      }
+
       await SessionManager.updateSession(sessionId, { modernPath: targetModernPath });
-      await SessionManager.addLog(sessionId, `Modern output workspace set to custom local folder: ${targetModernPath}`, 'info');
+      await SessionManager.addLog(
+        sessionId,
+        `Modern output workspace set to custom local folder: ${targetModernPath}`,
+        'info'
+      );
     }
 
     // Save AI config settings to session (used by orchestrator + agents)

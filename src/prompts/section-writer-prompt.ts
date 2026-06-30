@@ -1151,3 +1151,25 @@ export function buildParallelSectionGroups(sections: SectionConfig[]): SectionCo
 
   return parallelBatches;
 }
+
+// \u2500\u2500 6 Named Theme Groups (for Phase 4 dispatch logging) \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500
+// Maps 6 thematic groups to their section numbers.
+// Used by planner-agent.ts to log which theme is currently being dispatched.
+// Does NOT change execution order — buildParallelSectionGroups() drives scheduling.
+
+export const SECTION_THEME_GROUPS: Record<string, number[]> = {
+  'Project Identity':         [1, 2, 3, 4, 6],              // who, what, where, stack
+  'Code Architecture':        [7, 8, 9, 14, 15],             // callables, behaviors, rules, flows, transforms
+  'Data Layer':               [5, 13, 19, 22],               // entities, DB ops, states, transactions
+  'API & Security':           [10, 11, 12, 18],              // contracts, security, middleware, validation
+  'Operations & Quality':     [16, 17, 20, 21, 23, 24, 25],  // config, errors, async, tests, events, jobs
+  'Risk & Migration':         [26],                           // risk scorecard
+};
+
+// Returns the theme name for a given section number (for logging only).
+export function getSectionThemeName(sectionNumber: number): string {
+  for (const [theme, sections] of Object.entries(SECTION_THEME_GROUPS)) {
+    if (sections.includes(sectionNumber)) return theme;
+  }
+  return 'General';
+}

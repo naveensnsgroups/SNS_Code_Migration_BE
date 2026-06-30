@@ -43,6 +43,21 @@ import {
 import {
   FILE_ANALYSIS_SYSTEM_PROMPT,
 } from '../../prompts/file-analysis-prompt.js';
+import {
+  DATA_AGENT_SYSTEM_PROMPT,
+} from '../../prompts/data-agent-prompt.js';
+import {
+  BACKEND_AGENT_SYSTEM_PROMPT,
+} from '../../prompts/backend-agent-prompt.js';
+import {
+  LOGIC_AGENT_SYSTEM_PROMPT,
+} from '../../prompts/logic-agent-prompt.js';
+import {
+  INFRA_AGENT_SYSTEM_PROMPT,
+} from '../../prompts/infra-agent-prompt.js';
+import {
+  UI_AGENT_SYSTEM_PROMPT,
+} from '../../prompts/ui-agent-prompt.js';
 
 // =============================================================================
 //  SCANNER AGENT — Codebase Discovery (Pre-Stage 1)
@@ -163,17 +178,6 @@ export const STAGE1_PLANNER_AGENT: AgentDefinition = {
 
 import { agentService } from '../../core/agent-service.js';
 
-AgentRegistry.register(SCANNER_AGENT);
-AgentRegistry.register(STAGE1_PLANNER_AGENT);
-
-agentService.registerAgent(SCANNER_AGENT);
-agentService.registerAgent(STAGE1_PLANNER_AGENT);
-
-export const ALL_AGENT_DEFINITIONS = [
-  SCANNER_AGENT,
-  STAGE1_PLANNER_AGENT,
-];
-
 // =============================================================================
 //  DISCOVERY AGENT — Stage 1, Phase 1: Workspace Discovery Only
 //
@@ -291,19 +295,283 @@ export const SECTION_WRITER_AGENT: AgentDefinition = {
   ],
 };
 
-// Register new agents
+// Register all agents in one consolidated block
+AgentRegistry.register(SCANNER_AGENT);
+AgentRegistry.register(STAGE1_PLANNER_AGENT);
 AgentRegistry.register(DISCOVERY_AGENT);
 AgentRegistry.register(GRAPH_RESOLVER_AGENT);
 AgentRegistry.register(SECTION_WRITER_AGENT);
 
+// =============================================================================
+//  DATA AGENT — Stage 1, Phase 2: Data Layer Analysis
+//
+//  Domain: entity files, ORM models, migrations, schemas, DTOs, repositories.
+//  Graphs: entity-graph, state-graph, imports-graph.
+//  Tools: file read + knowledge graph write + task context.
+// =============================================================================
+
+export const DATA_AGENT_ID = 'data-agent';
+
+export const DATA_AGENT: AgentDefinition = {
+  id: DATA_AGENT_ID,
+  name: 'Data Agent',
+  description:
+    'Analyzes entity definitions, ORM models, migrations, schemas, and DTOs. ' +
+    'Writes to entity-graph, state-graph, and imports-graph. ' +
+    'Scope: data layer files only. Does not analyze routes or service logic.',
+  tags: ['domain-specialist', 'data', 'stage1', 'phase2'],
+  functions: [
+    FILE_CONTENT_FUNCTION_ID,
+    BATCH_READ_FILES_FUNCTION_ID,
+    EXTRACT_FILE_SYMBOLS_FUNCTION_ID,
+    GET_TASK_CONTEXT_FUNCTION_ID,
+    EDIT_TASK_CONTEXT_FUNCTION_ID,
+    APPEND_TO_KNOWLEDGE_GRAPH_FUNCTION_ID,
+    READ_KNOWLEDGE_GRAPH_FUNCTION_ID,
+  ],
+  variables: ['legacyPath', 'assignedFiles', 'language', 'framework'],
+  languageModelRequirements: [
+    { purpose: 'data-analysis', identifier: 'alias:reasoning-model' }
+  ],
+  prompts: [
+    {
+      id: 'data-agent-system',
+      defaultVariant: {
+        id: 'data-agent-system-default',
+        label: 'Data Agent System Prompt',
+        template: DATA_AGENT_SYSTEM_PROMPT,
+      }
+    }
+  ],
+  agentSpecificVariables: [
+    { name: 'legacyPath',     description: 'Absolute path to the legacy project root.', usedInPrompt: true },
+    { name: 'assignedFiles',  description: 'List of files routed to this domain agent.',  usedInPrompt: true },
+    { name: 'language',       description: 'Detected primary language.',                   usedInPrompt: true },
+    { name: 'framework',      description: 'Detected primary framework.',                  usedInPrompt: true },
+  ],
+};
+
+// =============================================================================
+//  BACKEND AGENT — Stage 1, Phase 2: API + Transport Layer Analysis
+//
+//  Domain: controllers, routes, middleware, guards, filters, interceptors.
+//  Graphs: api-graph, middleware-graph, security-graph, imports-graph.
+// =============================================================================
+
+export const BACKEND_AGENT_ID = 'backend-agent';
+
+export const BACKEND_AGENT: AgentDefinition = {
+  id: BACKEND_AGENT_ID,
+  name: 'Backend Agent',
+  description:
+    'Analyzes controllers, routes, middleware, guards, and security filters. ' +
+    'Writes to api-graph, middleware-graph, security-graph, and imports-graph. ' +
+    'Scope: transport layer files only. Does not analyze entity models or service logic.',
+  tags: ['domain-specialist', 'backend', 'stage1', 'phase2'],
+  functions: [
+    FILE_CONTENT_FUNCTION_ID,
+    BATCH_READ_FILES_FUNCTION_ID,
+    EXTRACT_FILE_SYMBOLS_FUNCTION_ID,
+    GET_TASK_CONTEXT_FUNCTION_ID,
+    EDIT_TASK_CONTEXT_FUNCTION_ID,
+    APPEND_TO_KNOWLEDGE_GRAPH_FUNCTION_ID,
+    READ_KNOWLEDGE_GRAPH_FUNCTION_ID,
+  ],
+  variables: ['legacyPath', 'assignedFiles', 'language', 'framework'],
+  languageModelRequirements: [
+    { purpose: 'api-analysis', identifier: 'alias:reasoning-model' }
+  ],
+  prompts: [
+    {
+      id: 'backend-agent-system',
+      defaultVariant: {
+        id: 'backend-agent-system-default',
+        label: 'Backend Agent System Prompt',
+        template: BACKEND_AGENT_SYSTEM_PROMPT,
+      }
+    }
+  ],
+  agentSpecificVariables: [
+    { name: 'legacyPath',     description: 'Absolute path to the legacy project root.', usedInPrompt: true },
+    { name: 'assignedFiles',  description: 'List of files routed to this domain agent.',  usedInPrompt: true },
+    { name: 'language',       description: 'Detected primary language.',                   usedInPrompt: true },
+    { name: 'framework',      description: 'Detected primary framework.',                  usedInPrompt: true },
+  ],
+};
+
+// =============================================================================
+//  LOGIC AGENT — Stage 1, Phase 2: Business Logic Layer Analysis
+//
+//  Domain: service classes, validators, business logic, utilities, helpers.
+//  Graphs: symbol-graph, rule-graph, event-graph, db-graph, imports-graph.
+// =============================================================================
+
+export const LOGIC_AGENT_ID = 'logic-agent';
+
+export const LOGIC_AGENT: AgentDefinition = {
+  id: LOGIC_AGENT_ID,
+  name: 'Logic Agent',
+  description:
+    'Analyzes service classes, validators, and business logic implementations. ' +
+    'Writes to symbol-graph, rule-graph, event-graph, db-graph, and imports-graph. ' +
+    'rule-graph is mandatory — every conditional check is a business rule.',
+  tags: ['domain-specialist', 'logic', 'stage1', 'phase2'],
+  functions: [
+    FILE_CONTENT_FUNCTION_ID,
+    BATCH_READ_FILES_FUNCTION_ID,
+    EXTRACT_FILE_SYMBOLS_FUNCTION_ID,
+    SEARCH_IN_WORKSPACE_FUNCTION_ID,
+    GET_TASK_CONTEXT_FUNCTION_ID,
+    EDIT_TASK_CONTEXT_FUNCTION_ID,
+    APPEND_TO_KNOWLEDGE_GRAPH_FUNCTION_ID,
+    READ_KNOWLEDGE_GRAPH_FUNCTION_ID,
+  ],
+  variables: ['legacyPath', 'assignedFiles', 'language', 'framework'],
+  languageModelRequirements: [
+    { purpose: 'logic-analysis', identifier: 'alias:reasoning-model' }
+  ],
+  prompts: [
+    {
+      id: 'logic-agent-system',
+      defaultVariant: {
+        id: 'logic-agent-system-default',
+        label: 'Logic Agent System Prompt',
+        template: LOGIC_AGENT_SYSTEM_PROMPT,
+      }
+    }
+  ],
+  agentSpecificVariables: [
+    { name: 'legacyPath',     description: 'Absolute path to the legacy project root.', usedInPrompt: true },
+    { name: 'assignedFiles',  description: 'List of files routed to this domain agent.',  usedInPrompt: true },
+    { name: 'language',       description: 'Detected primary language.',                   usedInPrompt: true },
+    { name: 'framework',      description: 'Detected primary framework.',                  usedInPrompt: true },
+  ],
+};
+
+// =============================================================================
+//  INFRA AGENT — Stage 1, Phase 2: Infrastructure + Operations Layer Analysis
+//
+//  Domain: config, env, jobs, workers, tests, SDK integrations, CI/CD.
+//  Graphs: config-graph, job-graph, test-graph, integration-graph, async-graph, imports-graph.
+// =============================================================================
+
+export const INFRA_AGENT_ID = 'infra-agent';
+
+export const INFRA_AGENT: AgentDefinition = {
+  id: INFRA_AGENT_ID,
+  name: 'Infra Agent',
+  description:
+    'Analyzes configuration files, scheduled jobs, background workers, test suites, ' +
+    'and external SDK integrations. ' +
+    'Writes to config-graph, job-graph, test-graph, integration-graph, async-graph, imports-graph.',
+  tags: ['domain-specialist', 'infra', 'stage1', 'phase2'],
+  functions: [
+    FILE_CONTENT_FUNCTION_ID,
+    BATCH_READ_FILES_FUNCTION_ID,
+    EXTRACT_FILE_SYMBOLS_FUNCTION_ID,
+    GET_TASK_CONTEXT_FUNCTION_ID,
+    EDIT_TASK_CONTEXT_FUNCTION_ID,
+    APPEND_TO_KNOWLEDGE_GRAPH_FUNCTION_ID,
+    READ_KNOWLEDGE_GRAPH_FUNCTION_ID,
+  ],
+  variables: ['legacyPath', 'assignedFiles', 'language', 'framework'],
+  languageModelRequirements: [
+    { purpose: 'infra-analysis', identifier: 'alias:reasoning-model' }
+  ],
+  prompts: [
+    {
+      id: 'infra-agent-system',
+      defaultVariant: {
+        id: 'infra-agent-system-default',
+        label: 'Infra Agent System Prompt',
+        template: INFRA_AGENT_SYSTEM_PROMPT,
+      }
+    }
+  ],
+  agentSpecificVariables: [
+    { name: 'legacyPath',     description: 'Absolute path to the legacy project root.', usedInPrompt: true },
+    { name: 'assignedFiles',  description: 'List of files routed to this domain agent.',  usedInPrompt: true },
+    { name: 'language',       description: 'Detected primary language.',                   usedInPrompt: true },
+    { name: 'framework',      description: 'Detected primary framework.',                  usedInPrompt: true },
+  ],
+};
+
+// =============================================================================
+//  UI AGENT — Stage 1, Phase 2: Frontend + UI Layer Analysis
+//
+//  Domain: React/Vue/Angular/Svelte components, hooks, stores, client API calls.
+//  Graphs: entity-graph (props), api-graph (CLIENT prefix), async-graph, symbol-graph, imports-graph.
+// =============================================================================
+
+export const UI_AGENT_ID = 'ui-agent';
+
+export const UI_AGENT: AgentDefinition = {
+  id: UI_AGENT_ID,
+  name: 'UI Agent',
+  description:
+    'Analyzes frontend components, hooks, state stores, and client-side API calls. ' +
+    'Writes props interfaces to entity-graph (as [Name]Props entities), ' +
+    'client API calls to api-graph with CLIENT prefix, and hooks to async-graph.',
+  tags: ['domain-specialist', 'ui', 'frontend', 'stage1', 'phase2'],
+  functions: [
+    FILE_CONTENT_FUNCTION_ID,
+    BATCH_READ_FILES_FUNCTION_ID,
+    EXTRACT_FILE_SYMBOLS_FUNCTION_ID,
+    GET_TASK_CONTEXT_FUNCTION_ID,
+    EDIT_TASK_CONTEXT_FUNCTION_ID,
+    APPEND_TO_KNOWLEDGE_GRAPH_FUNCTION_ID,
+    READ_KNOWLEDGE_GRAPH_FUNCTION_ID,
+  ],
+  variables: ['legacyPath', 'assignedFiles', 'language', 'framework'],
+  languageModelRequirements: [
+    { purpose: 'ui-analysis', identifier: 'alias:reasoning-model' }
+  ],
+  prompts: [
+    {
+      id: 'ui-agent-system',
+      defaultVariant: {
+        id: 'ui-agent-system-default',
+        label: 'UI Agent System Prompt',
+        template: UI_AGENT_SYSTEM_PROMPT,
+      }
+    }
+  ],
+  agentSpecificVariables: [
+    { name: 'legacyPath',     description: 'Absolute path to the legacy project root.', usedInPrompt: true },
+    { name: 'assignedFiles',  description: 'List of files routed to this domain agent.',  usedInPrompt: true },
+    { name: 'language',       description: 'Detected primary language.',                   usedInPrompt: true },
+    { name: 'framework',      description: 'Detected primary framework.',                  usedInPrompt: true },
+  ],
+};
+
+// Register all agents in one consolidated block
+AgentRegistry.register(DATA_AGENT);
+AgentRegistry.register(BACKEND_AGENT);
+AgentRegistry.register(LOGIC_AGENT);
+AgentRegistry.register(INFRA_AGENT);
+AgentRegistry.register(UI_AGENT);
+
+agentService.registerAgent(SCANNER_AGENT);
+agentService.registerAgent(STAGE1_PLANNER_AGENT);
 agentService.registerAgent(DISCOVERY_AGENT);
 agentService.registerAgent(GRAPH_RESOLVER_AGENT);
 agentService.registerAgent(SECTION_WRITER_AGENT);
+agentService.registerAgent(DATA_AGENT);
+agentService.registerAgent(BACKEND_AGENT);
+agentService.registerAgent(LOGIC_AGENT);
+agentService.registerAgent(INFRA_AGENT);
+agentService.registerAgent(UI_AGENT);
 
-export const ALL_AGENT_DEFINITIONS_V2 = [
+// ALL_AGENT_DEFINITIONS — single source of truth for all active agents.
+export const ALL_AGENT_DEFINITIONS = [
   SCANNER_AGENT,
   STAGE1_PLANNER_AGENT,
   DISCOVERY_AGENT,
   GRAPH_RESOLVER_AGENT,
   SECTION_WRITER_AGENT,
+  DATA_AGENT,
+  BACKEND_AGENT,
+  LOGIC_AGENT,
+  INFRA_AGENT,
+  UI_AGENT,
 ];

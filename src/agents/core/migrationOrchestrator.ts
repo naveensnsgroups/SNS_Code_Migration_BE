@@ -7,6 +7,9 @@ import { writeSessionFile } from '../../tools/fileWriter.js';
 import { scanProjectDirectory } from '../../tools/fileScanner.js';
 import { DetectedStack, TargetStack, MigrationStatus } from '../../types.js';
 import { resolveApiKey, resolveModelAlias } from '../../ai/index.js';
+import fs from 'fs-extra';
+import path from 'path';
+
 
 export class MigrationOrchestrator {
   private static pausedSessions:  Set<string> = new Set();
@@ -127,12 +130,18 @@ export class MigrationOrchestrator {
     // agentsConfig can arrive as:
     //   { "agent-id": { enabled, selectedModel } }  ← object from localStorage
     //   [{ id, enabled, selectedModel }]             ← array (future format)
+
+    // Use a typed alias that TypeScript knows is non-null (checked above at line 111)
+    // We need `let` here so the auto-descent block can update projectPath in-memory.
+    // eslint-disable-next-line prefer-const
+    let currentSession: NonNullable<typeof session> = session;
+
     const resolveAgent = (agentId: string): any | undefined => {
-      if (!session.agentsConfig) return undefined;
-      if (Array.isArray(session.agentsConfig)) {
-        return session.agentsConfig.find((a: any) => a.id === agentId);
+      if (!currentSession.agentsConfig) return undefined;
+      if (Array.isArray(currentSession.agentsConfig)) {
+        return currentSession.agentsConfig.find((a: any) => a.id === agentId);
       }
-      return (session.agentsConfig as Record<string, any>)[agentId];
+      return (currentSession.agentsConfig as Record<string, any>)[agentId];
     };
 
     const isAgentEnabled = (agentId: string): boolean => {
@@ -141,14 +150,85 @@ export class MigrationOrchestrator {
       return agent.enabled !== false;
     };
 
+    let legacyPath = currentSession.projectPath;
+    const modernPath = currentSession.modernPath;
 
-    const legacyPath = session.projectPath;
-    const modernPath = session.modernPath;
+    // ── Pre-flight: validate legacyPath has actual source files ────────────────────
+    // This runs BEFORE any LLM call. If the legacyPath is empty or doesn't exist,
+    // we fail fast with a clear error instead of letting the Discovery Agent run
+    // and returning TOTAL_FILES=0 six minutes later.
+    //
+    // Auto-descent: if legacyPath itself contains ONLY a single subdirectory and
+    // no files (e.g. sessions/.../legacy/demo-15/ contains only mern-todo-app/),
+    // we descend one level and update session.projectPath so agents use the real root.
+    if (!(await fs.pathExists(legacyPath))) {
+      throw new Error(
+        `[MigrationOrchestrator] Source project path does not exist: "${legacyPath}". ` +
+        'Please re-upload your project from the UI and try again.'
+      );
+    }
 
-    // Get scanned file list
-    const { fileList } = await scanProjectDirectory(legacyPath);
-    if (fileList.length === 0) {
-      throw new Error('No files found to migrate.');
+    {
+      const { fileList: topFiles } = await scanProjectDirectory(legacyPath);
+
+      if (topFiles.length === 0) {
+        // Try one-level descent: list immediate children directories
+        const children = (await fs.readdir(legacyPath, { withFileTypes: true }))
+          .filter(d => d.isDirectory())
+          .map(d => path.join(legacyPath, d.name));
+
+        let foundPath: string | null = null;
+        for (const child of children) {
+          const { fileList: childFiles } = await scanProjectDirectory(child);
+          if (childFiles.length > 0) {
+            foundPath = child;
+            break;
+          }
+        }
+
+        if (foundPath) {
+          // Auto-correct: update session.projectPath to the real project root
+          await SessionManager.updateSession(sessionId, { projectPath: foundPath });
+          const refreshed = await SessionManager.getSession(sessionId);
+          if (refreshed) currentSession = refreshed;
+          legacyPath = foundPath;
+          console.log(
+            `[MigrationOrchestrator] Auto-corrected projectPath to: "${legacyPath}" ` +
+            `(was pointing at parent wrapper folder with no direct files).`
+          );
+        } else {
+          // Truly empty — fail with actionable message
+          const childNames = children.map(c => path.basename(c)).join(', ') || 'none';
+          throw new Error(
+            `[MigrationOrchestrator] Source project path is empty: "${legacyPath}". ` +
+            `Immediate subdirectories found: [${childNames}] — all appear empty too. ` +
+            'Possible causes: files were not uploaded correctly, or the project directory ' +
+            'contains only binary/excluded files (node_modules, .git, dist, build). ' +
+            'Please re-upload your project from the UI and try again.'
+          );
+        }
+      }
+    }
+
+    // ── SAFETY GUARD: modernPath must not overlap with legacyPath ────────────────
+    // If modernPath was corrupted (e.g. set to source directory by UI),
+    // the watcher would watch the source and the agent would write output into it.
+    {
+      const resolvedLegacy = path.resolve(legacyPath);
+      const resolvedModern = path.resolve(modernPath);
+      const sep = path.sep;
+      const overlap =
+        resolvedModern === resolvedLegacy ||
+        resolvedModern.startsWith(resolvedLegacy + sep) ||
+        resolvedLegacy.startsWith(resolvedModern + sep);
+
+      if (overlap) {
+        throw new Error(
+          `[MigrationOrchestrator] SAFETY ABORT: modernPath "${resolvedModern}" overlaps with ` +
+          `legacyPath "${resolvedLegacy}". The output folder must be completely separate from ` +
+          'the source project. Please start a new session and set a different output path.'
+        );
+      }
     }
 
     // Helper to log and broadcast changes
@@ -212,8 +292,8 @@ export class MigrationOrchestrator {
         sessionId,
         legacyPath,
         modernPath,
-        session.detectedStack,
-        session.targetStack,
+        currentSession.detectedStack!,
+        currentSession.targetStack!,
         null,  // _aiServiceLegacy — deprecated, ignored by PlannerAgent
         async (msg, lvl) => log(msg, lvl ?? 'info', 'stage1'),
         async (percent, currentFile) => {

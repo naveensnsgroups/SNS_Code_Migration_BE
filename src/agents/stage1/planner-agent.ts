@@ -36,70 +36,118 @@ import {
   FILE_ANALYSIS_SYSTEM_PROMPT,
   buildAnalysisUserPrompt,
 } from '../../prompts/file-analysis-prompt.js';
+import { DATA_AGENT_SYSTEM_PROMPT,    buildDataAgentUserPrompt    } from '../../prompts/data-agent-prompt.js';
+import { BACKEND_AGENT_SYSTEM_PROMPT, buildBackendAgentUserPrompt } from '../../prompts/backend-agent-prompt.js';
+import { LOGIC_AGENT_SYSTEM_PROMPT,   buildLogicAgentUserPrompt   } from '../../prompts/logic-agent-prompt.js';
+import { INFRA_AGENT_SYSTEM_PROMPT,   buildInfraAgentUserPrompt   } from '../../prompts/infra-agent-prompt.js';
+import { UI_AGENT_SYSTEM_PROMPT,      buildUIAgentUserPrompt      } from '../../prompts/ui-agent-prompt.js';
 import {
-  GRAPH_RESOLUTION_SYSTEM_PROMPT,
-  buildGraphResolutionUserPrompt,
-  GRAPH_PASS_A_SYSTEM,
-  buildGraphPassAUserPrompt,
-  GRAPH_PASS_B_SYSTEM,
-  buildGraphPassBUserPrompt,
   GRAPH_PASS_C_SYSTEM,
   buildGraphPassCUserPrompt,
-  GRAPH_PASS_D_SYSTEM,           // Fix 4: counter-only recovery pass
-  buildGraphPassDUserPrompt,     // Fix 4: counter-only recovery pass
+  GRAPH_PASS_D_SYSTEM,
+  buildGraphPassDUserPrompt,
 } from '../../prompts/graph-resolution-prompt.js';
+
 import {
   SECTION_SYSTEM_PROMPT,
   SECTION_CONFIG,
   SectionConfig,
   buildSectionUserPrompt,
   buildParallelSectionGroups,
+  getSectionThemeName,
 } from '../../prompts/section-writer-prompt.js';
+
 import { assembleSections, getWrittenSections } from './section-assembler.js';
+import {
+  resolveForeignKeys,
+  buildCallFlowGraph,
+  computeImportedBy,
+  computeMigrationOrder,
+} from './graph-resolver.js';
+import {
+  routeFilesToDomains,
+  deduplicateFileIndex,
+  getBucketSummary,
+} from './domain-router.js';
 import fs   from 'fs-extra';
 import path from 'path';
+import glob from 'fast-glob';
+
 
 // ── Constants ─────────────────────────────────────────────────────────────────
 
 const REASONING_MODEL_ALIAS    = 'reasoning-model';
 const CUSTOM_RULES_FRAGMENT_ID = 'system-agent-rules';
 
-// ── Model-Aware Turn Cap ──────────────────────────────────────────────────────
-// Computes the maximum number of files the file-analysis agent should process
-// per session, based on the model's context window size.
-// Larger context = more files per session.
-// Free tier models need conservative caps to avoid rate limits and context exhaustion.
+// ── Dynamic Turn Cap (from real FILE_INDEX data) ─────────────────────────────
+// Replaces model-name-string matching with real signal.
+// contextK: model's context window in thousands of tokens (from session config or model resolver).
+// avgFileSizeLines: computed from actual FILE_INDEX.estimatedLines average.
+// pendingCount: actual files still to process — never cap higher than this.
+//
+// Formula:
+//   tokenBudget  = contextK * 1000 * 0.55  (55% of context for file content)
+//   tokensPerFile = max(avgFileSizeLines * 4 + 500, 700)  (4 tok/line + graph overhead)
+//   turnCap = min(floor(tokenBudget / tokensPerFile), pendingCount)
+//
+// If contextK is unknown: fall back to safe default of 22 files.
 
-function computeTurnCap(modelName: string): number {
-  const m = modelName.toLowerCase();
-  if (m.includes('gemini-2.0-flash'))   return 35;  // 1M context, 15 RPM free
-  if (m.includes('gemini-2.5-flash'))   return 35;
-  if (m.includes('gemini-2.5-pro'))     return 30;  // 1M context, 50 RPD free — conservative
-  if (m.includes('gemini-1.5-flash'))   return 30;
-  if (m.includes('gemini-1.5-pro'))     return 28;
-  if (m.includes('claude-opus-4'))      return 20;  // 200k context
-  if (m.includes('claude-sonnet-4'))    return 25;
-  if (m.includes('claude-3-5-sonnet'))  return 25;
-  if (m.includes('claude-3-opus'))      return 18;
-  if (m.includes('claude-3-haiku'))     return 20;
-  if (m.includes('claude-haiku'))       return 20;
-  if (m.includes('gpt-4o-mini'))        return 22;  // 128k context
-  if (m.includes('gpt-4o'))             return 18;
-  if (m.includes('gpt-4-turbo'))        return 18;
-  if (m.includes('gpt-3.5'))            return 15;  // 16k context — very limited
-  return 22;                                         // safe default for unknown models
+function computeTurnCapFromData(
+  contextK:         number,   // model context window in K tokens (e.g. 1000 for 1M context)
+  avgFileSizeLines: number,   // average lines across FILE_INDEX.estimatedLines
+  pendingCount:     number    // files remaining to process
+): number {
+  if (contextK <= 0 || avgFileSizeLines <= 0) return Math.min(22, pendingCount);
+  const tokenBudget   = contextK * 1000 * 0.55;
+  const tokensPerFile = Math.max(avgFileSizeLines * 4 + 500, 700);
+  const contextBased  = Math.floor(tokenBudget / tokensPerFile);
+  // Clamp: at least 3 (never pointlessly small), at most pendingCount (never overshoot)
+  return Math.min(Math.max(contextBased, 3), pendingCount);
 }
 
-// ── Project-Size-Aware Batch Size ─────────────────────────────────────────────
-// Controls how many SMALL files (<= 200 lines) are read in a single batch-read-files call.
-// More files in parallel = faster analysis, but higher token cost per turn.
-// For large projects, reduce batch size to stay within token budgets.
+// ── Dynamic Batch Size (from real FILE_INDEX data) ───────────────────────────
+// Derived from actual pending file count — no hardcoded thresholds.
+// Larger pending lists = smaller batches (stay within token budget per turn).
 
-function computeBatchSize(totalFiles: number): number {
-  if (totalFiles < 30)  return 10;   // tiny project — batch aggressively
-  if (totalFiles < 100) return 8;    // small project — moderate batching
-  if (totalFiles < 300) return 5;    // medium project — conservative
-  return 3;                          // large project — minimal, prioritise quality
+function computeBatchSizeFromData(pendingCount: number): number {
+  if (pendingCount < 30)  return 10;  // tiny remaining set — batch aggressively
+  if (pendingCount < 100) return 8;
+  if (pendingCount < 300) return 5;
+  return 3;                           // large remaining set — conservative
+}
+
+// ── Compute average file size from FILE_INDEX ──────────────────────────────
+function computeAvgFileSizeLines(fileIndex: any[]): number {
+  if (!fileIndex.length) return 150; // safe default
+  const total = fileIndex.reduce((sum: number, f: any) => sum + (f?.estimatedLines ?? 0), 0);
+  const avg   = Math.round(total / fileIndex.length);
+  return avg > 0 ? avg : 150;
+}
+
+// ── Extract model context window K from resolved model name ───────────────
+// Used for dynamic turn cap computation.
+// Returns context window size in thousands of tokens.
+function getModelContextK(modelName: string): number {
+  const m = (modelName ?? '').toLowerCase();
+  // Gemini family
+  if (m.includes('gemini-2.5-pro'))    return 1000;
+  if (m.includes('gemini-2.5-flash'))  return 1000;
+  if (m.includes('gemini-2.0-flash'))  return 1000;
+  if (m.includes('gemini-1.5-pro'))    return 1000;
+  if (m.includes('gemini-1.5-flash'))  return 1000;
+  // Claude family
+  if (m.includes('claude-3-5-sonnet')) return 200;
+  if (m.includes('claude-sonnet-4'))   return 200;
+  if (m.includes('claude-opus-4'))     return 200;
+  if (m.includes('claude-3-opus'))     return 200;
+  if (m.includes('claude-haiku'))      return 200;
+  if (m.includes('claude-3-haiku'))    return 200;
+  // GPT family
+  if (m.includes('gpt-4o'))            return 128;
+  if (m.includes('gpt-4-turbo'))       return 128;
+  if (m.includes('gpt-3.5'))           return 16;
+  // Default: conservative 128K assumption for unknown models
+  return 128;
 }
 
 // ── Model-Aware Section Writer Concurrency ─────────────────────────────────
@@ -209,6 +257,109 @@ const PHASE_TIMEOUT_MS = {
   section:       10 * 60_000,
 } as const;
 
+// ── 4-Category Error Handler ──────────────────────────────────────────────────
+// Classifies every agent error into one of 4 action categories.
+// No arbitrary retry counts — action is driven by error signal type.
+
+type LogFn = (msg: string, lvl?: 'info' | 'success' | 'error' | 'warning') => void;
+type ErrorAction = 'retry-rate-limit' | 'retry-depth' | 'skip-problematic' | 'escalate';
+
+async function handleAnalysisError(
+  error:       Error,
+  passNumber:  number,
+  pendingCount: number,
+  onLog:       LogFn
+): Promise<ErrorAction> {
+  const msg = (error.message ?? '').toLowerCase();
+
+  // Category 1: Rate limit / quota — exponential backoff, then retry same pass
+  if (msg.includes('429') || msg.includes('rate limit') || msg.includes('quota') || msg.includes('too many')) {
+    const delayMs = Math.min(Math.pow(2, passNumber) * 2_000, 120_000); // cap at 2 min
+    onLog(
+      `[PlannerAgent] Rate limit on pass ${passNumber}. Waiting ${Math.round(delayMs / 1000)}s before retry.`,
+      'warning'
+    );
+    await new Promise(r => setTimeout(r, delayMs));
+    return 'retry-rate-limit';
+  }
+
+  // Category 2: Timeout — resume from LAST_FILE_ANALYZED checkpoint
+  if (msg.includes('timeout') || msg.includes('timed out') || msg.includes('phase timeout')) {
+    onLog(
+      `[PlannerAgent] Pass ${passNumber} timed out. ${pendingCount} files remain. ` +
+      `Resuming from LAST_FILE_ANALYZED on next pass.`,
+      'warning'
+    );
+    return 'retry-rate-limit'; // same action: retry the pass from checkpoint
+  }
+
+  // Category 3: First failure — retry with depth-recovery signal
+  if (passNumber <= 2) {
+    onLog(
+      `[PlannerAgent] Pass ${passNumber} error: ${error.message}. ` +
+      `Retrying — agent will resume from LAST_FILE_ANALYZED.`,
+      'warning'
+    );
+    return 'retry-depth';
+  }
+
+  // Category 4: Repeated failures — skip and advance (log the remaining files as problematic)
+  onLog(
+    `[PlannerAgent] Pass ${passNumber} failed after ${passNumber} attempts: ${error.message}. ` +
+    `Advancing with ${pendingCount} files still pending.`,
+    'error'
+  );
+  return 'skip-problematic';
+}
+
+// \u2500\u2500 FILE_INDEX Resolution Helper \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500
+// Discovery agents have written file index under different key names across versions:
+//   'file_index'   (underscore) \u2014 current discovery agent output
+//   'file-index'   (dash)       \u2014 older discovery agent output
+//   FILE_INDEX_KEY              \u2014 indirect: context stores the KEY NAME, not the array
+//
+// This function resolves to whichever key actually contains an array of file objects,
+// preventing the Phase 2 loop from seeing an empty file index when data exists.
+//
+// Returns: { key: string; entries: any[] }
+//   key     = the actual context key where the array was found
+//   entries = the file index array (may be empty if nothing found)
+
+const FILE_INDEX_CANDIDATE_KEYS = ['file_index', 'file-index', 'FILE_INDEX'] as const;
+
+function resolveFileIndexFromContext(ctx: Record<string, unknown>): { key: string; entries: any[] } {
+  // 1. Try FILE_INDEX_KEY indirection first (canonical path)
+  const indirectKey = ctx['FILE_INDEX_KEY'] as string | undefined;
+  if (indirectKey && Array.isArray(ctx[indirectKey]) && (ctx[indirectKey] as any[]).length > 0) {
+    return { key: indirectKey, entries: ctx[indirectKey] as any[] };
+  }
+
+  // 2. Try known static key names (covers underscore AND dash variants)
+  for (const candidate of FILE_INDEX_CANDIDATE_KEYS) {
+    const val = ctx[candidate];
+    if (Array.isArray(val) && val.length > 0) {
+      return { key: candidate, entries: val as any[] };
+    }
+  }
+
+  // 3. Scan all context keys for the first array of objects with a 'path' + 'read_status' field.
+  //    Last resort — handles future key name variations.
+  //    Skips null values (the stale-cleanup pass writes null, not undefined).
+  for (const [k, v] of Object.entries(ctx)) {
+    if (
+      Array.isArray(v) && v.length > 0 &&
+      typeof (v as any[])[0] === 'object' &&
+      (v as any[])[0] !== null &&
+      'path' in (v as any[])[0] &&
+      'read_status' in (v as any[])[0]
+    ) {
+      return { key: k, entries: v as any[] };
+    }
+  }
+
+  // 4. Nothing found — return the indirect key (if any) with empty array
+  return { key: indirectKey ?? 'file_index', entries: [] };
+}
 
 // ── PlannerAgent ──────────────────────────────────────────────────────────────
 
@@ -280,6 +431,42 @@ export class PlannerAgent {
       onLog?.('[PlannerAgent] Stage 1/5: Workspace Discovery...', 'info');
       await onPhase?.('discovery', 'active');
 
+      // ── Pre-flight: count source files in legacyPath BEFORE calling the LLM ──────
+      // This is a fast TypeScript-only check (no LLM, no API call).
+      // If the path has no files at all, we fail immediately with an actionable
+      // error instead of letting the Discovery Agent run for 6 minutes and then
+      // returning TOTAL_FILES=0.
+      let preflightFileCount = 0;
+      try {
+        const preflightFiles = await glob('**/*', {
+          cwd:       legacyPath,
+          onlyFiles: true,
+          ignore:    ['**/node_modules/**', '**/.git/**', '**/dist/**', '**/build/**', '**/.next/**'],
+          dot:       true,
+        });
+        preflightFileCount = preflightFiles.length;
+      } catch (globErr: any) {
+        onLog?.(
+          `[PlannerAgent] Pre-flight scan failed for "${legacyPath}": ${globErr.message}. ` +
+          'Proceeding to Discovery Agent — it will handle file listing.',
+          'warning'
+        );
+      }
+
+      onLog?.(
+        `[PlannerAgent] Pre-flight scan: found ${preflightFileCount} file(s) in "${legacyPath}".`,
+        'info'
+      );
+
+      if (preflightFileCount === 0) {
+        await TaskContextManager.updateContext(sessionId, { active_phase: 'discovery' });
+        throw new Error(
+          `[PlannerAgent] Pre-flight check failed: legacyPath "${legacyPath}" contains 0 files. ` +
+          'The source project folder is empty or all files were excluded (node_modules / .git / dist / build). ' +
+          'Please verify the uploaded project and start a new session.'
+        );
+      }
+
       // GAP 1 applied: discovery has a 6-minute hard timeout
       await withPhaseTimeout(
         AgentExecutor.execute(
@@ -301,18 +488,16 @@ export class PlannerAgent {
 
       // ── Guard 1: Zero files saved ───────────────────────────────────────────
       if (totalFiles === 0) {
-        // Discovery agent ran but saved zero files.
-        // This happens when: the workspace has no recognisable source files,
-        // the agent hit an LLM error before calling edit_task_context, or
-        // the legacy path was empty / misconfigured.
-        //
-        // SNS IDE pattern: reset phase to 'discovery' so the next run restarts
-        // from Discovery, not from File Analysis with no FILE_INDEX.
+        // Discovery agent ran but saved TOTAL_FILES=0.
+        // Pre-flight confirmed ${preflightFileCount} files exist in legacyPath,
+        // so this is an LLM-side failure (agent crashed or hit an API error before
+        // calling edit_task_context to persist TOTAL_FILES and FILE_INDEX).
+        // Phase is reset to 'discovery' so the next run retries from scratch.
         await TaskContextManager.updateContext(sessionId, { active_phase: 'discovery' });
         throw new Error(
-          '[PlannerAgent] Discovery returned TOTAL_FILES=0. ' +
-          'No source files were indexed. ' +
-          'Possible causes: empty workspace, wrong legacyPath, or agent error. ' +
+          `[PlannerAgent] Discovery Agent returned TOTAL_FILES=0 for "${legacyPath}" ` +
+          `(pre-flight found ${preflightFileCount} file(s) there). ` +
+          'The LLM agent failed to save the file index — likely an API error or timeout. ' +
           'Phase reset to \'discovery\' — re-run to retry from the start.'
         );
       }
@@ -327,7 +512,7 @@ export class PlannerAgent {
       if (expectedFiles > 5 && totalFiles < minimumExpected) {
         onLog?.(
           `[PlannerAgent] Discovery undercount: saved ${totalFiles} files but initial scan found ${expectedFiles}. ` +
-          `Minimum expected: ${minimumExpected}. Resetting to discovery to retry.`,
+        `Minimum expected: ${minimumExpected}. Resetting to discovery to retry.`,
           'warning'
         );
         await TaskContextManager.updateContext(sessionId, { active_phase: 'discovery', TOTAL_FILES: 0 });
@@ -342,18 +527,47 @@ export class PlannerAgent {
       onProgress?.(5, 'Workspace Discovery');
       await onPhase?.('discovery', 'done');
 
-      // ── P0 Fix: Remove stale file_index (underscore) key ──────────────────
-      // A prior discovery pass may have written 'file_index' (underscore) while
-      // the current active key is 'file-index' (dash). If the Phase 2 agent reads
-      // the stale key it sees 8 files all DONE and stops immediately — session stuck.
-      // Solution: delete the underscore key immediately after discovery completes.
+      // ── P0 Fix: Normalize stale file_index key (underscore → dash) ──────────────
+      // The Discovery LLM sometimes writes 'file_index' (underscore) even though
+      // FILE_INDEX_KEY is set to 'file-index' (dash).
+      //
+      // OLD (broken) logic: null out file_index, assuming file-index exists.
+      //   If file-index was never written, the FILE_INDEX data is GONE →
+      //   Phase 2 sees fileIndex=[] → "all done" exits immediately →
+      //   all domain agents skipped → all knowledge graphs empty →
+      //   Sections 5-26 say "not applicable" (this bug caused this run's failure).
+      //
+      // NEW (correct) logic:
+      //   1. If 'file_index' (underscore) has data AND 'file-index' (dash) is empty/missing:
+      //      → COPY underscore data to dash key (so downstream code finds it by FILE_INDEX_KEY)
+      //   2. Then null out the underscore key to prevent Phase 2 key confusion.
       try {
         const staleCtx = await TaskContextManager.getContext(sessionId);
-        if (staleCtx['file_index'] !== undefined && staleCtx['FILE_INDEX_KEY'] === 'file-index') {
-          await TaskContextManager.updateContext(sessionId, { file_index: null });
-          onLog?.('[PlannerAgent] Cleaned up stale file_index key — preventing Phase 2 key confusion.', 'info');
+        const underscoreVal = staleCtx['file_index'];
+        const dashVal       = staleCtx['file-index'];
+        const hasUnderscoreData = Array.isArray(underscoreVal) && underscoreVal.length > 0;
+        const hasDashData       = Array.isArray(dashVal)       && dashVal.length       > 0;
+
+        if (hasUnderscoreData && !hasDashData) {
+          // RESCUE: LLM wrote underscore only — copy to dash so FILE_INDEX_KEY works
+          await TaskContextManager.updateContext(sessionId, {
+            'file-index': underscoreVal,
+            'file_index': null,
+            'FILE_INDEX_KEY': 'file-index',
+          });
+          onLog?.(
+            `[PlannerAgent] Normalized FILE_INDEX: copied ${
+              (underscoreVal as any[]).length
+            } entries from file_index → file-index (LLM used wrong key).`,
+            'info'
+          );
+        } else if (hasUnderscoreData && hasDashData) {
+          // Both exist: dash is already populated; null underscore to remove confusion
+          await TaskContextManager.updateContext(sessionId, { 'file_index': null });
+          onLog?.('[PlannerAgent] Removed duplicate file_index (underscore) — file-index (dash) already populated.', 'info');
         }
-      } catch { /* non-fatal — best-effort cleanup */ }
+        // else: neither or only dash exists — nothing to do
+      } catch { /* non-fatal — resolveFileIndexFromContext will fall back to scanning */ }
 
       await onPhase?.('file-analysis', 'active');
       await TaskContextManager.updateContext(sessionId, { active_phase: 'analysis' });
@@ -362,10 +576,14 @@ export class PlannerAgent {
     }
 
     // ═════════════════════════════════════════════════════════════════════════
-    // STAGE 2 — File Analysis (Full While Loop)
-    // TypeScript loops as many times as needed until ALL files are DONE.
-    // Stall guard: if a pass makes ZERO progress, agent is stuck → advance anyway.
-    // Handles codebases of any size (3 files or 3,000 files).
+    // STAGE 2 — File Analysis (Signal-Driven Loop)
+    //
+    // Primary exit: ALL files marked DONE in FILE_INDEX (real signal).
+    // Safety ceiling: MAX_PASSES=50 (never reached under normal conditions).
+    // Stall guard: 4 consecutive zero-progress passes → advance anyway.
+    // Error handler: 4-category classifier drives retry vs. skip vs. escalate.
+    // Turn cap: derived from real FILE_INDEX avg line count, not model name strings.
+    // De-duplication: FILE_INDEX de-duped once after discovery (GAP 3 fix).
     // ═════════════════════════════════════════════════════════════════════════
     if (activePhase === 'analysis') {
       taskCtx = await TaskContextManager.getContext(sessionId);
@@ -373,87 +591,245 @@ export class PlannerAgent {
       onLog?.(`[PlannerAgent] Stage 2/5: File Analysis (${totalFiles} files)...`, 'info');
       await onPhase?.('file-analysis', 'active');
 
-      let passNumber        = 0;
-      let consecutiveStalls  = 0;    // how many passes in a row made zero progress
-      const MAX_PASSES = 20;         // safety ceiling — no infinite loop ever
-      const MAX_STALLS = 4;          // require 4 consecutive zero-progress passes before advancing
-                                     // (2 was too aggressive — free-tier 429s cause false stalls)
-
-      while (passNumber < MAX_PASSES) {
-        passNumber++;
-
-        // Re-read context to get LAST_FILE_ANALYZED for resume prompt
-        taskCtx = await TaskContextManager.getContext(sessionId);
-        const lastAnalyzed = taskCtx.LAST_FILE_ANALYZED as string | undefined;
-
-        // Check done count BEFORE running this pass (used for stall detection)
-        const fileIndexKey = taskCtx.FILE_INDEX_KEY as string | undefined;
-        const fileIndex: any[] = fileIndexKey ? ((taskCtx[fileIndexKey] as any[]) ?? []) : [];
-        const doneCount = fileIndex.filter((f: any) => f?.read_status === 'DONE').length;
-
-        if (doneCount >= totalFiles) {
-          onLog?.(`[PlannerAgent] All ${totalFiles} files analyzed.`, 'success');
-          break;
+      // ── GAP 3 Fix: De-duplicate FILE_INDEX once before analysis starts ────────
+      // Discovery may run twice on resume, creating duplicate FILE_INDEX entries.
+      // De-dupe eliminates DUPLICATE WRITE BLOCKED false-positives in the analysis agent.
+      // Uses resolveFileIndexFromContext() so we find the array regardless of key name.
+      {
+        const { key: initKey, entries: rawFileIndex } = resolveFileIndexFromContext(taskCtx as Record<string, unknown>);
+        if (rawFileIndex.length > 0) {
+          const { deduped: dedupedIndex, removedCount } = deduplicateFileIndex(rawFileIndex as any);
+          if (removedCount > 0) {
+            await TaskContextManager.updateContext(sessionId, { [initKey]: dedupedIndex });
+            onLog?.(`[PlannerAgent] De-duplicated FILE_INDEX (key="${initKey}"): removed ${removedCount} duplicate entries.`, 'info');
+          }
+          // Normalize: always set FILE_INDEX_KEY so downstream code can use the indirection path
+          if (!(taskCtx as any)['FILE_INDEX_KEY']) {
+            await TaskContextManager.updateContext(sessionId, { FILE_INDEX_KEY: initKey });
+            onLog?.(`[PlannerAgent] Normalized FILE_INDEX_KEY to "${initKey}" (was missing from context).`, 'info');
+          }
         }
+      }
 
-        const remaining = totalFiles - doneCount;
-        const agentId   = passNumber === 1 ? 'file-analysis-agent' : `file-analysis-agent-pass${passNumber}`;
-        onLog?.(`[PlannerAgent] Analysis pass ${passNumber}: ${remaining} files remaining (${doneCount}/${totalFiles} done).`, 'info');
+      let passNumber       = 0;
+      let consecutiveStalls = 0;
+      const MAX_PASSES = 50;  // safety ceiling ONLY — normal exit is pending.length === 0
+      const MAX_STALLS = 4;   // require 4 consecutive zero-progress passes before advancing
 
-        // Compute dynamic limits (model-aware + project-size-aware)
-        const turnCap   = computeTurnCap(resolvedModel);
-        const batchSize = computeBatchSize(totalFiles);
-        onLog?.(`[PlannerAgent] Session limits: turnCap=${turnCap} files | batchSize=${batchSize} small files/batch (model: ${resolvedModel || 'default'})`, 'info');
+      while (true) {
+        // ── Real Signal: Check pending files before every pass ─────────────────
+        taskCtx = await TaskContextManager.getContext(sessionId);
+        const { key: fileIndexKey, entries: fileIndex } = resolveFileIndexFromContext(taskCtx as Record<string, unknown>);
+        const pending   = fileIndex.filter((f: any) => f?.read_status !== 'DONE');
+        const doneCount = fileIndex.length - pending.length;
 
-        // GAP 1 applied: each analysis pass has an 18-minute hard timeout
-        await withPhaseTimeout(
-          AgentExecutor.execute(
-            provider,
-            FILE_ANALYSIS_SYSTEM_PROMPT + customSuffix,
-            buildAnalysisUserPrompt(legacyPath, lastAnalyzed, turnCap, batchSize, detectedStack.language, detectedStack.framework),
-            analysisTools,
-            context,
-            resolvedModel,
-            agentId
-          ),
-          PHASE_TIMEOUT_MS.analysisPass,
-          `analysis-pass-${passNumber}`,
-          onLog
-        );
-
-        await PlannerAgent.cleanupAnalysisKeys(sessionId);
-
-        // ── TypeScript-side DONE reconciliation ───────────────────────────────
-        // The LLM often writes knowledge graphs but skips calling edit_task_context
-        // to mark files DONE (hit by 429 / TURN_CAP before reaching that step).
-        // TypeScript reads _sources from every graph file and marks any FILE_INDEX
-        // entry DONE if its path appears in any graph's _sources array.
-        // This is the safety net that makes progress visible regardless of LLM behaviour.
-        const reconciledCount = await PlannerAgent.reconcileFileDoneStatus(
-          sessionId, modernPath
-        );
-        if (reconciledCount > 0) {
-          onLog?.(
-            `[PlannerAgent] Reconciled ${reconciledCount} file(s) as DONE from knowledge graph sources.`,
-            'info'
+        // ── CRITICAL GUARD: FILE_INDEX is empty but TOTAL_FILES > 0 ─────────────────
+        // This means key resolution failed — the file index was not found in context.
+        // Root causes:
+        //   • Discovery LLM wrote 'file_index' (underscore) but FILE_INDEX_KEY='file-index' (dash)
+        //     AND the normalization above did not copy it (e.g. the context was already corrupted).
+        //   • The taskContext.json was partially written / corrupted.
+        // Action: reset to discovery so the user gets a clear error, not silent "all done"
+        //         which causes all sections to say "not applicable".
+        if (fileIndex.length === 0 && totalFiles > 0) {
+          await TaskContextManager.updateContext(sessionId, { active_phase: 'discovery', TOTAL_FILES: 0 });
+          throw new Error(
+            `[PlannerAgent] Phase 2 ABORT: FILE_INDEX is empty (key="${fileIndexKey}") ` +
+            `but TOTAL_FILES=${totalFiles}. The Discovery LLM wrote the file index under ` +
+            'a key that could not be resolved (likely \'file_index\' vs \'file-index\' mismatch). ' +
+            'Phase reset to \'discovery\' — re-run to retry from Discovery.'
           );
         }
 
-        // Re-read context to measure progress made in this pass
-        taskCtx = await TaskContextManager.getContext(sessionId);
-        const fileIndexKeyAfter   = taskCtx.FILE_INDEX_KEY as string | undefined;
-        const fileIndexAfter: any[] = fileIndexKeyAfter ? ((taskCtx[fileIndexKeyAfter] as any[]) ?? []) : [];
-        const doneAfter = fileIndexAfter.filter((f: any) => f?.read_status === 'DONE').length;
-
-        if (doneAfter >= totalFiles) {
-          onLog?.(`[PlannerAgent] All ${totalFiles} files analyzed after pass ${passNumber}.`, 'success');
-          onProgress?.(45, `Analyzed ${doneAfter} / ${totalFiles} files`);
+        // Primary exit: all files done (real signal — not a counter)
+        if (pending.length === 0 && fileIndex.length > 0) {
+          onLog?.(`[PlannerAgent] All ${fileIndex.length} files analyzed. Analysis complete.`, 'success');
+          onProgress?.(45, `Analyzed ${fileIndex.length} / ${fileIndex.length} files`);
           break;
         }
 
-        // Stall guard: compare THIS pass's progress (doneAfter vs doneCount at pass start)
-        // A 429-interrupted pass may make no DONE marks but still made real progress —
-        // so require 2 consecutive zero-progress passes before advancing.
+        // Safety ceiling: counter only (never the primary control)
+        if (passNumber >= MAX_PASSES) {
+          onLog?.(
+            `[PlannerAgent] Safety ceiling reached (${MAX_PASSES} passes). ` +
+            `Advancing with ${pending.length} files still pending.`,
+            'warning'
+          );
+          onProgress?.(45, `Advanced at ${doneCount} / ${fileIndex.length} files`);
+          break;
+        }
+
+        passNumber++;
+        const lastAnalyzed = taskCtx.LAST_FILE_ANALYZED as string | undefined;
+        const remaining    = pending.length;
+
+        // ── Domain-routed dispatch: route pending files to specialist agents ────
+        // routeFilesToDomains() classifies each PENDING source/schema file into one
+        // of 5 domain buckets (DATA / BACKEND / LOGIC / INFRA / UI) using file.role
+        // and file.path — no LLM calls, no heuristic guessing.
+        // Non-source files (config, doc, asset, build) are excluded by the router
+        // and handled by the generic fallback agent below.
+        const buckets     = routeFilesToDomains(pending as any);
+        const bucketSummary = getBucketSummary(buckets);
+
+        onLog?.(
+          `[PlannerAgent] Analysis pass ${passNumber}: ${remaining} file(s) pending (${doneCount}/${fileIndex.length} done).`,
+          'info'
+        );
+        if (bucketSummary) {
+          onLog?.(`[PlannerAgent] Domain routing: ${bucketSummary}`, 'info');
+        }
+
+        // ── Data-driven turn cap + batch size (per-bucket, from real FILE_INDEX) ─
+        const avgLines  = computeAvgFileSizeLines(fileIndex);
+        const contextK  = getModelContextK(resolvedModel);
+        const turnCap   = computeTurnCapFromData(contextK, avgLines, remaining);
+        const batchSize = computeBatchSizeFromData(remaining);
+        onLog?.(
+          `[PlannerAgent] Pass ${passNumber} limits: turnCap=${turnCap} files | batchSize=${batchSize} ` +
+          `(contextK=${contextK}K, avgLines=${avgLines}, pending=${remaining})`,
+          'info'
+        );
+
+        // ── Domain agent dispatch map ────────────────────────────────────────────
+        // Each bucket runs as an independent AgentExecutor call in parallel.
+        // System prompt is domain-specific; user prompt lists only that bucket's files.
+        type DomainDispatch = {
+          bucket:     keyof typeof buckets;
+          system:     string;
+          userPrompt: string;
+          agentId:    string;
+        };
+
+        const dispatches: DomainDispatch[] = [];
+
+        if (buckets.DATA.length > 0) {
+          dispatches.push({
+            bucket:     'DATA',
+            system:     DATA_AGENT_SYSTEM_PROMPT + customSuffix,
+            userPrompt: buildDataAgentUserPrompt(legacyPath, buckets.DATA as any, detectedStack.language, detectedStack.framework),
+            agentId:    `data-agent-pass${passNumber}`,
+          });
+        }
+        if (buckets.BACKEND.length > 0) {
+          dispatches.push({
+            bucket:     'BACKEND',
+            system:     BACKEND_AGENT_SYSTEM_PROMPT + customSuffix,
+            userPrompt: buildBackendAgentUserPrompt(legacyPath, buckets.BACKEND as any, detectedStack.language, detectedStack.framework),
+            agentId:    `backend-agent-pass${passNumber}`,
+          });
+        }
+        if (buckets.LOGIC.length > 0) {
+          dispatches.push({
+            bucket:     'LOGIC',
+            system:     LOGIC_AGENT_SYSTEM_PROMPT + customSuffix,
+            userPrompt: buildLogicAgentUserPrompt(legacyPath, buckets.LOGIC as any, detectedStack.language, detectedStack.framework),
+            agentId:    `logic-agent-pass${passNumber}`,
+          });
+        }
+        if (buckets.INFRA.length > 0) {
+          dispatches.push({
+            bucket:     'INFRA',
+            system:     INFRA_AGENT_SYSTEM_PROMPT + customSuffix,
+            userPrompt: buildInfraAgentUserPrompt(legacyPath, buckets.INFRA as any, detectedStack.language, detectedStack.framework),
+            agentId:    `infra-agent-pass${passNumber}`,
+          });
+        }
+        if (buckets.UI.length > 0) {
+          dispatches.push({
+            bucket:     'UI',
+            system:     UI_AGENT_SYSTEM_PROMPT + customSuffix,
+            userPrompt: buildUIAgentUserPrompt(legacyPath, buckets.UI as any, detectedStack.language, detectedStack.framework),
+            agentId:    `ui-agent-pass${passNumber}`,
+          });
+        }
+
+        // Fallback: files not routed to any domain (non-source/schema types such as
+        // config, doc, asset — excluded by routeFilesToDomains) use the generic agent.
+        const routedPaths = new Set([
+          ...buckets.DATA, ...buckets.BACKEND, ...buckets.LOGIC,
+          ...buckets.INFRA, ...buckets.UI,
+        ].map((f: any) => f.path));
+        const unroutedFiles = pending.filter(f => !routedPaths.has((f as any).path));
+        if (unroutedFiles.length > 0) {
+          onLog?.(
+            `[PlannerAgent] ${unroutedFiles.length} non-source file(s) → generic agent (config/doc/asset).`,
+            'info'
+          );
+          dispatches.push({
+            bucket:     'LOGIC',   // reuse LOGIC slot for typing — not a real bucket here
+            system:     FILE_ANALYSIS_SYSTEM_PROMPT + customSuffix,
+            userPrompt: buildAnalysisUserPrompt(
+              legacyPath, lastAnalyzed, turnCap, batchSize,
+              detectedStack.language, detectedStack.framework
+            ),
+            agentId: `file-analysis-agent-pass${passNumber}`,
+          });
+        }
+
+        // If nothing to dispatch (e.g. all pending are already mid-flight), skip
+        if (dispatches.length === 0) {
+          onLog?.(`[PlannerAgent] Pass ${passNumber}: nothing to dispatch (0 routable files).`, 'warning');
+        }
+
+        // ── Execute all domain dispatches concurrently ───────────────────────────
+        // Each domain agent runs independently — no shared mutable state per pass.
+        // concurrencyLimit = 5 (one slot per domain bucket).
+        let passError: Error | null = null;
+        const passResults = await Promise.allSettled(
+          dispatches.map(d =>
+            withPhaseTimeout(
+              AgentExecutor.execute(provider, d.system, d.userPrompt, analysisTools, context, resolvedModel, d.agentId),
+              PHASE_TIMEOUT_MS.analysisPass,
+              `analysis-pass-${passNumber}-${d.bucket}`,
+              onLog
+            )
+          )
+        );
+
+        // Collect errors — if any domain agent failed, classify the worst one
+        for (const result of passResults) {
+          if (result.status === 'rejected') {
+            const err = result.reason as Error;
+            const action = await handleAnalysisError(err, passNumber, remaining, onLog ?? (() => {}));
+            if (action === 'skip-problematic' || action === 'escalate') {
+              passError = err;
+              break;
+            }
+            // rate-limit / depth-retry: log but let other domain agents' results stand
+            if (!passError) passError = err;
+          }
+        }
+        if (passError) {
+          const action = await handleAnalysisError(passError, passNumber, remaining, onLog ?? (() => {}));
+          if (action === 'skip-problematic' || action === 'escalate') {
+            break;
+          }
+        }
+
+        await PlannerAgent.cleanupAnalysisKeys(sessionId);
+
+        // ── TypeScript-side DONE reconciliation ──────────────────────────────
+        // Safety net: marks files DONE if their path appears in any graph's _sources.
+        // Covers cases where LLM wrote graphs but didn't call edit_task_context.
+        if (!passError) {
+          const reconciledCount = await PlannerAgent.reconcileFileDoneStatus(sessionId, modernPath);
+          if (reconciledCount > 0) {
+            onLog?.(
+              `[PlannerAgent] Reconciled ${reconciledCount} file(s) as DONE from knowledge graph sources.`,
+              'info'
+            );
+          }
+        }
+
+        // ── Stall guard: secondary safety net only ────────────────────────────
+        // Re-read context to measure progress made in this pass
+        taskCtx = await TaskContextManager.getContext(sessionId);
+        const { entries: fileIndexAfter } = resolveFileIndexFromContext(taskCtx as Record<string, unknown>);
+        const doneAfter = fileIndexAfter.filter((f: any) => f?.read_status === 'DONE').length;
+
+
+        // Stall guard: compare THIS pass progress
         if (doneAfter > doneCount) {
           // Real progress made this pass — reset stall counter
           consecutiveStalls = 0;
@@ -490,35 +866,21 @@ export class PlannerAgent {
       activePhase = 'graph-resolution';
     }
 
-
     // ═════════════════════════════════════════════════════════════════════════
-    // STAGE 3 — Graph Resolution
-    // ONE call. Agent resolves cross-refs, synthesizes architecture, saves counters.
-    // Agent self-manages: reads all graphs, resolves references, stops naturally.
+    // STAGE 3 — Graph Resolution (TypeScript + 1 LLM call)
+    //
+    // Pass A (FK resolution):         TypeScript graph-resolver.ts — 0 LLM calls
+    // Pass B (call-flow graph):        TypeScript graph-resolver.ts — 0 LLM calls
+    // importedBy + MIGRATION_ORDER:    TypeScript graph-resolver.ts — 0 LLM calls
+    // Pass C (architecture synthesis): 1 LLM call
+    // Pass D (counter recovery):       1 LLM call — safety fallback only
     // ═════════════════════════════════════════════════════════════════════════
     if (activePhase === 'graph-resolution') {
       await onPhase?.('graph-resolution', 'active');
-      // ═══════════════════════════════════════════════════════════════════════
-      // STAGE 3 — Graph Resolution (3 Context-Isolated Passes)
-      //
-      // Anthropic Context Isolation principle: each sub-agent starts fresh.
-      // Benefits: full context capacity per pass, no context pollution,
-      // better failure isolation (retry only the failed pass).
-      //
-      // Pass A: Entity FK resolution + entry point auth resolution
-      // Pass B: Call flow graph (traces ALL entry points — no cap)
-      // Pass C: Architecture synthesis + mandatory G5 counters
-      // ═══════════════════════════════════════════════════════════════════════
-
-      onLog?.('[PlannerAgent] Stage 3/5: Graph Resolution...', 'info');
+      onLog?.('[PlannerAgent] Stage 3/5: Graph Resolution (TypeScript + Architecture Synthesis)...', 'info');
 
       // ── Graph Quality Gate ─────────────────────────────────────────────────
-      // If Phase 2 produced no data in the 3 primary graphs, running Pass A and
-      // Pass B is wasteful — they only resolve cross-references in existing data.
-      // Root cause: Phase 2 may have used a stale file-index key (all files DONE)
-      // and written zero entries to knowledge graphs.
-      // Action: skip Pass A+B, jump to Pass C (saves counters = all 0) + Pass D.
-      const preGraphCtx = await TaskContextManager.getContext(sessionId);
+      const preGraphCtx        = await TaskContextManager.getContext(sessionId);
       const totalUnitsCheck    = (preGraphCtx.TOTAL_CALLABLE_UNITS as number) ?? 0;
       const totalEntitiesCheck = (preGraphCtx.TOTAL_DATA_ENTITIES  as number) ?? 0;
       const totalEndptsCheck   = (preGraphCtx.TOTAL_API_ENDPOINTS  as number) ?? 0;
@@ -529,9 +891,7 @@ export class PlannerAgent {
       if (graphsAreEmpty) {
         onLog?.(
           '[PlannerAgent] ⚠️ Graph quality gate: all 3 primary graphs are empty. ' +
-          'Phase 2 may not have written to knowledge graphs (stale file-index key or zero-file session). ' +
-          'Skipping Pass A (entity FK) and Pass B (call flows) — no data to resolve. ' +
-          'Pass C will run to save counters (all = 0). Check Phase 2 logs for root cause.',
+          'TypeScript resolvers will be no-ops. Pass C runs to save counters (all = 0).',
           'warning'
         );
         await TaskContextManager.updateContext(sessionId, {
@@ -541,102 +901,47 @@ export class PlannerAgent {
       }
 
       if (!graphsAreEmpty) {
-        onLog?.('[PlannerAgent] Stage 3A/5: Entity & Auth Resolution...', 'info');
-        // GAP 1 applied: graph passes each have a 12-minute hard timeout
-        await withPhaseTimeout(
-          AgentExecutor.execute(
-            provider,
-            GRAPH_PASS_A_SYSTEM + customSuffix,
-            buildGraphPassAUserPrompt(legacyPath, detectedStack.language, detectedStack.framework),
-            graphTools, context, resolvedModel, 'graph-resolver-entity-auth'
-          ),
-          PHASE_TIMEOUT_MS.graphPass,
-          'graph-pass-A',
-          onLog
-        );
-        onLog?.('[PlannerAgent] Stage 3A complete — entity FKs + auth resolved.', 'success');
-        // GAP 4: granular progress — user sees sub-pass completion, not frozen 55%
-        onProgress?.(47, 'Graph: Entity & Auth resolved');
+        // ── TypeScript FK Resolution (replaces LLM Pass A) ──────────────────
+        onLog?.('[PlannerAgent] Stage 3A/5: TypeScript FK Resolution...', 'info');
+        try {
+          const fkCount = await resolveForeignKeys(modernPath);
+          onLog?.(`[PlannerAgent] Stage 3A complete — ${fkCount} FK relation(s) resolved.`, 'success');
+        } catch (fkErr: any) {
+          onLog?.(`[PlannerAgent] Stage 3A FK error: ${fkErr.message}. Continuing.`, 'warning');
+        }
+        onProgress?.(47, 'Graph: FK relations resolved');
+
+        // ── TypeScript Call-Flow Graph (replaces LLM Pass B loop) ──────────
+        onLog?.('[PlannerAgent] Stage 3B/5: TypeScript Call-Flow Graph...', 'info');
+        try {
+          const cfCount = await buildCallFlowGraph(modernPath);
+          onLog?.(`[PlannerAgent] Stage 3B complete — ${cfCount} entry point(s) traced.`, 'success');
+        } catch (cfErr: any) {
+          onLog?.(`[PlannerAgent] Stage 3B call-flow error: ${cfErr.message}. Continuing.`, 'warning');
+        }
+        onProgress?.(50, 'Graph: Call-flow traced');
       } else {
-        onLog?.('[PlannerAgent] Stage 3A skipped — graphs are empty.', 'warning');
+        onLog?.('[PlannerAgent] Stage 3A+3B: TypeScript resolvers skipped (empty graphs).', 'warning');
       }
 
-      if (!graphsAreEmpty) {
-        // Fix 3: Pass B now uses offset-based batching (15 endpoints per call).
-        // Each call traces one batch, saves CALL_FLOW_OFFSET, then stops.
-        // The orchestrator loops until offset >= CALL_FLOW_TOTAL (all endpoints traced).
-        // This prevents context exhaustion that previously caused Pass C to never run.
-        onLog?.('[PlannerAgent] Stage 3B/5: Call Flow Graph Construction (batched)...', 'info');
-        const MAX_PASS_B_ROUNDS = 20; // Safety ceiling: 20 × 15 = 300 endpoints max
-        let passBRound = 0;
-        while (passBRound < MAX_PASS_B_ROUNDS) {
-          passBRound++;
-          const ctxBeforeB = await TaskContextManager.getContext(sessionId);
-          const currentOffset = (ctxBeforeB.CALL_FLOW_OFFSET as number) ?? 0;
-          const totalEndpoints = (ctxBeforeB.CALL_FLOW_TOTAL as number) ?? undefined;
-
-          // If total is known and offset has reached or passed it — all traces done
-          if (totalEndpoints !== undefined && currentOffset >= totalEndpoints) {
-            onLog?.(`[PlannerAgent] Pass B complete — all ${totalEndpoints} entry points traced.`, 'success');
-            break;
-          }
-
-          onLog?.(`[PlannerAgent] Pass B round ${passBRound}: tracing batch starting at offset ${currentOffset}...`, 'info');
-          // GAP 1 applied: each Pass B round has a 12-minute timeout
-          await withPhaseTimeout(
-            AgentExecutor.execute(
-              provider,
-              GRAPH_PASS_B_SYSTEM + customSuffix,
-              buildGraphPassBUserPrompt(legacyPath, currentOffset, detectedStack.language, detectedStack.framework),
-              graphTools, context, resolvedModel, 'graph-resolver-callflow'
-            ),
-            PHASE_TIMEOUT_MS.graphPass,
-            `graph-pass-B-round-${passBRound}`,
-            onLog
-          );
-
-          // Read updated offset — if it didn't advance, stop to avoid an infinite loop
-          const ctxAfterB = await TaskContextManager.getContext(sessionId);
-          const newOffset = (ctxAfterB.CALL_FLOW_OFFSET as number) ?? currentOffset;
-          const newTotal  = (ctxAfterB.CALL_FLOW_TOTAL as number) ?? undefined;
-
-          if (newOffset <= currentOffset) {
-            onLog?.(`[PlannerAgent] Pass B round ${passBRound}: offset did not advance (stuck at ${currentOffset}). Stopping Pass B.`, 'warning');
-            break;
-          }
-
-          // GAP 3: Regression guard — offset going BACKWARDS means LLM reset it incorrectly
-          if (newOffset < currentOffset) {
-            onLog?.(
-              `[PlannerAgent] Pass B round ${passBRound}: OFFSET REGRESSION detected ` +
-              `(${currentOffset} → ${newOffset}). LLM reset the counter incorrectly. ` +
-              `Stopping Pass B to prevent re-tracing already completed endpoints.`,
-              'warning'
-            );
-            break;
-          }
-
-          // GAP 4: granular progress per Pass B round
-          if (newTotal && newTotal > 0) {
-            const bPct = 47 + Math.round((newOffset / newTotal) * 3); // 47% → 50%
-            onProgress?.(Math.min(bPct, 50), `Call flow: ${newOffset} / ${newTotal} endpoints`);
-          }
-
-          // Check again with fresh values
-          if (newTotal !== undefined && newOffset >= newTotal) {
-            onLog?.(`[PlannerAgent] Pass B complete — all ${newTotal} entry points traced (${passBRound} rounds).`, 'success');
-            break;
-          }
+      // ── TypeScript importedBy + MIGRATION_ORDER ────────────────────────────
+      onLog?.('[PlannerAgent] Stage 3C-pre: TypeScript importedBy + Migration Order...', 'info');
+      try {
+        await computeImportedBy(modernPath);
+        const migrationOrder = await computeMigrationOrder(modernPath);
+        if (migrationOrder.length > 0) {
+          await TaskContextManager.updateContext(sessionId, {
+            MIGRATION_ORDER: migrationOrder.map((filePath, i) => ({ rank: i + 1, file: filePath })),
+          });
+          onLog?.(`[PlannerAgent] Migration order: top ${migrationOrder.length} files ranked.`, 'success');
+        } else {
+          onLog?.('[PlannerAgent] Migration order: no import data — imports-graph may be empty.', 'info');
         }
-        if (passBRound >= MAX_PASS_B_ROUNDS) {
-          onLog?.(`[PlannerAgent] Pass B hit round cap (${MAX_PASS_B_ROUNDS}). Proceeding to Pass C.`, 'warning');
-        }
-        onLog?.('[PlannerAgent] Stage 3B complete — call flows built.', 'success');
-      } else {
-        onLog?.('[PlannerAgent] Stage 3B skipped — graphs are empty.', 'warning');
+      } catch (ibErr: any) {
+        onLog?.(`[PlannerAgent] importedBy error: ${ibErr.message}. Continuing.`, 'warning');
       }
 
-      onLog?.('[PlannerAgent] Stage 3C/5: Architecture Synthesis + Counters...', 'info');
+      onLog?.('[PlannerAgent] Stage 3C/5: Architecture Synthesis + Counters (LLM)...', 'info');
       onProgress?.(51, 'Graph: Synthesizing architecture');
       // GAP 1 applied: Pass C has a 12-minute hard timeout
       await withPhaseTimeout(
@@ -772,6 +1077,14 @@ export class PlannerAgent {
       onLog?.(`[PlannerAgent] Section writer concurrency: ${maxConcurrent} parallel (model: ${resolvedModel || 'default'})`, 'info');
 
       for (const batch of batches) {
+        // Log which theme groups are running in this batch (for user visibility)
+        const themeNames = [...new Set(batch.map(s => getSectionThemeName(s.n)))];
+        const sectionNums = batch.map(s => s.n).join(', ');
+        onLog?.(
+          `[PlannerAgent] Dispatching sections [${sectionNums}] — themes: ${themeNames.join(' | ')}`,
+          'info'
+        );
+
         await runWithConcurrencyLimit(
           batch.map(section => () =>
             PlannerAgent.writeSingleSection(
@@ -1233,10 +1546,7 @@ export class PlannerAgent {
 
     // ── Step 2: Load FILE_INDEX from task context ──────────────────────────
     const ctx = await TaskContextManager.getContext(sessionId);
-    const fileIndexKey = ctx.FILE_INDEX_KEY as string | undefined;
-    if (!fileIndexKey) return 0;
-
-    const fileIndex: any[] = (ctx[fileIndexKey] as any[]) ?? [];
+    const { key: fileIndexKey, entries: fileIndex } = resolveFileIndexFromContext(ctx as Record<string, unknown>);
     if (fileIndex.length === 0) return 0;
 
     // ── Step 3: Mark DONE for any file that contributed to a graph ─────────

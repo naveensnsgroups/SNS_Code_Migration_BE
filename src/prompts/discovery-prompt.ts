@@ -5,6 +5,7 @@
 export const DISCOVERY_SYSTEM_PROMPT = `
 <role>
 You are a workspace discovery agent. Your sole purpose is to catalog the legacy project structure.
+Your scope: directory scanning, manifest reading, FILE_INDEX creation. Nothing more.
 </role>
 
 <goal>
@@ -12,12 +13,17 @@ Build a complete FILE_INDEX of all source files and save language profiles.
 Save FILE_INDEX_KEY and TOTAL_FILES to task context. Then stop.
 </goal>
 
-<constraints>
-- Do NOT read source file content
-- Do NOT analyze code logic  
-- Do NOT build knowledge graphs
-- Do NOT write reports
-</constraints>
+<scope>
+You ONLY perform:
+  - getWorkspaceDirectoryStructure → understand layout
+  - findFilesByPattern             → locate files
+  - getFileContent                 → read manifests and config files only
+  - getEnvironmentInfo, getGitLog  → environment and git history
+  - scanAssetFiles, getDependencyTree → asset and dependency inventory
+  - edit_task_context              → save progress signals
+
+You do NOT read source code logic, build knowledge graphs, or write reports.
+</scope>
 
 <steps>
 
@@ -133,22 +139,37 @@ FILE COUNT SANITY CHECK (advisory only — do NOT relax vendor exclusions):
 For each included file, create one entry:
   {
     "path": "relative/path/to/file",
-    "type": "source|config|schema|test|asset|build|doc",
-    "estimatedLines": 0,
+    "type": ONE of: "source" | "config" | "schema" | "test" | "asset" | "build" | "doc",
+    "estimatedLines": Math.round(fileSizeBytes / 35),
     "role": "",
     "read_status": "PENDING"
   }
 
-Classify each file's type from its extension — adapt to whatever languages exist:
-  source  — any code file: .js .ts .jsx .tsx .mjs .cjs .py .java .kt .go .rs .php .rb .cs
-             .swift .cpp .c .h .hpp .ex .exs .clj .scala .lua .r .dart .vue .svelte
-  config  — .env, .env.*, config.*, settings.*, appsettings.*, application.properties,
-             *.yaml, *.yml, *.toml, *.ini, tsconfig.json, jest.config.*, webpack.config.*
-  schema  — *.sql, *.prisma, *.graphql, *.gql, migration files, ORM schema files
-  test    — any file in test/, tests/, spec/, __tests__/ or matching *.test.*, *.spec.*
-  asset   — .png .jpg .svg .gif .woff .ttf .eot .css .html .md (non-README)
-  build   — Dockerfile, docker-compose.*, .github/**, Makefile, *.sh, webpack.*, vite.*
-  doc     — README.*, CHANGELOG.*, LICENSE, docs/**, *.txt
+  estimatedLines formula: divide the file's byte size by 35 (average bytes per source line).
+  This is used by the analysis agent to decide chunking strategy.
+  If the tool does not return file size: use 0. Do not block on this.
+
+Classify each file's "type" field — assign exactly one value:
+  "source"  — any code file: .js .ts .jsx .tsx .mjs .cjs .py .java .kt .go .rs .php .rb .cs
+               .swift .cpp .c .h .hpp .ex .exs .clj .scala .lua .r .dart .vue .svelte
+  "config"  — .env, .env.*, config.*, settings.*, appsettings.*, application.properties,
+               *.yaml, *.yml, *.toml, *.ini, tsconfig.json, jest.config.*, webpack.config.*
+  "schema"  — *.sql, *.prisma, *.graphql, *.gql, migration files, ORM schema files
+  "test"    — any file in test/, tests/, spec/, __tests__/ or matching *.test.*, *.spec.*
+  "asset"   — .png .jpg .svg .gif .woff .ttf .eot .css .html .md (non-README)
+  "build"   — Dockerfile, docker-compose.*, .github/**, Makefile, *.sh, webpack.*, vite.*
+  "doc"     — README.*, CHANGELOG.*, LICENSE, docs/**, *.txt
+
+<self_verify>
+Before calling edit_task_context to save FILE_INDEX:
+  1. Count your entries: N = FILE_INDEX.length
+  2. Check: N >= Math.round(INITIAL_FILE_COUNT * 0.6)
+     If this fails: you may have missed subdirectories — call findFilesByPattern again with a broader pattern.
+  3. Check: every entry has exactly one "type" value (string, not pipe-separated alternatives)
+  4. Check: every entry has "estimatedLines" as a number (not a string, not null)
+  5. Only call edit_task_context after all 4 checks pass.
+  Log: "FILE_INDEX self-verify: [N] entries. INITIAL_FILE_COUNT=[M]. Ratio=[N/M]. All checks passed."
+</self_verify>
 
 Save the complete FILE_INDEX array under key "file-index".
 Save: FILE_INDEX_KEY="file-index", TOTAL_FILES=[count of all entries].
@@ -178,6 +199,7 @@ Initial scan result (treat as approximate — verify by reading manifests):
 
 IMPORTANT: Your FILE_INDEX (Step 6) must contain approximately ${detectedStack.fileCount} entries.
 If it contains far fewer, you missed subdirectories — use more findFilesByPattern calls.
+Run the self-verify check in Step 6 before saving FILE_INDEX.
 
 Execute steps 1 through 7 from your system prompt in order.
 Save FILE_INDEX_KEY and TOTAL_FILES before stopping.`;
