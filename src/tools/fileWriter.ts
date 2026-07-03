@@ -1,13 +1,10 @@
 import fs from 'fs-extra';
 import path from 'path';
 
-/**
- * Safely writes content to a file within a session directory
- */
 export async function writeSessionFile(sessionPath: string, relativePath: string, content: string): Promise<void> {
   const absolutePath = path.resolve(sessionPath, relativePath);
 
-  // Security guard: prevent directory traversal
+  
   if (!absolutePath.startsWith(path.resolve(sessionPath))) {
     throw new Error('Access denied: path is outside the project directory');
   }

@@ -1,7 +1,4 @@
-// =============================================================================
-//  tools/environment/get-environment-info.tool.ts
-//  Mirrors: GetEnvironmentInfo (snside migration-env-tools.ts)
-// =============================================================================
+
 
 import { ToolRequest } from '../../types/tool.js';
 
@@ -10,9 +7,6 @@ import { makeToolTextResult, makeToolErrorResult } from '../../types/language-mo
 
 import { ShellExecutor } from '../shellExecutor.js';
 import { GET_ENVIRONMENT_INFO_FUNCTION_ID } from '../../common/workspace-functions.js';
-
-// ── Use the exact SNS IDE constant from workspace-functions.ts ────────────────
-// GET_ENVIRONMENT_INFO_FUNCTION_ID = 'getEnvironmentInfo'
 
 export const getEnvironmentInfoTool: ToolRequest = {
   id: GET_ENVIRONMENT_INFO_FUNCTION_ID,

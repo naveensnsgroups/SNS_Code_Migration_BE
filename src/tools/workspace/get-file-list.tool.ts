@@ -1,7 +1,4 @@
-// =============================================================================
-//  tools/workspace/get-file-list.tool.ts
-//  Mirrors: GetWorkspaceFileList (snside workspace-functions.ts)
-// =============================================================================
+
 
 import fs from 'fs-extra';
 import path from 'path';

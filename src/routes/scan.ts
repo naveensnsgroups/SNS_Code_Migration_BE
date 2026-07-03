@@ -8,11 +8,6 @@ import { ScannerAgent, ScannerAgentConfig } from '../agents/stage1/scanner-agent
 const router = Router();
 const upload = multer({ storage: multer.memoryStorage() });
 
-/**
- * POST /api/scan
- * Receives legacy workspace files, writes them to disk under sessions/<sessionId>/legacy,
- * and scans the stack.
- */
 router.post('/', upload.array('files'), async (req: Request, res: Response, next: NextFunction) => {
   try {
     const files = req.files as Express.Multer.File[];
@@ -21,13 +16,13 @@ router.post('/', upload.array('files'), async (req: Request, res: Response, next
       return;
     }
 
-    // 1. Generate unique session ID and initialize directories
+    
     const sessionId = SessionManager.generateSessionId();
     const session = await SessionManager.createSession(sessionId);
     
     await SessionManager.addLog(sessionId, `Initializing session ${sessionId}...`, 'info');
 
-    // 2. Write uploaded files to sessions/<sessionId>/legacy/ preserving their subfolder structure
+    
     let paths: string[] = [];
     try {
       paths = JSON.parse(req.body.paths || '[]');
@@ -47,13 +42,13 @@ router.post('/', upload.array('files'), async (req: Request, res: Response, next
       await fs.writeFile(destPath, file.buffer);
     }
 
-    // Detect if there is a common parent directory for all files to align project root
+    
     let commonParent = '';
     const cleanPaths = paths
       .map(p => p.replace(/\\/g, '/'))
       .filter(p => p && !p.includes('.git/') && !p.includes('node_modules/'));
 
-    // Log the real count: files that will actually be written (excludes .git, node_modules)
+    
     const rawCount = files.length;
     const writtenCount = cleanPaths.length;
     const skippedCount = rawCount - writtenCount;
@@ -89,7 +84,7 @@ router.post('/', upload.array('files'), async (req: Request, res: Response, next
       await SessionManager.addLog(sessionId, `Project root detected and set to subfolder: ${commonParent}`, 'info');
     }
 
-    // 3. Build AI config from request body and run codebase scanner agent
+    
     await SessionManager.addLog(sessionId, 'Running codebase scanner agent...', 'info');
 
     const { provider, model, apiKey } = req.body;
@@ -115,10 +110,10 @@ router.post('/', upload.array('files'), async (req: Request, res: Response, next
       await SessionManager.addLog(sessionId, 'No AI provider configured — using static manifest scan.', 'info');
     }
 
-    // Run scanner agent in the background asynchronously
+    
     ScannerAgent.run(
       session.projectPath,
-      session.modernPath,    // needed for scan-result.json persistence + idempotency
+      session.modernPath,    
       aiConfig,
       async (msg, lvl) => {
         const entry = await SessionManager.addLog(sessionId, msg, lvl ?? 'info');
@@ -126,7 +121,7 @@ router.post('/', upload.array('files'), async (req: Request, res: Response, next
         EventBroadcaster.broadcast(sessionId, 'log', entry);
       }
     ).then(async (scanResult) => {
-      // Update session settings on completion
+      
       await SessionManager.updateSession(sessionId, {
         detectedStack: scanResult.detectedStack,
         fileTree:      scanResult.fileTree,
@@ -134,7 +129,7 @@ router.post('/', upload.array('files'), async (req: Request, res: Response, next
         rawFileCount:  scanResult.rawFileCount,
       });
 
-      // Broadcast scan completion to SSE clients
+      
       const { EventBroadcaster } = await import('./stream.js');
       EventBroadcaster.broadcast(sessionId, 'complete', {
         success:           true,
@@ -154,7 +149,7 @@ router.post('/', upload.array('files'), async (req: Request, res: Response, next
       EventBroadcaster.broadcast(sessionId, 'error', { message: err.message });
     });
 
-    // Return the sessionId immediately to the client
+    
     res.json({
       sessionId,
     });

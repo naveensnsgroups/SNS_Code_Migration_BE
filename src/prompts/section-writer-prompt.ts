@@ -1,44 +1,26 @@
-// =============================================================================
-//  section-writer-prompt.ts — Stage 4 Section Writer Agent
-//
-//  This file contains:
-//    1. SECTION_SYSTEM_PROMPT — short generic system prompt used for all 26 sections
-//    2. SECTION_CONFIG — configuration for all 26 sections (graph, instructions, exclusions)
-//    3. buildSectionUserPrompt() — generates a tailored user prompt per section
-//
-//  Each section agent call gets:
-//    system: SECTION_SYSTEM_PROMPT (short, focused, same for all 26)
-//    user:   buildSectionUserPrompt(section) (tailored per section)
-//
-//  The agent writes to: _analysis/sections/section-NN.md
-//  The TypeScript assembler later combines all 26 into Stage1_Analysis.md
-// =============================================================================
 
-// ── Section Config Type ───────────────────────────────────────────────────────
 
 export interface SectionConfig {
   n: number;
   name: string;
-  graph: string | null;            // null = no graph; use task context / other tool
-  ctxKeys?: string[];              // task context keys to call get_task_context for
-  needsDirStructure?: boolean;     // call getWorkspaceDirectoryStructure
-  needsDepsTree?: boolean;         // call getDependencyTree
-  specificInstructions: string;    // WHAT to write in this section
-  crossRefNote?: string;           // what NOT to repeat (refers to other sections)
+  graph: string | null;            
+  ctxKeys?: string[];              
+  needsDirStructure?: boolean;     
+  needsDepsTree?: boolean;         
+  specificInstructions: string;    
+  crossRefNote?: string;           
 
-  // ── Industry-standard per-section validation ─────────────────────────────
-  // emptyGraphIsValid: true  → "No X found." is a correct complete answer
-  //                            (don't retry, don't mark as failed)
-  // emptyGraphIsValid: false → empty graph means the graph writer MISSED something;
-  //                            retry is warranted
+  
+  
+  
+  
+  
   emptyGraphIsValid: boolean;
 
-  // minContentBytes: minimum file size considered a complete section.
-  // Replaces the global 500-byte guess with a per-section calibrated threshold.
+  
+  
   minContentBytes: number;
 }
-
-// ── All 26 Section Configurations ────────────────────────────────────────────
 
 export const SECTION_CONFIG: SectionConfig[] = [
   {
@@ -46,7 +28,7 @@ export const SECTION_CONFIG: SectionConfig[] = [
     name: 'Project Identity',
     graph: null,
     ctxKeys: ['lang-profiles', 'TOTAL_FILES', 'PRIMARY_LANGUAGE', 'MONOREPO', 'MONOREPO_TYPE', 'RUNTIME_VERSIONS'],
-    emptyGraphIsValid: true,    // no graph — reads context keys directly
+    emptyGraphIsValid: true,    
     minContentBytes: 300,
     specificInstructions: `Load lang-profiles and inline task context keys.
 Write a comprehensive project identity section including:
@@ -55,7 +37,7 @@ Write a comprehensive project identity section including:
     go.mod / pom.xml / build.gradle / Cargo.toml / Gemfile / *.csproj — do NOT assume Node.js)
   - Primary programming language and version
   - Framework and framework version
-  - Architecture type (REST API, GraphQL, MVC, CLI, Worker, Library, etc.)
+  - Architecture type \u2014 read EXACTLY from lang-profiles[0].architecture_type. Do not rephrase or remap.
   - Entry point file (main file, index, app, cmd/main.go, src/main.rs — whatever the project uses)
   - Package manager:
     Node.js → npm / yarn / pnpm | Python → pip / poetry / uv / conda |
@@ -71,7 +53,7 @@ Write a comprehensive project identity section including:
     n: 2,
     name: 'Architecture Overview',
     graph: 'architecture',
-    emptyGraphIsValid: false,   // architecture graph always populated by resolver
+    emptyGraphIsValid: false,   
     minContentBytes: 500,
     specificInstructions: `Call read-knowledge-graph("architecture").
 
@@ -85,14 +67,16 @@ FALLBACK (if synthesized_overview is missing or empty — resolver may have hit 
 
 Write a complete architecture overview including:
   - System type and overall pattern
-  - All layers (Controller/Service/Repository/Data or equivalent for this language) with files
+  - All layers FOUND IN THIS PROJECT — use the actual folder names and file roles from FILE_INDEX.
+    Do NOT assume Controller/Service/Repository pattern. Write what actually exists in this codebase.
   - ALL modules/domains found (one paragraph per module with entities and endpoints)
   - Cross-module dependency map (which module depends on which)
   - Communication protocol (REST/GraphQL/gRPC/WebSocket/Event-Driven/CLI/Queue)
   - Design patterns observed (Repository, DI, MVC, CQRS, Factory, Active Record, etc.)
   - Global middleware/interceptor pipeline (ordered, from synthesized_overview or middleware-graph)
   - Frontend/Backend split (if frontend exists)
-  - Technology decisions and WHY (infer from patterns)
+  - Technology decisions observed: list the libraries and frameworks found in the project.
+    Do NOT explain WHY they were chosen — you cannot know this from static code analysis.
   - Total counts: entities, endpoints, modules, callable units`,
   },
   {
@@ -101,7 +85,7 @@ Write a complete architecture overview including:
     graph: null,
     ctxKeys: ['file-index', 'FILE_INDEX_KEY'],
     needsDirStructure: true,
-    emptyGraphIsValid: true,    // reads dir structure directly — always has output
+    emptyGraphIsValid: true,    
     minContentBytes: 400,
     specificInstructions: `Call getWorkspaceDirectoryStructure to get the full tree.
 Load file-index from task context (key from FILE_INDEX_KEY) to get file roles.
@@ -121,36 +105,24 @@ Write a COMPLETE annotated directory tree:
     name: 'File Classification',
     graph: null,
     ctxKeys: ['file-index', 'FILE_INDEX_KEY'],
-    emptyGraphIsValid: true,    // reads file-index — always has output if files scanned
+    emptyGraphIsValid: true,    
     minContentBytes: 400,
     specificInstructions: `Load file-index from task context (key from FILE_INDEX_KEY).
 Write a complete table with ONE ROW per source file:
   | File Path | Role | Layer | Side | Est. Lines | Complexity |
   |:----------|:-----|:------|:-----|:-----------|:-----------|
   
-  Role — use the terminology that matches the detected language:
-    Web frameworks (Node/Express, Django, Laravel, Spring, Rails, Go):
-      Controller / Service / Repository / Model / Middleware / Route /
-      Migration / Schema / Helper / Utility / Auth / Event / Job / Test / DTO / Type
-    COBOL:
-      PARAGRAPH / COPYBOOK / DIVISION / SECTION / PROGRAM / JCL-Job
-    Java/Kotlin non-web:
-      Entity / @Configuration / @Bean / @Component / Scheduler / Aspect
-    Python non-web:
-      Script / Celery-Task / Signal / Serializer / Management-Command
-    Go:
-      Package / Goroutine-Worker / gRPC-Handler
-    C/C++:
-      Header / Implementation / CMake-Target
-    Generic (unknown or mixed):
-      Module / Procedure / Function-File / Interface / Struct-File
-    If uncertain: use the closest web-framework equivalent and add "(inferred)"
+  Role — copy the role field EXACTLY as recorded in the file-index entry.
+    If role is empty or "util": write "util". Do NOT guess or invent a different role.
 
   Layer: HTTP / Business / Data / Infrastructure / Cross-cutting / Unknown
   Side: Backend / Frontend / Shared / Build
-  Complexity: LOW (simple CRUD) / MEDIUM (business logic) / HIGH (complex orchestration)
+  Complexity — use estimatedLines from FILE_INDEX (objective value, no guessing):
+    LOW    = estimatedLines < 100
+    MEDIUM = estimatedLines 100–400
+    HIGH   = estimatedLines > 400
 
-Include ALL files. Do not truncate the table. Use "..." only when role is genuinely unclear.
+Include ALL files. Do not truncate the table.
 After the table: summary statistics (count per role, count per complexity tier).`,
 
   },
@@ -158,7 +130,7 @@ After the table: summary statistics (count per role, count per complexity tier).
     n: 5,
     name: 'Domain Models',
     graph: 'entity',
-    emptyGraphIsValid: false,   // entity graph empty = resolver missed ORM/schema parsing
+    emptyGraphIsValid: false,   
     minContentBytes: 400,
     specificInstructions: `Call read-knowledge-graph("entity").
 For EVERY entity in the graph, write a complete entity specification:
@@ -203,7 +175,7 @@ Write enum values as: status: ACTIVE | INACTIVE | PENDING | DELETED`,
     graph: null,
     ctxKeys: ['dep-raw', 'DEP_RAW_KEY'],
     needsDepsTree: true,
-    emptyGraphIsValid: true,    // no deps is valid for C/C++ or script projects
+    emptyGraphIsValid: true,    
     minContentBytes: 150,
     specificInstructions: `Call getDependencyTree to get full dependency list.
 Also load dep-raw from task context if available.
@@ -232,7 +204,7 @@ Group by Category for readability.`,
     n: 7,
     name: 'Functions Master Catalog',
     graph: 'symbol',
-    emptyGraphIsValid: false,   // symbol graph empty = resolver missed function extraction
+    emptyGraphIsValid: false,   
     minContentBytes: 500,
     specificInstructions: `Call read-knowledge-graph("symbol").
 Write a COMPLETE catalog of ALL callable units in the codebase.
@@ -331,7 +303,7 @@ NOTE: Do NOT write the catalog table — that is Section 7. Start directly with 
     n: 9,
     name: 'Business Rules',
     graph: 'rule',
-    emptyGraphIsValid: true,    // many projects have no explicit rule registry — valid
+    emptyGraphIsValid: true,    
     minContentBytes: 120,
     specificInstructions: `Call read-knowledge-graph("rule").
 Write ALL business rules found across ALL domains EXCEPT the "validation" domain
@@ -353,7 +325,7 @@ Do NOT use generic descriptions — write the ACTUAL business rule found in the 
     n: 10,
     name: 'API Contracts',
     graph: 'api',
-    emptyGraphIsValid: true,    // CLI tools, workers, scripts have no API — valid
+    emptyGraphIsValid: true,    
     minContentBytes: 120,
     specificInstructions: `Call read-knowledge-graph("api").
 
@@ -395,7 +367,7 @@ After all contracts: Summary Table (Type | Identifier | Auth | Handler | File).`
     n: 11,
     name: 'Security & Permissions',
     graph: 'security',
-    emptyGraphIsValid: true,    // script/CLI projects may have no auth layer
+    emptyGraphIsValid: true,    
     minContentBytes: 150,
     specificInstructions: `Call read-knowledge-graph("security").
 Write a complete security documentation:
@@ -427,7 +399,7 @@ Write a complete security documentation:
     n: 12,
     name: 'Middleware Execution Order',
     graph: 'middleware',
-    emptyGraphIsValid: true,    // non-HTTP projects have no middleware
+    emptyGraphIsValid: true,    
     minContentBytes: 120,
     specificInstructions: `Call read-knowledge-graph("middleware").
 Write the complete middleware documentation:
@@ -458,7 +430,7 @@ Write the complete middleware documentation:
     n: 13,
     name: 'Database Operations',
     graph: 'db',
-    emptyGraphIsValid: true,    // projects without DB (pure API clients, CLIs) valid
+    emptyGraphIsValid: true,    
     minContentBytes: 150,
     specificInstructions: `Call read-knowledge-graph("db").
 For EVERY table in db-graph, write all database operations:
@@ -489,7 +461,7 @@ NOTE: Do NOT write transaction boundaries — those are in Section 22.`,
     n: 14,
     name: 'Cross-Module Call Flows',
     graph: 'call-flow',
-    emptyGraphIsValid: true,    // partial call flows are valid — write what the graph contains
+    emptyGraphIsValid: true,    
     minContentBytes: 300,
     specificInstructions: `Call read-knowledge-graph("call-flow").
 Write the complete execution trace for EACH call flow in the graph.
@@ -520,7 +492,7 @@ Write ALL flows from call-flow-graph. If only 5-10 flows exist, explain why thos
     n: 15,
     name: 'Data Transformations',
     graph: 'transform',
-    emptyGraphIsValid: true,    // many projects use direct mapping without DTOs
+    emptyGraphIsValid: true,    
     minContentBytes: 120,
     specificInstructions: `Call read-knowledge-graph("transform").
 For EVERY transformation in the graph, write:
@@ -550,7 +522,7 @@ Include ALL transformations. If graph is empty: write "No explicit transformatio
     n: 16,
     name: 'Configuration & Environment',
     graph: 'config',
-    emptyGraphIsValid: true,    // hardcoded config projects exist
+    emptyGraphIsValid: true,    
     minContentBytes: 150,
     specificInstructions: `Call read-knowledge-graph("config").
 For EVERY configuration key in the graph:
@@ -582,7 +554,7 @@ Include ALL config keys. Do NOT redact or hide any key names (values are empty �
     n: 17,
     name: 'Error Handling Patterns',
     graph: 'error',
-    emptyGraphIsValid: true,    // some projects use bare throw/catch
+    emptyGraphIsValid: true,    
     minContentBytes: 150,
     specificInstructions: `Call read-knowledge-graph("error").
 Write complete error handling documentation:
@@ -613,7 +585,7 @@ Write complete error handling documentation:
     n: 18,
     name: 'Validation Rules',
     graph: 'rule',
-    emptyGraphIsValid: true,    // some projects do inline validation without a rule registry
+    emptyGraphIsValid: true,    
     minContentBytes: 120,
     specificInstructions: `Call read-knowledge-graph("rule").
 Write ONLY the rules from the "validation" domain.
@@ -643,7 +615,7 @@ Include EVERY validation rule found.`,
     n: 19,
     name: 'State Transitions',
     graph: 'state',
-    emptyGraphIsValid: true,    // stateless projects have no FSMs — valid complete answer
+    emptyGraphIsValid: true,    
     minContentBytes: 80,
     specificInstructions: `Call read-knowledge-graph("state").
 For EVERY stateful entity in state-graph, write a finite state machine specification:
@@ -678,7 +650,7 @@ Possible implicit states may exist — check entity status/type fields in Sectio
     n: 20,
     name: 'Async Processing Patterns',
     graph: 'async',
-    emptyGraphIsValid: true,    // sync/threaded projects (PHP, C, Java threads) have no async-graph
+    emptyGraphIsValid: true,    
     minContentBytes: 100,
     specificInstructions: `Call read-knowledge-graph("async").
 
@@ -721,7 +693,7 @@ For EVERY entry write:
     n: 21,
     name: 'Testing & Verification',
     graph: 'test',
-    emptyGraphIsValid: true,    // untested projects are valid (we document gaps)
+    emptyGraphIsValid: true,    
     minContentBytes: 80,
     specificInstructions: `Call read-knowledge-graph("test").
 Write complete test coverage documentation:
@@ -751,7 +723,7 @@ Write complete test coverage documentation:
     n: 22,
     name: 'Transaction Boundaries',
     graph: 'db',
-    emptyGraphIsValid: true,    // no transactions is a valid (and common) answer
+    emptyGraphIsValid: true,    
     minContentBytes: 80,
     specificInstructions: `Call read-knowledge-graph("db").
 Write ONLY the transaction boundary documentation.
@@ -780,7 +752,7 @@ If no explicit transactions found:
     n: 23,
     name: 'Event Flows',
     graph: 'event',
-    emptyGraphIsValid: true,    // most projects have no event bus — valid complete answer
+    emptyGraphIsValid: true,    
     minContentBytes: 80,
     specificInstructions: `Call read-knowledge-graph("event").
 For EVERY event in the event-graph:
@@ -807,7 +779,7 @@ For EVERY event in the event-graph:
     n: 24,
     name: 'External Integrations',
     graph: 'integration',
-    emptyGraphIsValid: true,    // internal/self-contained projects have no integrations
+    emptyGraphIsValid: true,    
     minContentBytes: 80,
     specificInstructions: `Call read-knowledge-graph("integration").
 For EVERY external integration:
@@ -833,7 +805,7 @@ For EVERY external integration:
     n: 25,
     name: 'Scheduled Jobs & Workers',
     graph: 'job',
-    emptyGraphIsValid: true,    // most web APIs have no scheduled jobs — valid
+    emptyGraphIsValid: true,    
     minContentBytes: 80,
     specificInstructions: `Call read-knowledge-graph("job").
 For EVERY scheduled job or background worker:
@@ -860,7 +832,7 @@ For EVERY scheduled job or background worker:
     name: 'Risk Scorecard & Migration Complexity',
     graph: 'imports',
     ctxKeys: ['TOTAL_FILES', 'TOTAL_CALLABLE_UNITS', 'TOTAL_API_ENDPOINTS', 'TOTAL_BUSINESS_RULES', 'TOTAL_DATA_ENTITIES', 'TOTAL_DB_TABLES', 'TOTAL_EVENTS', 'TOTAL_INTEGRATIONS', 'TOTAL_JOBS', 'HIGH_CHURN_FILES', 'DEAD_CODE_CANDIDATES', 'PHASE1_AUDIT_WARNING', 'RUNTIME_VERSIONS', 'PRIMARY_LANGUAGE', 'MONOREPO', 'MULTI_PROJECT', 'MIGRATION_ORDER'],
-    emptyGraphIsValid: true,    // reads context counters — always has data
+    emptyGraphIsValid: true,    
     minContentBytes: 1000,
     specificInstructions: `Load all counters from task context via get_task_context.
 Write a comprehensive risk scorecard for migration planning:
@@ -971,8 +943,6 @@ Write a comprehensive risk scorecard for migration planning:
   },
 ];
 
-// ── System Prompt (same for all 26 sections) ──────────────────────────────────
-
 export const SECTION_SYSTEM_PROMPT = `
 <role>
 You are a technical documentation writer producing a migration reference document.
@@ -1026,7 +996,6 @@ Save the result to the output file path given. Then stop.
       → Write "None detected in this codebase." normally.
 </rules>
 
-
 <output_format>
 MANDATORY HEADER — every section file MUST start with this exact format:
   ## {N}. {Section Name}
@@ -1056,9 +1025,6 @@ Do not write any other section. Do not set ACTIVE_PHASE.
 </stop_condition>
 `;
 
-
-// ── User Prompt Builder ───────────────────────────────────────────────────────
-
 import { buildLanguageHint } from './file-analysis-prompt.js';
 
 export function buildSectionUserPrompt(
@@ -1075,7 +1041,7 @@ export function buildSectionUserPrompt(
     '',
   ];
 
-  // Data loading instructions
+  
   if (section.graph) {
     lines.push(`DATA SOURCE: Call read-knowledge-graph("${section.graph}") to load the data.`);
   }
@@ -1107,43 +1073,39 @@ export function buildSectionUserPrompt(
   return lines.join('\n');
 }
 
-// ── Parallel Section Groups ────────────────────────────────────────────────────
-// Sections are grouped so sections sharing the same graph run sequentially
-// within a group, while groups with different graphs run in parallel.
-
 export function buildParallelSectionGroups(sections: SectionConfig[]): SectionConfig[][] {
-  // Group sections by their graph (sections sharing a graph must be sequential)
+  
   const graphGroups: Map<string, SectionConfig[]> = new Map();
 
   for (const section of sections) {
     const key = section.graph || `_no_graph_${section.n}`;
-    // Sections with no graph each get their own group (they only read task context, safe to parallel)
+    
     const groupKey = section.graph || `_no_graph_${section.n}`;
     if (!graphGroups.has(groupKey)) graphGroups.set(groupKey, []);
     graphGroups.get(groupKey)!.push(section);
   }
 
-  // Each graph group becomes one sequential "slot"
-  // Multiple slots run in parallel (batches of 5 to respect rate limits)
+  
+  
   const slots = Array.from(graphGroups.values());
 
-  // Pack slots into batches of 5 parallel groups
+  
   const PARALLEL_BATCH_SIZE = 5;
   const parallelBatches: SectionConfig[][] = [];
 
-  // Flatten into rounds: round = up to PARALLEL_BATCH_SIZE sections (one per unique graph group)
-  // For groups with multiple sections (e.g., symbol has 7 and 8), those run in sequence
-  // Across groups: parallel
+  
+  
+  
   const maxRounds = Math.max(...slots.map(s => s.length));
 
   for (let round = 0; round < maxRounds; round++) {
-    // Get one section from each group for this round (if that group has a section for this round)
+    
     const roundSections: SectionConfig[] = [];
     for (const slot of slots) {
       if (slot[round]) roundSections.push(slot[round]);
     }
 
-    // Batch into groups of PARALLEL_BATCH_SIZE
+    
     for (let i = 0; i < roundSections.length; i += PARALLEL_BATCH_SIZE) {
       parallelBatches.push(roundSections.slice(i, i + PARALLEL_BATCH_SIZE));
     }
@@ -1152,21 +1114,15 @@ export function buildParallelSectionGroups(sections: SectionConfig[]): SectionCo
   return parallelBatches;
 }
 
-// \u2500\u2500 6 Named Theme Groups (for Phase 4 dispatch logging) \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500
-// Maps 6 thematic groups to their section numbers.
-// Used by planner-agent.ts to log which theme is currently being dispatched.
-// Does NOT change execution order — buildParallelSectionGroups() drives scheduling.
-
 export const SECTION_THEME_GROUPS: Record<string, number[]> = {
-  'Project Identity':         [1, 2, 3, 4, 6],              // who, what, where, stack
-  'Code Architecture':        [7, 8, 9, 14, 15],             // callables, behaviors, rules, flows, transforms
-  'Data Layer':               [5, 13, 19, 22],               // entities, DB ops, states, transactions
-  'API & Security':           [10, 11, 12, 18],              // contracts, security, middleware, validation
-  'Operations & Quality':     [16, 17, 20, 21, 23, 24, 25],  // config, errors, async, tests, events, jobs
-  'Risk & Migration':         [26],                           // risk scorecard
+  'Project Identity':         [1, 2, 3, 4, 6],              
+  'Code Architecture':        [7, 8, 9, 14, 15],             
+  'Data Layer':               [5, 13, 19, 22],               
+  'API & Security':           [10, 11, 12, 18],              
+  'Operations & Quality':     [16, 17, 20, 21, 23, 24, 25],  
+  'Risk & Migration':         [26],                           
 };
 
-// Returns the theme name for a given section number (for logging only).
 export function getSectionThemeName(sectionNumber: number): string {
   for (const [theme, sections] of Object.entries(SECTION_THEME_GROUPS)) {
     if (sections.includes(sectionNumber)) return theme;

@@ -1,7 +1,4 @@
-// =============================================================================
-//  tools/memory/edit-task-context.tool.ts
-//  Persistent memory — update/merge into the session task context JSON.
-// =============================================================================
+
 
 import { ToolRequest } from '../../types/tool.js';
 
@@ -10,7 +7,6 @@ import { makeToolTextResult, makeToolErrorResult } from '../../types/language-mo
 
 import { TaskContextManager } from '../../session/taskContext.js';
 import { EDIT_TASK_CONTEXT_FUNCTION_ID } from '../../common/workspace-functions.js';
-// EDIT_TASK_CONTEXT_FUNCTION_ID = 'edit_task_context' — SNS IDE exact value
 
 export const editTaskContextTool: ToolRequest = {
   id: EDIT_TASK_CONTEXT_FUNCTION_ID,

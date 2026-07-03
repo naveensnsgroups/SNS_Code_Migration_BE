@@ -1,15 +1,6 @@
-// =============================================================================
-//  core/agent-service.ts
-//  Mirrors: snside packages/ai-core/src/common/agent-service.ts
-//
-//  Singleton registry for all AgentDefinition objects.
-//  Agents register themselves at startup via registerAgent().
-//  Orchestrator and tests query getAgent(id) to dispatch.
-// =============================================================================
+
 
 import { AgentDefinition } from '../types/agent.js';
-
-// ── Interface (mirrors SNS IDE AgentService) ──────────────────────────────────
 
 export interface IAgentService {
   registerAgent(agent: AgentDefinition): void;
@@ -21,8 +12,6 @@ export interface IAgentService {
   disableAgent(agentId: string): void;
   isEnabled(agentId: string): boolean;
 }
-
-// ── Implementation ────────────────────────────────────────────────────────────
 
 export class AgentServiceImpl implements IAgentService {
   private agents = new Map<string, AgentDefinition>();
@@ -65,6 +54,4 @@ export class AgentServiceImpl implements IAgentService {
   }
 }
 
-// ── Singleton export ──────────────────────────────────────────────────────────
-// All orchestrator and pipeline code imports THIS instance.
 export const agentService = new AgentServiceImpl();

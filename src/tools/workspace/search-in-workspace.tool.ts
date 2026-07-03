@@ -1,7 +1,4 @@
-// =============================================================================
-//  tools/workspace/search-in-workspace.tool.ts
-//  Mirrors: WorkspaceSearchProvider (snside workspace-functions.ts)
-// =============================================================================
+
 
 import fs from 'fs-extra';
 import path from 'path';
@@ -57,7 +54,7 @@ export const searchInWorkspaceTool: ToolRequest = {
             }
           }
         }
-      } catch { /* skip binary/unreadable files */ }
+      } catch {  }
     }
 
     return makeToolTextResult(JSON.stringify({ results, total: results.length }));

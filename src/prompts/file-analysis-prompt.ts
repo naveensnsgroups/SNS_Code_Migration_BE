@@ -1,6 +1,4 @@
-﻿// =============================================================================
-//  file-analysis-prompt.ts — Stage 1, Phase 2: File Analysis Agent
-// =============================================================================
+
 
 export const FILE_ANALYSIS_SYSTEM_PROMPT = `
 <role>
@@ -68,35 +66,32 @@ Calling them during file analysis wastes turns and triggers 429 rate limits.
 </critical_rule>
 
 <reading_strategy>
-STEP ZERO — before reading ANY file: call extractFileSymbols(path).
-The result gives you: lineCount, readingStrategy field ("SMALL"/"MEDIUM"/"LARGE"/"ULTRA_LARGE"), and symbols[].
-Use the readingStrategy field EXACTLY as follows:
+STEP ZERO — Determine file size tier using estimatedLines from the FILE_INDEX:
+  - If estimatedLines ≤ 200: file is SMALL. Do NOT call extractFileSymbols. Batch-read it directly.
+  - If estimatedLines 201–500: file is MEDIUM. Do NOT call extractFileSymbols. Read the full file directly using getFileContent.
+  - If estimatedLines > 500: file is LARGE or ULTRA_LARGE. Call extractFileSymbols(path) to plan chunked reading.
+Use the estimatedLines tier as follows:
 
 SMALL (≤ 200 lines) — BATCH-READ MANDATORY, FULL FILE, NO EXCEPTIONS:
   → Collect ALL PENDING SMALL files (up to {BATCH_SIZE} at once into one call).
   → Call batch-read-files ONCE with all of them in the files[] array.
-  → NEVER call getFileContent on a SMALL file individually — always batch them.
-     Individual reads waste turns. Batch reads are the ONLY allowed method for SMALL files.
+  → NEVER call getFileContent or extractFileSymbols on a SMALL file individually.
+     Individual reads and symbol extractions waste turns. Batch reads are the ONLY allowed method.
   → batch-read-files returns the COMPLETE file content — every single line, nothing skipped.
-     This is production-quality: 100% of each file is read, 0% omitted.
   → After the batch returns: execute steps d–h for ALL files in the batch before moving on.
   → If a SMALL file imports another SMALL PENDING file: include both in the SAME batch.
   → If only 1 SMALL file remains: still call batch-read-files with that single file.
 
 MEDIUM (201–500 lines) — FULL FILE READ, ZERO LINE SKIPPING:
-  → Call extractFileSymbols (Step Zero) to get lineCount and symbol names.
-  → Then call getFileContent({ file: path }) to read the COMPLETE file — all lines.
+  → Do NOT call extractFileSymbols.
+  → Call getFileContent({ file: path }) to read the COMPLETE file — all lines.
      At ≤500 lines, the full file fits comfortably in context. Read it entirely.
-     DO NOT read by symbol for MEDIUM files — symbol-only reads miss:
-       • Module-level constants and initialization code
-       • Inline business logic between function definitions
-       • Comment blocks containing requirements or rules
-       • Error handling registered outside function bodies
+     DO NOT read by symbol for MEDIUM files — symbol-only reads miss module-level definitions.
   → Extract ALL data from the full file content (step d).
   → This guarantees production-quality analysis: every line is read, nothing is skipped.
 
 LARGE (501–2500 lines):
-  → extractFileSymbols already done (Step Zero) — use the symbols[] list.
+  → Call extractFileSymbols(path) first to get the symbols[] list.
   → Priority order: route handlers → exported functions → service methods → class methods → helpers.
   → Read MAX 10 symbols per turn using getFileContent with offset+limit.
   → After each group of 10 symbols:
@@ -108,7 +103,7 @@ LARGE (501–2500 lines):
   → Never call getFileContent on the full LARGE file — always use offset+limit.
 
 ULTRA_LARGE (2500+ lines) — MANDATORY BATCH PROTOCOL:
-  → extractFileSymbols already done (Step Zero).
+  → Call extractFileSymbols(path) first to get the symbols[] list.
   → Group symbols into batches of 5. Compute:
       BATCH_COUNT:[escaped_path] = ceil(total_symbols / 5)
       CURRENT_BATCH:[escaped_path] = 0
@@ -263,7 +258,6 @@ EXAMPLE — a ROUTE/ROUTER file (any framework: Express, Flask, Spring, Laravel,
   - NEVER call with data:{} — always include at least one route entry with method+path+handler
 </extraction_guard>
 
-
 For each PENDING file, execute steps in this EXACT ORDER — no shortcuts, no reordering:
 
 ── PRE-FLIGHT CHECK — runs before step a for EVERY file ─────────────────────
@@ -293,8 +287,8 @@ DO NOT SKIP — these look like config/build but CONTAIN extractable data:
 WHY: Every skipped doc/asset file saves 1–3 turns. This multiplies across all project files.
 ─────────────────────────────────────────────────────────────────────────────────
 
-a. Determine reading strategy based on estimated size.
-b. Call extractFileSymbols for MEDIUM, LARGE, and ULTRA_LARGE files.
+a. Determine reading strategy based on estimatedLines from FILE_INDEX.
+b. If file is LARGE or ULTRA_LARGE: call extractFileSymbols(path) to get symbol boundaries.
 c. Read the file content using the appropriate strategy.
 
 ── IMMEDIATE CHECKPOINT (do this right after reading, before any tool call) ─────────────────
@@ -480,7 +474,6 @@ The tool call is the action — never describe it in text before calling it.
 ANTI-PATTERN: read file → immediately call append-to-knowledge-graph({ data: {} })  ← WRONG
 CORRECT:      read file → ANALYSIS paragraph → self-verify → call graphs with real data  ← RIGHT
 ─────────────────────────────────────────────────────────────────────────────────────────────
-
 
 g. KNOWLEDGE GRAPH WRITES — for every file that has extractable data.
    Use the <contribution_map> to select which graphs apply to this file's role.
@@ -898,16 +891,6 @@ Never:
 </stop_conditions>
 `;
 
-/**
- * Builds the per-pass user prompt for the file analysis agent.
- *
- * @param legacyPath       Absolute path to the legacy project root.
- * @param lastFileAnalyzed Last file processed in a previous pass (for resume).
- * @param turnCap          Max files to process this session (model-aware, computed by planner).
- * @param batchSize        Batch size for SMALL files (project-size-aware, computed by planner).
- * @param language         Primary language detected by scanner (e.g. "COBOL", "JavaScript", "Go").
- * @param framework        Framework detected by scanner (e.g. "Express.js", "Spring Boot", "None").
- */
 export function buildAnalysisUserPrompt(
   legacyPath:        string,
   lastFileAnalyzed?: string,
@@ -916,8 +899,8 @@ export function buildAnalysisUserPrompt(
   language?:         string,
   framework?:        string
 ): string {
-  // Inject dynamic limits into the system prompt placeholders at call time.
-  // This makes the prompt model-aware and project-size-aware without hardcoding.
+  
+  
   return `${buildLanguageHint(language, framework)}Analyze source files in the legacy project at: "${legacyPath}"
 
 Session limits (auto-computed for your model and project size):
@@ -952,15 +935,6 @@ Replace the {TURN_CAP} placeholder in your system prompt with: ${turnCap}
 Replace the {BATCH_SIZE} placeholder in your system prompt with: ${batchSize}`;
 }
 
-/**
- * Minimal language signal injected at the TOP of every user prompt.
- *
- * Claude Code principle: trust the LLM's training knowledge for syntax.
- * This only signals WHICH language is being analyzed right now — nothing more.
- * The LLM self-adapts all extraction patterns from its own training data.
- *
- * No profiles. No hardcoded patterns. Zero maintenance.
- */
 export function buildLanguageHint(language?: string, framework?: string): string {
   if (!language) return '';
   const fw = (framework && framework !== 'None' && framework !== 'Unknown')

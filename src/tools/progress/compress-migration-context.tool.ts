@@ -1,7 +1,4 @@
-// =============================================================================
-//  tools/progress/compress-migration-context.tool.ts
-//  Mirrors: SemanticContextCompressor (snside migration-context-compressor-tool.ts)
-// =============================================================================
+
 
 import { ToolRequest } from '../../types/tool.js';
 
@@ -10,7 +7,6 @@ import { makeToolTextResult, makeToolErrorResult } from '../../types/language-mo
 
 import { TaskContextManager } from '../../session/taskContext.js';
 import { COMPRESS_MIGRATION_CONTEXT_FUNCTION_ID } from '../../common/workspace-functions.js';
-// COMPRESS_MIGRATION_CONTEXT_FUNCTION_ID = 'compress-migration-context' — SNS IDE exact value
 
 export const compressMigrationContextTool: ToolRequest = {
   id: COMPRESS_MIGRATION_CONTEXT_FUNCTION_ID,

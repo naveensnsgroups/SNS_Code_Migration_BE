@@ -1,7 +1,4 @@
-// =============================================================================
-//  tools/workspace/extract-file-symbols.tool.ts
-//  Mirrors: ExtractFileSymbols (snside migration-large-file-tools.ts)
-// =============================================================================
+
 
 import fs from 'fs-extra';
 import path from 'path';
@@ -11,9 +8,6 @@ import { ToolContext } from '../../types/tool.js';
 import { makeToolTextResult, makeToolErrorResult } from '../../types/language-model.js';
 
 import { EXTRACT_FILE_SYMBOLS_FUNCTION_ID } from '../../common/workspace-functions.js';
-
-// ── Use the exact SNS IDE constant from workspace-functions.ts ────────────────
-// EXTRACT_FILE_SYMBOLS_FUNCTION_ID = 'extractFileSymbols'
 
 export const extractFileSymbolsTool: ToolRequest = {
   id: EXTRACT_FILE_SYMBOLS_FUNCTION_ID,

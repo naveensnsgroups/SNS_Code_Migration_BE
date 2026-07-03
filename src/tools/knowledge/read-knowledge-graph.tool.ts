@@ -1,11 +1,4 @@
-// =============================================================================
-//  tools/knowledge/read-knowledge-graph.tool.ts
-//
-//  Reads a fully-merged knowledge graph at report-writing time (Phase 1_5).
-//  Called by the Graph Resolver Agent and Section Writer Agent.
-//
-//  SNS IDE standard: tool ID mirrors workspace-functions.ts constant exactly.
-// =============================================================================
+
 
 import path from 'path';
 import fs   from 'fs-extra';
@@ -16,7 +9,7 @@ import { READ_KNOWLEDGE_GRAPH_FUNCTION_ID } from '../../common/workspace-functio
 import { getValidGraphNames }              from './knowledge-graph-utils.js';
 
 export const readKnowledgeGraphTool: ToolRequest = {
-  id:           READ_KNOWLEDGE_GRAPH_FUNCTION_ID,     // 'read-knowledge-graph'
+  id:           READ_KNOWLEDGE_GRAPH_FUNCTION_ID,     
   name:         'read-knowledge-graph',
   providerName: 'migration-knowledge',
   description:
@@ -98,10 +91,10 @@ export const readKnowledgeGraphTool: ToolRequest = {
       );
     }
 
-    // Strip internal _sources metadata before returning to the agent.
+    
     const { _sources, ...domainData } = data;
 
-    // ── Optional filtering ───────────────────────────────────────────────────────────────
+    
     let filteredData: Record<string, any> = domainData;
     const f = args.filter;
     if (f) {
@@ -116,7 +109,7 @@ export const readKnowledgeGraphTool: ToolRequest = {
       }
     }
 
-    // ── Optional limit ─────────────────────────────────────────────────────────────────
+    
     let truncated = false;
     const limit = typeof args.limit === 'number' && args.limit > 0 ? args.limit : undefined;
     if (limit && Object.keys(filteredData).length > limit) {
@@ -125,7 +118,7 @@ export const readKnowledgeGraphTool: ToolRequest = {
       truncated = true;
     }
 
-    // ── Quality stats (symbol-graph only) ──────────────────────────────────────────────
+    
     let qualityStats: Record<string, number> | undefined;
     if (args.graphName === 'symbol') {
       const entries = Object.values(domainData) as any[];

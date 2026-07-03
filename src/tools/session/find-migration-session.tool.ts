@@ -1,7 +1,4 @@
-// =============================================================================
-//  tools/session/find-migration-session.tool.ts
-//  Mirrors: MigrationSessionFinder (snside migration-session-finder-tool.ts)
-// =============================================================================
+
 
 import { ToolRequest } from '../../types/tool.js';
 
@@ -10,7 +7,6 @@ import { makeToolTextResult, makeToolErrorResult } from '../../types/language-mo
 
 import { SessionManager } from '../../session/sessionManager.js';
 import { FIND_MIGRATION_SESSION_FUNCTION_ID } from '../../common/workspace-functions.js';
-// FIND_MIGRATION_SESSION_FUNCTION_ID = 'find-migration-session' — SNS IDE exact value
 
 export const findMigrationSessionTool: ToolRequest = {
   id: FIND_MIGRATION_SESSION_FUNCTION_ID,

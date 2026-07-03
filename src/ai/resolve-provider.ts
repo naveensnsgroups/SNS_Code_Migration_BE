@@ -1,27 +1,10 @@
-// =============================================================================
-//  resolve-provider.ts — Shared Provider + API Key Resolution
-//
-//  SNS IDE standard: all agents use this single utility to resolve
-//  a StreamingProvider from a session. No agent should contain its own
-//  API key or provider resolution logic.
-//
-//  Usage:
-//    const provider = await resolveStreamingProvider(sessionId, targetStack);
-// =============================================================================
+
 
 import { SessionManager }   from '../session/sessionManager.js';
 import { AIProviderFactory } from './provider.js';
 import { StreamingProvider } from '../types/language-model.js';
 import { TargetStack }       from '../types.js';
 
-// ── API Key Resolution ────────────────────────────────────────────────────────
-
-/**
- * Resolves the API key for a given provider from three sources, in order:
- *   1. Session-level per-provider keys (apiKeys.{provider})
- *   2. Session-level master key (apiKey)
- *   3. Environment variables (ANTHROPIC_API_KEY, GEMINI_API_KEY, etc.)
- */
 export function resolveApiKey(
   providerName: string,
   sessionApiKey:  string,
@@ -29,7 +12,7 @@ export function resolveApiKey(
 ): string {
   const p = providerName.toLowerCase();
 
-  // 1. Per-provider key from session
+  
   if (sessionApiKeys) {
     const k = sessionApiKeys as any;
     if (p === 'anthropic'   && k.anthropic)   return k.anthropic;
@@ -42,10 +25,10 @@ export function resolveApiKey(
     if (p === 'huggingface' && k.huggingface) return k.huggingface;
   }
 
-  // 2. Session master key
+  
   if (sessionApiKey) return sessionApiKey;
 
-  // 3. Environment variables
+  
   if (p === 'anthropic')   return process.env.ANTHROPIC_API_KEY  || '';
   if (p === 'openai')      return process.env.OPENAI_API_KEY     || '';
   if (p === 'google')      return process.env.GEMINI_API_KEY     || process.env.GOOGLE_API_KEY || '';
@@ -58,12 +41,6 @@ export function resolveApiKey(
   return '';
 }
 
-// ── Model Alias Resolution ────────────────────────────────────────────────────
-
-/**
- * Resolves a model alias (e.g. "alias:reasoning-model") to a concrete model identifier.
- * If the alias is not in aliasesConfig, returns the raw model name unchanged.
- */
 export function resolveModelAlias(
   modelName:    string,
   aliasesConfig: Record<string, string>
@@ -76,21 +53,6 @@ export function resolveModelAlias(
   return aliasesConfig[modelName] ?? modelName;
 }
 
-// ── Full Provider Resolution ──────────────────────────────────────────────────
-
-/**
- * Resolves a StreamingProvider from a session ID and target stack.
- * This is the single entry point all agents should use.
- *
- * Handles:
- *   - API key lookup (per-provider > master key > env vars)
- *   - Model alias resolution (aliasesConfig)
- *   - Google retry configuration (googleMaxRetries, googleRetryDelayRateLimit, etc.)
- *
- * @param sessionId   Active session
- * @param targetStack Provider + model from user configuration
- * @returns           { provider, resolvedModel } — both needed by AgentExecutor
- */
 export async function resolveStreamingProvider(
   sessionId:   string,
   targetStack: TargetStack
@@ -116,11 +78,11 @@ export async function resolveStreamingProvider(
     resolvedModel,
     apiKey,
     {
-      // Google retry config — only applied when provider === 'google'
+      
       maxRetries:          isGoogle  ? (s?.googleMaxRetries          ?? undefined) : isMistral ? (s?.mistralMaxRetries ?? undefined) : undefined,
       retryDelayRateLimit: isGoogle  ? (s?.googleRetryDelayRateLimit ?? undefined) : isMistral ? (s?.mistralRetryDelayRateLimit ?? undefined) : undefined,
       retryDelayOther:     isGoogle  ? (s?.googleRetryDelayOther     ?? undefined) : isMistral ? (s?.mistralRetryDelayOther ?? undefined) : undefined,
-      // Claude retry config
+      
       retryDelayOnRateLimitError: isClaude ? (s?.claudeRetryDelayOnRateLimitError ?? undefined) : undefined,
       retryDelayOnOtherErrors:    isClaude ? (s?.claudeRetryDelayOnOtherErrors    ?? undefined) : undefined,
     }

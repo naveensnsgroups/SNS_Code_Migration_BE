@@ -1,7 +1,7 @@
 import fs from 'fs-extra';
 import path from 'path';
 import { fileURLToPath } from 'url';
-import { randomUUID } from 'crypto';                    // Fix 9: ESM import (require is not available in ESM)
+import { randomUUID } from 'crypto';                    
 import { MigrationSession, LogEntry, TokenUsageEntry } from './types.js';
 import { FileNode } from '../types.js';
 import { writeJsonAtomic, readJsonWithRetry } from './fileUtils.js';
@@ -9,15 +9,14 @@ import { writeJsonAtomic, readJsonWithRetry } from './fileUtils.js';
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
-// Store sessions inside the backend root folder under "sessions/"
 const SESSIONS_DIR = path.join(__dirname, '..', '..', 'sessions');
 
 export class SessionManager {
-  // ── Per-session write serialization queue ───────────────────────────────────
-  // Prevents concurrent read-modify-write races on logs.json / session.json.
-  // On Windows, concurrent fs.rename() calls to the same target file throw EPERM.
-  // All writes for the same sessionId are chained through this queue so only
-  // ONE write is in-flight per session at a time.
+  
+  
+  
+  
+  
   private static readonly writeQueues = new Map<string, Promise<void>>();
 
   private static enqueueWrite<T>(
@@ -26,21 +25,17 @@ export class SessionManager {
   ): Promise<T> {
     const tail   = this.writeQueues.get(sessionId) ?? Promise.resolve();
     const result = tail.then(() => fn());
-    // Store only the settled tail so the chain doesn't grow unboundedly
+    
     this.writeQueues.set(sessionId, result.then(() => {}, () => {}));
     return result;
   }
 
-  /**
-   * Generates a unique session ID (cryptographically random — Fix 9)
-   */
+  
   static generateSessionId(): string {
     return randomUUID().replace(/-/g, '').substring(0, 12);
   }
 
-  /**
-   * Initializes paths and directory structure for a new session
-   */
+  
   static async createSession(sessionId: string): Promise<MigrationSession> {
     const sessionDir = path.join(SESSIONS_DIR, sessionId);
     const legacyPath = path.join(sessionDir, 'legacy');
@@ -69,21 +64,17 @@ export class SessionManager {
     };
 
     await this.saveSession(session);
-    await this.saveLogs(sessionId, []); // Initialize empty logs file
+    await this.saveLogs(sessionId, []); 
     return session;
   }
 
-  /**
-   * Saves the session state to session.json
-   */
+  
   static async saveSession(session: MigrationSession): Promise<void> {
     const sessionPath = path.join(SESSIONS_DIR, session.sessionId, 'session.json');
     await writeJsonAtomic(sessionPath, session);
   }
 
-  /**
-   * Gets the session by ID
-   */
+  
   static async getSession(sessionId: string): Promise<MigrationSession | null> {
     const sessionPath = path.join(SESSIONS_DIR, sessionId, 'session.json');
     if (!(await fs.pathExists(sessionPath))) {
@@ -96,9 +87,7 @@ export class SessionManager {
     }
   }
 
-  /**
-   * Updates session data
-   */
+  
   static async updateSession(sessionId: string, updates: Partial<MigrationSession>): Promise<MigrationSession> {
     return this.enqueueWrite(sessionId, async () => {
       const session = await this.getSession(sessionId);
@@ -111,9 +100,7 @@ export class SessionManager {
     });
   }
 
-  /**
-   * Adds a log entry to the session
-   */
+  
   static async addLog(
     sessionId: string,
     message: string,
@@ -135,9 +122,7 @@ export class SessionManager {
     });
   }
 
-  /**
-   * Retrieves all logs for a session
-   */
+  
   static async getLogs(sessionId: string): Promise<LogEntry[]> {
     const logsPath = path.join(SESSIONS_DIR, sessionId, 'logs.json');
     if (!(await fs.pathExists(logsPath))) {
@@ -150,18 +135,13 @@ export class SessionManager {
     }
   }
 
-  /**
-   * Saves logs array to logs.json
-   */
+  
   private static async saveLogs(sessionId: string, logs: LogEntry[]): Promise<void> {
     const logsPath = path.join(SESSIONS_DIR, sessionId, 'logs.json');
     await writeJsonAtomic(logsPath, logs);
   }
 
-  /**
-   * Lists all sessions in the sessions directory.
-   * Returns an array of MigrationSession objects for all sessions found.
-   */
+  
   static async listSessions(): Promise<MigrationSession[]> {
     try {
       if (!(await fs.pathExists(SESSIONS_DIR))) return [];
@@ -173,7 +153,7 @@ export class SessionManager {
           try {
             const session = await readJsonWithRetry<MigrationSession>(sessionPath);
             sessions.push(session);
-          } catch { /* skip corrupted sessions */ }
+          } catch {  }
         }
       }
       return sessions;
@@ -182,9 +162,7 @@ export class SessionManager {
     }
   }
 
-  /**
-   * Records and aggregates token usage for the session, writes to session.json, and broadcasts the new total.
-   */
+  
   static async recordTokenUsage(
     sessionId: string,
     inputTokens: number,

@@ -7,14 +7,11 @@ import fs from 'fs-extra';
 import path from 'path';
 import { fileURLToPath } from 'url';
 
-// ── Path safety helper ────────────────────────────────────────────────────────
-// Returns true if `candidate` is the same as, a child of, or a parent of `reference`.
-// Used to prevent the migration output path from overlapping with the source path.
 function pathsOverlap(candidate: string, reference: string): boolean {
   const a = path.resolve(candidate).replace(/[\\/]+$/, '').toLowerCase();
   const b = path.resolve(reference).replace(/[\\/]+$/, '').toLowerCase();
   const sep = path.sep.toLowerCase();
-  // Same, child-of, or parent-of
+  
   return a === b || a.startsWith(b + sep) || b.startsWith(a + sep);
 }
 
@@ -23,10 +20,6 @@ const router = Router();
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
-/**
- * POST /api/migrate/start
- * Starts or resumes the background modernization pipeline.
- */
 router.post('/start', async (req: Request, res: Response, next: NextFunction) => {
   try {
     const {
@@ -45,10 +38,10 @@ router.post('/start', async (req: Request, res: Response, next: NextFunction) =>
       return;
     }
 
-    // ── Override modernPath if localOutputPath is specified ───────────────────
-    // SAFETY GUARD: reject if the output path overlaps with the source project path.
-    // If modernPath === projectPath (or is a parent/child of it), the Discovery Agent
-    // would scan the output folder instead of the source — causing TOTAL_FILES=0.
+    
+    
+    
+    
     if (localOutputPath && localOutputPath.trim() !== '') {
       const targetModernPath = path.resolve(localOutputPath);
       const sourcePath       = path.resolve(session.projectPath);
@@ -73,8 +66,8 @@ router.post('/start', async (req: Request, res: Response, next: NextFunction) =>
       );
     }
 
-    // Save AI config settings to session (used by orchestrator + agents)
-    // Save AI config settings to session (used by orchestrator + agents)
+    
+    
     const {
       googleMaxRetries, googleRetryDelayRateLimit, googleRetryDelayOther
     } = req.body as any;
@@ -94,20 +87,20 @@ router.post('/start', async (req: Request, res: Response, next: NextFunction) =>
       });
     }
 
-    // Resolve final modernPath (may have been updated above by localOutputPath override)
+    
     const updatedSession = await SessionManager.getSession(sessionId);
     const resolvedModernPath = updatedSession?.modernPath ?? session.modernPath;
 
-    // Ensure output directory exists before watching
-    // (agent may not have created it yet — watcher will catch new files once they appear)
+    
+    
     await fs.ensureDir(resolvedModernPath);
 
-    // ── Start disk watcher (SNS IDE: ParcelFileSystemWatcherService.watch()) ──
-    // Non-blocking: watcher runs in background, emits SSE 'file_tree_changed' on any
-    // file CREATED/UPDATED/DELETED inside modernPath.
+    
+    
+    
     FileWatcherService.startWatching(sessionId, resolvedModernPath);
 
-    // Launch background worker without blocking the HTTP response
+    
     MigrationOrchestrator.startMigration(sessionId, targetStack, apiKey, apiKeys, agentsConfig);
 
     res.json({ success: true, message: 'Migration pipeline started.' });
@@ -116,11 +109,6 @@ router.post('/start', async (req: Request, res: Response, next: NextFunction) =>
   }
 });
 
-
-/**
- * POST /api/migrate/stop
- * Terminates the current active migration.
- */
 router.post('/stop', async (req: Request, res: Response, next: NextFunction) => {
   try {
     const { sessionId } = req.body;
@@ -132,7 +120,7 @@ router.post('/stop', async (req: Request, res: Response, next: NextFunction) => 
 
     MigrationOrchestrator.stopSession(sessionId);
 
-    // ── Stop disk watcher (SNS IDE: Disposable.dispose()) ──────────────────
+    
     FileWatcherService.stopWatching(sessionId);
 
     res.json({ success: true, message: 'Migration stopping requested.' });
@@ -141,10 +129,6 @@ router.post('/stop', async (req: Request, res: Response, next: NextFunction) => 
   }
 });
 
-/**
- * POST /api/migrate/pause
- * Pauses the current active migration.
- */
 router.post('/pause', async (req: Request, res: Response, next: NextFunction) => {
   try {
     const { sessionId } = req.body;
@@ -161,10 +145,6 @@ router.post('/pause', async (req: Request, res: Response, next: NextFunction) =>
   }
 });
 
-/**
- * GET /api/migrate/tree
- * Returns modernized project file tree
- */
 router.get('/tree', async (req: Request, res: Response, next: NextFunction) => {
   try {
     const { sessionId } = req.query;
@@ -193,15 +173,6 @@ router.get('/tree', async (req: Request, res: Response, next: NextFunction) => {
   }
 });
 
-/**
- * GET /api/migrate/tokens
- * Returns the persisted token usage from session.json for the given session.
- * Mirrors SNS IDE TokenUsageFrontendService.getTokenUsageData() aggregation pattern.
- *
- * Response includes:
- *   tokenUsage   — cumulative session totals (inputTokens, outputTokens, totalTokens, estimatedCost, model)
- *   modelBreakdown — per-model aggregation of tokenUsageHistory (SNS IDE pattern)
- */
 router.get('/tokens', async (req: Request, res: Response, next: NextFunction) => {
   try {
     const { sessionId } = req.query;
@@ -216,7 +187,7 @@ router.get('/tokens', async (req: Request, res: Response, next: NextFunction) =>
       return;
     }
 
-    // Aggregate history by model (SNS IDE TokenUsageFrontendService.aggregateTokenUsages pattern)
+    
     const history = session.tokenUsageHistory ?? [];
     const modelMap = new Map<string, {
       inputTokens: number;

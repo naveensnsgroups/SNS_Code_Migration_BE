@@ -1,14 +1,10 @@
-// =============================================================================
-//  tools/session/get-skill-file-content.tool.ts
-//  Mirrors: GetSkillFileContent (snside skill-file-functions.ts)
-// =============================================================================
+
 
 import fs from 'fs-extra';
 import path from 'path';
 import { ToolRequest } from '../../types/tool.js';
 import { makeToolTextResult, makeToolErrorResult } from '../../types/language-model.js';
 import { GET_SKILL_FILE_CONTENT_FUNCTION_ID } from '../../common/workspace-functions.js';
-// GET_SKILL_FILE_CONTENT_FUNCTION_ID = 'getSkillFileContent' — SNS IDE exact value
 
 export const getSkillFileContentTool: ToolRequest = {
   id: GET_SKILL_FILE_CONTENT_FUNCTION_ID,

@@ -1,7 +1,4 @@
-// =============================================================================
-//  tools/output/write-migration-files.tool.ts
-//  Mirrors: MultiFileWriter (snside migration-multi-writer-tool.ts)
-// =============================================================================
+
 
 import { ToolRequest } from '../../types/tool.js';
 
@@ -11,7 +8,6 @@ import { makeToolTextResult, makeToolErrorResult } from '../../types/language-mo
 import { writeSessionFile } from '../fileWriter.js';
 import { EventBroadcaster } from '../../routes/stream.js';
 import { WRITE_MIGRATION_FILES_FUNCTION_ID } from '../../common/workspace-functions.js';
-// WRITE_MIGRATION_FILES_FUNCTION_ID = 'write-migration-files' — SNS IDE exact value
 
 export const writeMigrationFilesTool: ToolRequest = {
   id: WRITE_MIGRATION_FILES_FUNCTION_ID,

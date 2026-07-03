@@ -1,7 +1,4 @@
-// =============================================================================
-//  tools/workspace/scan-asset-files.tool.ts
-//  Mirrors: ScanAssetFiles (snside migration-asset-tools.ts)
-// =============================================================================
+
 
 import glob from 'fast-glob';
 import { ToolRequest } from '../../types/tool.js';
@@ -10,9 +7,6 @@ import { ToolContext } from '../../types/tool.js';
 import { makeToolTextResult, makeToolErrorResult } from '../../types/language-model.js';
 
 import { SCAN_ASSET_FILES_FUNCTION_ID } from '../../common/workspace-functions.js';
-
-// ── Use the exact SNS IDE constant from workspace-functions.ts ────────────────
-// SCAN_ASSET_FILES_FUNCTION_ID = 'scanAssetFiles'
 
 export const scanAssetFilesTool: ToolRequest = {
   id: SCAN_ASSET_FILES_FUNCTION_ID,

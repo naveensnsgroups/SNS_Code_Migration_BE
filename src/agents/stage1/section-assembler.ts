@@ -1,16 +1,8 @@
-// =============================================================================
-//  section-assembler.ts — Stage 5: Section File Assembler (No LLM)
-//
-//  Reads all 26 section files from _analysis/sections/
-//  and assembles them into a single Stage1_Analysis.md file.
-//
-//  No LLM is used. Pure TypeScript file I/O.
-// =============================================================================
+
 
 import fs from 'fs-extra';
 import path from 'path';
 
-/** The 26 section file names (padded to 2 digits). */
 const SECTION_NUMBERS = Array.from({ length: 26 }, (_, i) => i + 1);
 
 const SECTION_NAMES: Record<number, string> = {
@@ -42,15 +34,6 @@ const SECTION_NAMES: Record<number, string> = {
   26: 'Risk Scorecard & Migration Complexity',
 };
 
-/**
- * Assembles all 26 section files into a single Stage1_Analysis.md.
- * This is the final Stage 5 step — no LLM involved.
- *
- * @param modernPath   Absolute path to the output directory (where Stage1_Analysis.md is written)
- * @param sessionId    Session ID (for logging only)
- * @param onLog        Optional log callback for progress reporting
- * @returns            List of any missing sections (section numbers that had no file)
- */
 export async function assembleSections(
   modernPath: string,
   sessionId: string,
@@ -59,10 +42,10 @@ export async function assembleSections(
   const sectionsDir = path.join(modernPath, '_analysis', 'sections');
   const outputFile  = path.join(modernPath, 'Stage1_Analysis.md');
 
-  // Ensure sections directory exists
+  
   await fs.ensureDir(sectionsDir);
 
-  // Document header
+  
   const header = [
     '# Stage 1 — Legacy Codebase Analysis',
     '',
@@ -90,7 +73,7 @@ export async function assembleSections(
       sectionContents.push(content.trim());
       onLog?.(`  Section ${n}: ${SECTION_NAMES[n]}`, 'success');
     } else {
-      // Section is missing — write a placeholder so the document is still complete
+      
       const placeholder = [
         `## ${n}. ${SECTION_NAMES[n]}`,
         '',
@@ -104,9 +87,9 @@ export async function assembleSections(
     }
   }
 
-  // ── Completeness Status Table (TypeScript only — no LLM) ───────────────────
-  // Shows ✅/❌ per section at the top of Stage1_Analysis.md.
-  // Lets the user see at a glance which sections need re-running.
+  
+  
+  
   const completenessCount = 26 - missingSections.length;
   const statusRows = SECTION_NUMBERS.map(n => {
     const done = !missingSections.includes(n);
@@ -129,7 +112,7 @@ export async function assembleSections(
     '',
   ].join('\n');
 
-  // Write the complete document: header + completeness table + all sections
+  
   const fullDocument = header + statusBlock + sectionContents.join('\n\n---\n\n') + '\n';
   await fs.writeFile(outputFile, fullDocument, 'utf-8');
 
@@ -154,13 +137,6 @@ export async function assembleSections(
   };
 }
 
-/**
- * Checks which sections are already written to disk.
- * Used by the orchestrator to skip already-written sections on resume.
- *
- * @param modernPath  Absolute path to the output directory
- * @returns           Set of section numbers that exist on disk
- */
 export async function getWrittenSections(modernPath: string): Promise<Set<number>> {
   const sectionsDir = path.join(modernPath, '_analysis', 'sections');
   const written     = new Set<number>();

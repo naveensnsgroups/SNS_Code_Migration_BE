@@ -1,7 +1,4 @@
-// =============================================================================
-//  tools/memory/get-task-context.tool.ts
-//  Persistent memory — read the session task context JSON.
-// =============================================================================
+
 
 import { ToolRequest } from '../../types/tool.js';
 
@@ -10,7 +7,6 @@ import { makeToolTextResult, makeToolErrorResult } from '../../types/language-mo
 
 import { TaskContextManager } from '../../session/taskContext.js';
 import { GET_TASK_CONTEXT_FUNCTION_ID } from '../../common/workspace-functions.js';
-// GET_TASK_CONTEXT_FUNCTION_ID = 'get_task_context' — SNS IDE exact value
 
 export const getTaskContextTool: ToolRequest = {
   id: GET_TASK_CONTEXT_FUNCTION_ID,

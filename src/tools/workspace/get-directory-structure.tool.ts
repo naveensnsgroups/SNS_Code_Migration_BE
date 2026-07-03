@@ -1,8 +1,4 @@
-// =============================================================================
-//  tools/workspace/get-directory-structure.tool.ts
-//  Mirrors: GetWorkspaceDirectoryStructure (snside workspace-functions.ts)
-//  ToolRequest — handler receives (arg_string: string) — SNS IDE standard
-// =============================================================================
+
 
 import fs from 'fs-extra';
 import path from 'path';

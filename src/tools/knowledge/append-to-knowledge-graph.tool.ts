@@ -1,11 +1,4 @@
-// =============================================================================
-//  tools/knowledge/append-to-knowledge-graph.tool.ts
-//
-//  Incrementally merges analysis data into a named knowledge graph file.
-//  Called by the File Analysis Agent after EVERY file read during Phase 1.
-//
-//  SNS IDE standard: tool ID mirrors workspace-functions.ts constant exactly.
-// =============================================================================
+
 
 import path from 'path';
 import fs   from 'fs-extra';
@@ -17,7 +10,7 @@ import { mergeGraphData, getValidGraphNames }    from './knowledge-graph-utils.j
 import { writeJsonAtomic, readJsonWithRetry }    from '../../session/fileUtils.js';
 
 export const appendToKnowledgeGraphTool: ToolRequest = {
-  id:           APPEND_TO_KNOWLEDGE_GRAPH_FUNCTION_ID,     // 'append-to-knowledge-graph'
+  id:           APPEND_TO_KNOWLEDGE_GRAPH_FUNCTION_ID,     
   name:         'append-to-knowledge-graph',
   providerName: 'migration-knowledge',
   description:
@@ -94,9 +87,9 @@ export const appendToKnowledgeGraphTool: ToolRequest = {
       );
     }
 
-    // ── Require sourceFile (enables deduplication guard) ──────────────────────
-    // Without sourceFile the _sources dedup cannot fire, leading to the LLM
-    // calling append-to-knowledge-graph in an infinite loop. Hard-reject here.
+    
+    
+    
     if (!args.sourceFile || args.sourceFile.trim() === '') {
       return makeToolErrorResult(
         `MISSING sourceFile for graph "${args.graphName}". ` +
@@ -106,11 +99,11 @@ export const appendToKnowledgeGraphTool: ToolRequest = {
       );
     }
 
-    // ── Reject empty data ──────────────────────────────────────────────────────
-    // The LLM sometimes calls this tool with data:{} to "check off" the step
-    // without doing the actual extraction work. This causes all graphs to stay
-    // at 0 entries and produces empty sections in the Stage 1 report.
-    // Hard-reject here so the LLM MUST retry with real extracted content.
+    
+    
+    
+    
+    
     const topLevelKeys = Object.keys(args.data ?? {});
     if (topLevelKeys.length === 0) {
       return makeToolErrorResult(
@@ -125,10 +118,10 @@ export const appendToKnowledgeGraphTool: ToolRequest = {
       );
     }
 
-    // ── Null guard: modernPath must be set in ToolContext ─────────────────────
-    // Without modernPath the graph file path cannot be computed.
-    // agentExecutor.ts catch block would convert a TypeError into a tool error,
-    // but the message "Path must be a string" gives the LLM no actionable guidance.
+    
+    
+    
+    
     if (!ctx?.modernPath) {
       return makeToolErrorResult(
         'append-to-knowledge-graph: modernPath not set in tool context. ' +
@@ -141,20 +134,20 @@ export const appendToKnowledgeGraphTool: ToolRequest = {
     await fs.ensureDir(analysisDir);
     const graphPath = path.join(analysisDir, `${args.graphName}-graph.json`);
 
-    // Load existing graph (or start with empty object)
+    
     let existing: Record<string, any> = {};
     try {
       if (await fs.pathExists(graphPath)) {
         existing = await readJsonWithRetry<Record<string, any>>(graphPath);
       }
     } catch {
-      existing = {}; // If file is corrupt, start fresh
+      existing = {}; 
     }
 
-    // ── _sources Deduplication (GraphRAG idempotent pattern) ─────────────────
-    // Track which source files have already contributed to this graph.
-    // If this file already contributed: return early — no duplicate merge.
-    // This prevents resume passes from writing the same symbols/entities twice.
+    
+    
+    
+    
     const sources: string[] = Array.isArray(existing._sources) ? existing._sources : [];
 
     if (args.sourceFile && sources.includes(args.sourceFile)) {
@@ -169,18 +162,18 @@ export const appendToKnowledgeGraphTool: ToolRequest = {
       return makeToolErrorResult(skipMsg);
     }
 
-    // Merge incoming data using the correct strategy for this graph type
+    
     const merged = mergeGraphData(args.graphName, existing, args.data);
 
-    // Record source contribution so future resume passes can skip it
+    
     if (args.sourceFile) {
       merged._sources = [...sources, args.sourceFile];
     }
 
-    // Write merged result back
+    
     await writeJsonAtomic(graphPath, merged);
 
-    // Exclude _sources metadata key from entry count (it is internal tracking, not domain data)
+    
     const entryCount = Object.keys(merged).filter(k => k !== '_sources').length;
     const message = `Graph "${args.graphName}" updated: ${entryCount} top-level entries.`
       + (args.sourceFile ? ` (source: ${args.sourceFile})` : '');

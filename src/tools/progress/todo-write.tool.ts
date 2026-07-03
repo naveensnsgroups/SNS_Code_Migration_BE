@@ -1,7 +1,4 @@
-// =============================================================================
-//  tools/progress/todo-write.tool.ts
-//  Mirrors: TodoWriteTool (snside todo-tool.ts)
-// =============================================================================
+
 
 import { ToolRequest } from '../../types/tool.js';
 
@@ -11,7 +8,6 @@ import { makeToolTextResult, makeToolErrorResult } from '../../types/language-mo
 import { TaskContextManager } from '../../session/taskContext.js';
 import { EventBroadcaster } from '../../routes/stream.js';
 import { TODO_WRITE_FUNCTION_ID } from '../../common/workspace-functions.js';
-// TODO_WRITE_FUNCTION_ID = 'todoWrite' — SNS IDE exact value
 
 export const todoWriteTool: ToolRequest = {
   id: TODO_WRITE_FUNCTION_ID,

@@ -1,50 +1,28 @@
-// =============================================================================
-//  domain-router.ts — Stage 1, Phase 2: TypeScript File Domain Router
-//
-//  Routes every FILE_INDEX entry to exactly ONE domain agent bucket.
-//  Zero LLM calls. Zero framework assumptions.
-//  Routing is based ONLY on data the Discovery agent already recorded:
-//    - file.role  (e.g. "controller", "entity", "service", "config")
-//    - file.type  (source | config | schema | test | asset | build | doc)
-//    - file.path  (directory structure signals)
-//
-//  Priority order (highest wins, a file goes to exactly one bucket):
-//    1. UI      — components, pages, views, hooks, stores (.vue/.svelte/.jsx/.tsx)
-//    2. BACKEND — controllers, routes, middleware, guards, filters
-//    3. DATA    — entities, models, schemas, DTOs, migrations, repositories
-//    4. INFRA   — config, test, jobs, workers, integrations, SDK clients
-//    5. LOGIC   — everything else (service files, utilities, helpers)
-// =============================================================================
+
 
 export type DomainBucket = 'DATA' | 'BACKEND' | 'LOGIC' | 'INFRA' | 'UI';
 
 export interface FileEntry {
   path:           string;
-  type:           string;  // source | config | schema | test | asset | build | doc
-  role:           string;  // set by Discovery agent
+  type:           string;  
+  role:           string;  
   estimatedLines: number;
-  read_status:    string;  // PENDING | DONE | PARTIAL | PROBLEMATIC
+  read_status:    string;  
 }
 
 export type DomainBuckets = Record<DomainBucket, FileEntry[]>;
 
-// =============================================================================
-//  routeFilesToDomains
-//  Main entry point. Routes all PENDING source/schema files into domain buckets.
-//  Files already DONE, PARTIAL, or PROBLEMATIC are excluded (no re-processing).
-//  Non-source files (doc, asset, build) are excluded — planner auto-marks them DONE.
-// =============================================================================
 export function routeFilesToDomains(fileIndex: FileEntry[]): DomainBuckets {
   const buckets: DomainBuckets = {
     DATA: [], BACKEND: [], LOGIC: [], INFRA: [], UI: [],
   };
 
   for (const file of fileIndex) {
-    // Skip already processed
+    
     if (file.read_status === 'DONE' || file.read_status === 'PARTIAL' || file.read_status === 'PROBLEMATIC') {
       continue;
     }
-    // Only route source and schema files — everything else has no code to analyze
+    
     if (file.type !== 'source' && file.type !== 'schema') {
       continue;
     }
@@ -56,18 +34,13 @@ export function routeFilesToDomains(fileIndex: FileEntry[]): DomainBuckets {
   return buckets;
 }
 
-// =============================================================================
-//  classifyFile
-//  Deterministic routing — same file always goes to same bucket.
-//  Reads role (from Discovery) and path only. No hardcoded framework names.
-// =============================================================================
 function classifyFile(file: FileEntry): DomainBucket {
   const p = file.path.toLowerCase();
   const r = (file.role ?? '').toLowerCase();
   const ext = p.split('.').pop() ?? '';
 
-  // ── Priority 1: UI ─────────────────────────────────────────────────────────
-  // UI files are unambiguous from extension or path segment
+  
+  
   if (
     ext === 'vue' || ext === 'svelte' ||
     (ext === 'jsx' || ext === 'tsx') ||
@@ -83,8 +56,8 @@ function classifyFile(file: FileEntry): DomainBucket {
     return 'UI';
   }
 
-  // ── Priority 2: BACKEND ────────────────────────────────────────────────────
-  // Routes, controllers, middleware — entry points that handle external calls
+  
+  
   if (
     r.includes('controller') || r.includes('route') || r.includes('router') ||
     r.includes('middleware') || r.includes('guard') || r.includes('filter') ||
@@ -98,8 +71,8 @@ function classifyFile(file: FileEntry): DomainBucket {
     return 'BACKEND';
   }
 
-  // ── Priority 3: DATA ───────────────────────────────────────────────────────
-  // Entities, models, schemas, DTOs — data contract definitions
+  
+  
   if (
     file.type === 'schema' ||
     ext === 'prisma' ||
@@ -117,8 +90,8 @@ function classifyFile(file: FileEntry): DomainBucket {
     return 'DATA';
   }
 
-  // ── Priority 4: INFRA ──────────────────────────────────────────────────────
-  // Config, tests, jobs, workers, external integrations
+  
+  
   if (
     file.type === 'config' || file.type === 'test' ||
     r.includes('job') || r.includes('worker') || r.includes('cron') ||
@@ -139,17 +112,11 @@ function classifyFile(file: FileEntry): DomainBucket {
     return 'INFRA';
   }
 
-  // ── Priority 5: LOGIC (default) ────────────────────────────────────────────
-  // Services, utilities, helpers, business logic — the largest bucket
+  
+  
   return 'LOGIC';
 }
 
-// =============================================================================
-//  deduplicateFileIndex
-//  Removes duplicate entries from FILE_INDEX (same path appearing twice).
-//  Caused by Discovery running twice after an interrupted session.
-//  Preserves the DONE status if either duplicate is already DONE.
-// =============================================================================
 export function deduplicateFileIndex(fileIndex: FileEntry[]): { deduped: FileEntry[]; removedCount: number } {
   const seen = new Map<string, FileEntry>();
   let removedCount = 0;
@@ -160,7 +127,7 @@ export function deduplicateFileIndex(fileIndex: FileEntry[]): { deduped: FileEnt
       seen.set(entry.path, { ...entry });
     } else {
       removedCount++;
-      // Preserve the most advanced status (DONE > PARTIAL > PROBLEMATIC > PENDING)
+      
       const statusPriority = { DONE: 3, PARTIAL: 2, PROBLEMATIC: 1, PENDING: 0 };
       const existingPriority = statusPriority[existing.read_status as keyof typeof statusPriority] ?? 0;
       const newPriority      = statusPriority[entry.read_status  as keyof typeof statusPriority] ?? 0;
@@ -173,11 +140,6 @@ export function deduplicateFileIndex(fileIndex: FileEntry[]): { deduped: FileEnt
   return { deduped: [...seen.values()], removedCount };
 }
 
-// =============================================================================
-//  getBucketSummary
-//  Returns a readable summary of how many files are in each bucket.
-//  Used by planner-agent.ts for logging before dispatching domain agents.
-// =============================================================================
 export function getBucketSummary(buckets: DomainBuckets): string {
   return Object.entries(buckets)
     .filter(([, files]) => files.length > 0)

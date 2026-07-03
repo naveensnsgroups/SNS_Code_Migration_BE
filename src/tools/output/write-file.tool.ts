@@ -1,7 +1,4 @@
-// =============================================================================
-//  tools/output/write-file.tool.ts
-//  Writes output files (Stage1_Analysis.md etc.) to modernPath.
-// =============================================================================
+
 
 import { ToolRequest } from '../../types/tool.js';
 
@@ -10,7 +7,6 @@ import { makeToolTextResult, makeToolErrorResult } from '../../types/language-mo
 
 import { writeSessionFile } from '../fileWriter.js';
 import { WRITE_FILE_FUNCTION_ID } from '../../common/workspace-functions.js';
-// WRITE_FILE_FUNCTION_ID = 'write_file' — SNS IDE exact value
 
 export const writeFileTool: ToolRequest = {
   id: WRITE_FILE_FUNCTION_ID,

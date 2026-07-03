@@ -19,23 +19,12 @@ import {
 } from '../common/workspace-functions.js';
 import { mergeGraphData, getValidGraphNames } from './knowledge/knowledge-graph-utils.js';
 
-// ── Tool Context ─────────────────────────────────────────────────────────────
-// Mirrors snside WorkspaceFunctionScope — provides sessionId, legacyPath,
-// modernPath, and optional streaming log callback.
-
 export interface ToolContext {
   sessionId: string;
-  legacyPath: string;    // The legacy source project root (read-only workspace)
-  modernPath: string;    // The modern output project root (write target)
+  legacyPath: string;    
+  modernPath: string;    
   onLog?: (message: string, level?: 'info' | 'success' | 'error' | 'warning') => void;
 }
-
-// ── Tool Definition ──────────────────────────────────────────────────────────
-// Follows the same shape as snside ToolRequest / ToolProvider interface.
-// name        → exact function name the LLM calls
-// description → what the LLM reads to decide when to use this tool
-// parameters  → JSON Schema describing the arguments
-// handler     → async function that runs the actual implementation
 
 export interface ToolDefinition {
   name: string;
@@ -48,17 +37,11 @@ export interface ToolDefinition {
   handler: (args: any, context: ToolContext) => Promise<any>;
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-//  TOOLS REGISTRY
-//  All tool IDs mirror the snside workspace-functions.ts constant names so
-//  that prompts copied from the IDE work with zero changes.
-// ─────────────────────────────────────────────────────────────────────────────
-
 export const TOOLS_REGISTRY: Record<string, ToolDefinition> = {
 
-  // ── getWorkspaceDirectoryStructure ────────────────────────────────────────
-  // Mirrors: GetWorkspaceDirectoryStructure (browser/workspace-functions.ts)
-  // ID:      GET_WORKSPACE_DIRECTORY_STRUCTURE_FUNCTION_ID
+  
+  
+  
   [GET_WORKSPACE_DIRECTORY_STRUCTURE_FUNCTION_ID]: {
     name: 'getWorkspaceDirectoryStructure',
     description:
@@ -100,9 +83,9 @@ export const TOOLS_REGISTRY: Record<string, ToolDefinition> = {
     }
   },
 
-  // ── getWorkspaceFileList ──────────────────────────────────────────────────
-  // Mirrors: GetWorkspaceFileList (browser/workspace-functions.ts)
-  // ID:      GET_WORKSPACE_FILE_LIST_FUNCTION_ID
+  
+  
+  
   [GET_WORKSPACE_FILE_LIST_FUNCTION_ID]: {
     name: 'getWorkspaceFileList',
     description:
@@ -144,9 +127,9 @@ export const TOOLS_REGISTRY: Record<string, ToolDefinition> = {
     }
   },
 
-  // ── getFileContent ────────────────────────────────────────────────────────
-  // Mirrors: FileContentFunction (browser/workspace-functions.ts)
-  // ID:      FILE_CONTENT_FUNCTION_ID = 'getFileContent'
+  
+  
+  
   [FILE_CONTENT_FUNCTION_ID]: {
     name: 'getFileContent',
     description:
@@ -191,7 +174,7 @@ export const TOOLS_REGISTRY: Record<string, ToolDefinition> = {
 
       const content = await fs.readFile(targetPath, 'utf-8');
 
-      // Support offset/limit chunking (same as snside FileContentFunction)
+      
       if (args.offset !== undefined || args.limit !== undefined) {
         const lines = content.split(/\r?\n/);
         const start = args.offset ?? 0;
@@ -207,9 +190,9 @@ export const TOOLS_REGISTRY: Record<string, ToolDefinition> = {
     }
   },
 
-  // ── searchInWorkspace ─────────────────────────────────────────────────────
-  // Mirrors: WorkspaceSearchProvider (browser/workspace-search-provider.ts)
-  // ID:      SEARCH_IN_WORKSPACE_FUNCTION_ID = 'searchInWorkspace'
+  
+  
+  
   [SEARCH_IN_WORKSPACE_FUNCTION_ID]: {
     name: 'searchInWorkspace',
     description:
@@ -254,7 +237,7 @@ export const TOOLS_REGISTRY: Record<string, ToolDefinition> = {
             }
           }
         } catch {
-          // Skip unreadable/binary files silently
+          
         }
       }
 
@@ -262,9 +245,9 @@ export const TOOLS_REGISTRY: Record<string, ToolDefinition> = {
     }
   },
 
-  // ── findFilesByPattern ────────────────────────────────────────────────────
-  // Mirrors: FindFilesByPattern (browser/workspace-functions.ts)
-  // ID:      FIND_FILES_BY_PATTERN_FUNCTION_ID = 'findFilesByPattern'
+  
+  
+  
   [FIND_FILES_BY_PATTERN_FUNCTION_ID]: {
     name: 'findFilesByPattern',
     description:
@@ -295,9 +278,9 @@ export const TOOLS_REGISTRY: Record<string, ToolDefinition> = {
     }
   },
 
-  // ── getDependencyTree ─────────────────────────────────────────────────────
-  // Mirrors: GetDependencyTree (browser/migration-dependency-tools.ts)
-  // ID:      GET_DEPENDENCY_TREE_FUNCTION_ID = 'getDependencyTree'
+  
+  
+  
   [GET_DEPENDENCY_TREE_FUNCTION_ID]: {
     name: 'getDependencyTree',
     description:
@@ -338,7 +321,7 @@ export const TOOLS_REGISTRY: Record<string, ToolDefinition> = {
         { file: 'pyproject.toml',    type: 'pip',     parser: parsePyprojectToml },
       ];
 
-      // Also recursively find all package.json files in subdirectories (monorepo support)
+      
       const extraPackageJsonFiles = await glob('**/package.json', {
         cwd: basePath,
         onlyFiles: true,
@@ -348,7 +331,7 @@ export const TOOLS_REGISTRY: Record<string, ToolDefinition> = {
 
       const results: any[] = [];
 
-      // Check root-level manifests
+      
       for (const m of manifests) {
         const filePath = path.join(basePath, m.file);
         try {
@@ -356,16 +339,16 @@ export const TOOLS_REGISTRY: Record<string, ToolDefinition> = {
             const content = await fs.readFile(filePath, 'utf-8');
             results.push({ type: m.type, file: m.file, ...m.parser(content) });
           }
-        } catch { /* skip unreadable */ }
+        } catch {  }
       }
 
-      // Check extra package.json in subdirs (monorepo packages)
+      
       for (const relPath of extraPackageJsonFiles) {
-        if (relPath === 'package.json') continue; // already handled above
+        if (relPath === 'package.json') continue; 
         try {
           const content = await fs.readFile(path.join(basePath, relPath), 'utf-8');
           results.push({ type: 'npm', file: relPath, ...parsePackageJson(content) });
-        } catch { /* skip */ }
+        } catch {  }
       }
 
       if (results.length === 0) {
@@ -379,9 +362,9 @@ export const TOOLS_REGISTRY: Record<string, ToolDefinition> = {
     }
   },
 
-  // ── batch-read-files ─────────────────────────────────────────────────────
-  // Mirrors: BatchFileReader (browser/migration-batch-reader-tool.ts)
-  // ID:      BATCH_READ_FILES_FUNCTION_ID = 'batch-read-files'
+  
+  
+  
   [BATCH_READ_FILES_FUNCTION_ID]: {
     name: 'batch-read-files',
     description:
@@ -428,7 +411,7 @@ export const TOOLS_REGISTRY: Record<string, ToolDefinition> = {
         return { error: 'Max 10 files per batch call. Split into multiple batches.' };
       }
 
-      const MAX_TOTAL_BYTES = 300 * 1024; // 300KB
+      const MAX_TOTAL_BYTES = 300 * 1024; 
       let totalBytes = 0;
 
       const results = await Promise.all(entries.map(async (entry) => {
@@ -493,8 +476,8 @@ export const TOOLS_REGISTRY: Record<string, ToolDefinition> = {
     }
   },
 
-  // ── write_file ────────────────────────────────────────────────────────────
-  // Writes output files (Stage1_Analysis.md, migration-plan.md) to modernPath.
+  
+  
   write_file: {
     name: 'write_file',
     description:
@@ -533,8 +516,8 @@ export const TOOLS_REGISTRY: Record<string, ToolDefinition> = {
     }
   },
 
-  // ── get_task_context ──────────────────────────────────────────────────────
-  // Persistent memory — read the session task context JSON.
+  
+  
   get_task_context: {
     name: 'get_task_context',
     description:
@@ -548,8 +531,8 @@ export const TOOLS_REGISTRY: Record<string, ToolDefinition> = {
     }
   },
 
-  // ── edit_task_context ─────────────────────────────────────────────────────
-  // Persistent memory — update/merge into the session task context JSON.
+  
+  
   edit_task_context: {
     name: 'edit_task_context',
     description:
@@ -573,8 +556,8 @@ export const TOOLS_REGISTRY: Record<string, ToolDefinition> = {
     }
   },
 
-  // ── run_command ───────────────────────────────────────────────────────────
-  // Safely runs shell commands inside the modernPath (output) directory.
+  
+  
   run_command: {
     name: 'run_command',
     description: 'Safely runs a command (like build, lint, or test) inside the target modernized project path.',
@@ -600,8 +583,8 @@ export const TOOLS_REGISTRY: Record<string, ToolDefinition> = {
     }
   },
 
-  // ── list_directory ────────────────────────────────────────────────────────
-  // Legacy tool kept for backward compatibility — delegates to getWorkspaceFileList.
+  
+  
   list_directory: {
     name: 'list_directory',
     description:
@@ -636,8 +619,8 @@ export const TOOLS_REGISTRY: Record<string, ToolDefinition> = {
     }
   },
 
-  // ── read_file ─────────────────────────────────────────────────────────────
-  // Legacy tool kept for backward compatibility — delegates to getFileContent.
+  
+  
   read_file: {
     name: 'read_file',
     description: 'Reads the content of a file from the legacy or modern project path. Prefer getFileContent during Stage 1.',
@@ -667,8 +650,8 @@ export const TOOLS_REGISTRY: Record<string, ToolDefinition> = {
     }
   },
 
-  // ── search_code ───────────────────────────────────────────────────────────
-  // Legacy tool kept for backward compat — same as searchInWorkspace but with base selector.
+  
+  
   search_code: {
     name: 'search_code',
     description: 'Searches all text files in the legacy or modern project for lines matching a query. Prefer searchInWorkspace.',
@@ -704,9 +687,9 @@ export const TOOLS_REGISTRY: Record<string, ToolDefinition> = {
     }
   },
 
-  // ── extractFileSymbols ───────────────────────────────────────────────────
-  // Mirrors: ExtractFileSymbols (browser/migration-large-file-tools.ts)
-  // Extracts function/class symbols from a source file + recommends reading strategy.
+  
+  
+  
   extractFileSymbols: {
     name: 'extractFileSymbols',
     description:
@@ -733,30 +716,30 @@ export const TOOLS_REGISTRY: Record<string, ToolDefinition> = {
       const lines = content.split(/\r?\n/);
       const lineCount = lines.length;
 
-      // Determine reading strategy
+      
       const readingStrategy =
         lineCount <= 200 ? 'SMALL' :
         lineCount <= 500 ? 'MEDIUM' :
         lineCount <= 2500 ? 'LARGE' : 'ULTRA_LARGE';
 
-      // Regex-based symbol extraction (supports JS/TS/Python/Java/Go/PHP/Ruby/C++/C#)
+      
       const symbols: any[] = [];
       const patterns = [
-        // JavaScript/TypeScript functions & classes
+        
         { regex: /^\s*(?:export\s+)?(?:async\s+)?function\s+(\w+)\s*\(/gm,    type: 'function' },
         { regex: /^\s*(?:export\s+)?class\s+(\w+)/gm,                          type: 'class' },
         { regex: /^\s*(?:public|private|protected|static|async)?\s+(\w+)\s*\([^)]*\)\s*[:{]/gm, type: 'method' },
         { regex: /^\s*const\s+(\w+)\s*=\s*(?:async\s+)?(?:\([^)]*\)|\w+)\s*=>/gm, type: 'arrow_fn' },
-        // Python
+        
         { regex: /^def\s+(\w+)\s*\(/gm,      type: 'function' },
         { regex: /^class\s+(\w+)/gm,          type: 'class' },
-        // Java/C#
+        
         { regex: /(?:public|private|protected|static)\s+\w+\s+(\w+)\s*\(/gm, type: 'method' },
-        // Go
+        
         { regex: /^func\s+(?:\(\w+\s+\*?\w+\)\s+)?(\w+)\s*\(/gm, type: 'function' },
-        // PHP
+        
         { regex: /^\s*(?:public|private|protected)?\s*function\s+(\w+)\s*\(/gm, type: 'function' },
-        // Ruby
+        
         { regex: /^\s*def\s+(\w+)/gm, type: 'function' },
       ];
 
@@ -768,7 +751,7 @@ export const TOOLS_REGISTRY: Record<string, ToolDefinition> = {
           const name = match[1];
           if (!name || seen.has(name)) continue;
           seen.add(name);
-          // Find line number
+          
           const before = content.slice(0, match.index);
           const startLine = before.split('\n').length;
           symbols.push({ name, type, startLine, endLine: startLine + 5 });
@@ -780,7 +763,7 @@ export const TOOLS_REGISTRY: Record<string, ToolDefinition> = {
         lineCount,
         readingStrategy,
         symbolCount: symbols.length,
-        symbols: symbols.slice(0, 200), // cap at 200 to avoid context overflow
+        symbols: symbols.slice(0, 200), 
         recommendation: readingStrategy === 'SMALL'
           ? 'Read entire file with getFileContent (no offset/limit needed).'
           : readingStrategy === 'MEDIUM'
@@ -792,8 +775,8 @@ export const TOOLS_REGISTRY: Record<string, ToolDefinition> = {
     }
   },
 
-  // ── getEnvironmentInfo ───────────────────────────────────────────────────
-  // Mirrors: GetEnvironmentInfo (browser/migration-env-tools.ts)
+  
+  
   getEnvironmentInfo: {
     name: 'getEnvironmentInfo',
     description:
@@ -843,8 +826,8 @@ export const TOOLS_REGISTRY: Record<string, ToolDefinition> = {
     }
   },
 
-  // ── getGitLog ────────────────────────────────────────────────────────────
-  // Mirrors: GetGitLog (browser/migration-git-tools.ts)
+  
+  
   getGitLog: {
     name: 'getGitLog',
     description:
@@ -885,7 +868,7 @@ export const TOOLS_REGISTRY: Record<string, ToolDefinition> = {
             const [_, hash, date, ...msgParts] = line.split('|');
             currentCommit = { hash: hash?.replace('COMMIT:', ''), date, message: msgParts.join('|'), files: [] };
             if (currentCommit.date && new Date(currentCommit.date) > oneYearAgo) {
-              // file is recently touched — will be added below
+              
             }
           } else if (line.trim() && currentCommit && !line.startsWith('COMMIT:')) {
             currentCommit.files.push(line.trim());
@@ -907,7 +890,7 @@ export const TOOLS_REGISTRY: Record<string, ToolDefinition> = {
 
         return {
           totalCommits: commits.length,
-          commits: commits.slice(0, 20), // Only return first 20 to avoid context overflow
+          commits: commits.slice(0, 20), 
           highChurnFiles: sortedByChurn,
           deadCodeCandidates,
           note: `Full history: ${commits.length} commits analyzed.`
@@ -918,8 +901,8 @@ export const TOOLS_REGISTRY: Record<string, ToolDefinition> = {
     }
   },
 
-  // ── scanAssetFiles ───────────────────────────────────────────────────────
-  // Mirrors: ScanAssetFiles (browser/migration-asset-tools.ts)
+  
+  
   scanAssetFiles: {
     name: 'scanAssetFiles',
     description:
@@ -957,8 +940,8 @@ export const TOOLS_REGISTRY: Record<string, ToolDefinition> = {
     }
   },
 
-  // ── copyStaticAssets ─────────────────────────────────────────────────────
-  // Mirrors: CopyStaticAssets (browser/migration-asset-tools.ts)
+  
+  
   copyStaticAssets: {
     name: 'copyStaticAssets',
     description: 'Copies specified asset files from the legacy workspace to the same relative path in the modern output workspace.',
@@ -988,8 +971,8 @@ export const TOOLS_REGISTRY: Record<string, ToolDefinition> = {
     }
   },
 
-  // ── capturedShellExecute ─────────────────────────────────────────────────
-  // Mirrors: CapturedShellExecution (browser/migration-shell-capture-tool.ts)
+  
+  
   capturedShellExecute: {
     name: 'capturedShellExecute',
     description:
@@ -1023,7 +1006,7 @@ export const TOOLS_REGISTRY: Record<string, ToolDefinition> = {
 
       const allOutput = [res.stdout, res.stderr].filter(Boolean).join('\n');
       const outputLines = allOutput.split('\n');
-      const tails = outputLines.slice(-200).join('\n'); // Last 200 lines
+      const tails = outputLines.slice(-200).join('\n'); 
 
       return {
         exitCode: res.code,
@@ -1036,8 +1019,8 @@ export const TOOLS_REGISTRY: Record<string, ToolDefinition> = {
     }
   },
 
-  // ── getSkillFileContent ──────────────────────────────────────────────────
-  // Mirrors: GetSkillFileContent (browser/skill-file-functions.ts)
+  
+  
   getSkillFileContent: {
     name: 'getSkillFileContent',
     description: 'Reads a custom skill/rule template file from the skills directory. Skills are Markdown files with custom migration rules.',
@@ -1050,7 +1033,7 @@ export const TOOLS_REGISTRY: Record<string, ToolDefinition> = {
     },
     handler: async (args: { skillPath: string }, context: ToolContext) => {
       try {
-        // Look in a skills/ directory at the BE root (or session-specific)
+        
         const skillsDir = path.join(process.cwd(), 'skills');
         const skillPath = path.resolve(skillsDir, args.skillPath);
         if (!skillPath.startsWith(skillsDir)) throw new Error('Access denied.');
@@ -1065,8 +1048,8 @@ export const TOOLS_REGISTRY: Record<string, ToolDefinition> = {
     }
   },
 
-  // ── todoWrite ────────────────────────────────────────────────────────────
-  // Mirrors: TodoWriteTool (browser/todo-tool.ts)
+  
+  
   todoWrite: {
     name: 'todoWrite',
     description:
@@ -1092,16 +1075,16 @@ export const TOOLS_REGISTRY: Record<string, ToolDefinition> = {
       required: ['todos']
     },
     handler: async (args: { todos: Array<{ title: string; status: string; priority?: string }> }, context: ToolContext) => {
-      // Save to task context under 'todo-list'
+      
       await TaskContextManager.updateContext(context.sessionId, { 'todo-list': args.todos });
 
-      // Broadcast to frontend
+      
       EventBroadcaster.broadcast(context.sessionId, 'todo_update', {
         todos: args.todos,
         timestamp: new Date().toISOString()
       });
 
-      // Also log summary to terminal
+      
       const completed = args.todos.filter(t => t.status === 'completed').length;
       const total = args.todos.length;
       context.onLog?.(`[Todo] ${completed}/${total} tasks completed.`, 'info');
@@ -1110,8 +1093,8 @@ export const TOOLS_REGISTRY: Record<string, ToolDefinition> = {
     }
   },
 
-  // ── update-migration-dashboard ───────────────────────────────────────────
-  // Mirrors: MigrationProgressDashboard (browser/migration-progress-dashboard-tool.ts)
+  
+  
   'update-migration-dashboard': {
     name: 'update-migration-dashboard',
     description:
@@ -1141,7 +1124,7 @@ export const TOOLS_REGISTRY: Record<string, ToolDefinition> = {
 
       context.onLog?.(`[Progress] ${args.filesCompleted}/${args.totalFiles} files (${percent}%)${args.currentFile ? ` — ${args.currentFile}` : ''}`, 'info');
 
-      // Save to session
+      
       await SessionManager.updateSession(context.sessionId, {
         completedFiles: args.filesCompleted,
         totalFiles: args.totalFiles,
@@ -1152,8 +1135,8 @@ export const TOOLS_REGISTRY: Record<string, ToolDefinition> = {
     }
   },
 
-  // ── compress-migration-context ───────────────────────────────────────────
-  // Mirrors: SemanticContextCompressor (browser/migration-context-compressor-tool.ts)
+  
+  
   'compress-migration-context': {
     name: 'compress-migration-context',
     description:
@@ -1180,7 +1163,7 @@ export const TOOLS_REGISTRY: Record<string, ToolDefinition> = {
         }
       }
 
-      // Remove archived keys and add archive pointers
+      
       const updates: Record<string, any> = { ...archiveData, CONTEXT_COMPACTED: true, CONTEXT_SIZE_WARNING: false };
       for (const key of archived) updates[key] = undefined;
 
@@ -1191,8 +1174,8 @@ export const TOOLS_REGISTRY: Record<string, ToolDefinition> = {
     }
   },
 
-  // ── write-migration-files ────────────────────────────────────────────────
-  // Mirrors: MultiFileWriter (browser/migration-multi-writer-tool.ts)
+  
+  
   'write-migration-files': {
     name: 'write-migration-files',
     description:
@@ -1235,8 +1218,8 @@ export const TOOLS_REGISTRY: Record<string, ToolDefinition> = {
     }
   },
 
-  // ── compareFiles ─────────────────────────────────────────────────────────
-  // Mirrors: CompareFiles (browser/migration-compare-tools.ts)
+  
+  
   compareFiles: {
     name: 'compareFiles',
     description: 'Compares a legacy file with its modern equivalent and returns a unified diff. Use to verify migration fidelity.',
@@ -1260,7 +1243,7 @@ export const TOOLS_REGISTRY: Record<string, ToolDefinition> = {
           fs.readFile(modernPath,  'utf-8').then(c => c.split('\n')),
         ]);
 
-        // Simple line-by-line diff
+        
         let added = 0; let removed = 0;
         const diff: string[] = [];
         const maxLines = Math.max(legacyLines.length, modernLines.length);
@@ -1283,7 +1266,7 @@ export const TOOLS_REGISTRY: Record<string, ToolDefinition> = {
           addedLines: added,
           removedLines: removed,
           similarity: `${similarity}%`,
-          diff: diff.slice(0, 200).join('\n'), // Cap at 200 diff lines
+          diff: diff.slice(0, 200).join('\n'), 
         };
       } catch (err: any) {
         return { error: err.message };
@@ -1291,8 +1274,8 @@ export const TOOLS_REGISTRY: Record<string, ToolDefinition> = {
     }
   },
 
-  // ── find-migration-session ───────────────────────────────────────────────
-  // Mirrors: MigrationSessionFinder (browser/migration-session-finder-tool.ts)
+  
+  
   'find-migration-session': {
     name: 'find-migration-session',
     description: 'Scans all sessions to find incomplete migration sessions. Used for cross-session recovery on startup.',
@@ -1316,9 +1299,9 @@ export const TOOLS_REGISTRY: Record<string, ToolDefinition> = {
     }
   },
 
-  // ── getFileDiagnostics ────────────────────────────────────────────────────
-  // Mirrors: FileDiagnosticProvider (browser/workspace-functions.ts)
-  // Returns empty array in BE context (no LSP available) — kept for prompt compatibility.
+  
+  
+  
   [GET_FILE_DIAGNOSTICS_ID]: {
     name: 'getFileDiagnostics',
     description: 'Retrieves diagnostic warnings and errors for a specific file. Note: in backend mode this returns an empty list as no LSP is available.',
@@ -1334,9 +1317,9 @@ export const TOOLS_REGISTRY: Record<string, ToolDefinition> = {
     }
   },
 
-  // ── append-to-knowledge-graph ─────────────────────────────────────────────
-  // Incrementally builds cross-file knowledge graphs during Phase 1 analysis.
-  // Called after EVERY file read to contribute extracted data to the relevant graph(s).
+  
+  
+  
   'append-to-knowledge-graph': {
     name: 'append-to-knowledge-graph',
     description:
@@ -1402,20 +1385,20 @@ export const TOOLS_REGISTRY: Record<string, ToolDefinition> = {
       await fs.ensureDir(analysisDir);
       const graphPath = path.join(analysisDir, `${args.graphName}-graph.json`);
 
-      // Load existing graph (or start with empty object)
+      
       let existing: Record<string, any> = {};
       try {
         if (await fs.pathExists(graphPath)) {
           existing = await readJsonWithRetry<Record<string, any>>(graphPath);
         }
       } catch {
-        existing = {}; // If file is corrupt, start fresh
+        existing = {}; 
       }
 
-      // Merge incoming data using the correct strategy for this graph type
+      
       const merged = mergeGraphData(args.graphName, existing, args.data);
 
-      // Write merged result back
+      
       await writeJsonAtomic(graphPath, merged);
 
       const entryCount = Object.keys(merged).length;
@@ -1434,9 +1417,9 @@ export const TOOLS_REGISTRY: Record<string, ToolDefinition> = {
     }
   },
 
-  // ── read-knowledge-graph ──────────────────────────────────────────────────
-  // Reads a fully-merged knowledge graph at report-writing time.
-  // Agent calls this instead of loading 50+ raw per-file analysis keys.
+  
+  
+  
   'read-knowledge-graph': {
     name: 'read-knowledge-graph',
     description:
@@ -1517,10 +1500,6 @@ export const TOOLS_REGISTRY: Record<string, ToolDefinition> = {
   },
 
 };
-
-// ─────────────────────────────────────────────────────────────────────────────
-//  MANIFEST PARSERS — used by getDependencyTree
-// ─────────────────────────────────────────────────────────────────────────────
 
 function parsePackageJson(content: string) {
   try {

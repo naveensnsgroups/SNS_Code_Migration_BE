@@ -1,7 +1,4 @@
-// =============================================================================
-//  tools/workspace/get-dependency-tree.tool.ts
-//  Mirrors: GetDependencyTree (snside migration-dependency-tools.ts)
-// =============================================================================
+
 
 import fs from 'fs-extra';
 import path from 'path';
@@ -12,8 +9,6 @@ import { ToolContext } from '../../types/tool.js';
 import { makeToolTextResult, makeToolErrorResult } from '../../types/language-model.js';
 
 import { GET_DEPENDENCY_TREE_FUNCTION_ID } from '../../common/workspace-functions.js';
-
-// ── Manifest parsers ──────────────────────────────────────────────────────────
 
 function parsePackageJson(content: string) {
   try {
@@ -118,8 +113,6 @@ function parsePyprojectToml(content: string) {
   return { dependencies: deps };
 }
 
-// ── Tool ──────────────────────────────────────────────────────────────────────
-
 export const getDependencyTreeTool: ToolRequest = {
   id: GET_DEPENDENCY_TREE_FUNCTION_ID,
   name: 'getDependencyTree',
@@ -166,7 +159,7 @@ export const getDependencyTreeTool: ToolRequest = {
           const content = await fs.readFile(filePath, 'utf-8');
           results.push({ type: m.type, file: m.file, ...m.parser(content) });
         }
-      } catch { /* skip unreadable */ }
+      } catch {  }
     }
 
     for (const relPath of extraPackageJsonFiles) {
@@ -174,7 +167,7 @@ export const getDependencyTreeTool: ToolRequest = {
       try {
         const content = await fs.readFile(path.join(basePath, relPath), 'utf-8');
         results.push({ type: 'npm', file: relPath, ...parsePackageJson(content) });
-      } catch { /* skip */ }
+      } catch {  }
     }
 
     if (results.length === 0) {

@@ -1,19 +1,4 @@
-// =============================================================================
-//  openai/openai-service.ts — OpenAI & OpenAI-Compatible Legacy AIService
-//
-//  SNS IDE folder structure:
-//    src/ai/openai/
-//      openai-service.ts    ← this file: legacy blocking AIService
-//
-//  Supports OpenAI-compatible APIs via custom baseURL:
-//    - OpenAI:     (default endpoint)
-//    - Grok:       https://api.x.ai/v1
-//    - Groq:       https://api.groq.com/openai/v1
-//    - OpenRouter: https://openrouter.ai/api/v1
-//
-//  TODO: Add openai-language-model.ts with chat.completions.stream()
-//        to support streaming in AgentExecutor ReAct loop.
-// =============================================================================
+
 
 import OpenAI from 'openai';
 import { AIService, AICompletionResponse, ChatMessage } from '../provider.js';

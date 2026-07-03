@@ -1,17 +1,4 @@
-// =============================================================================
-//  anthropic/claude-service.ts — Legacy AIService shim for Anthropic Claude
-//
-//  SNS IDE folder structure:
-//    src/ai/anthropic/
-//      claude-service.ts             ← this file: legacy blocking AIService
-//      anthropic-language-model.ts   ← streaming StreamingProvider (SNS IDE standard)
-//
-//  ClaudeService is kept ONLY for backward-compat with getService() factory.
-//  All new agent code (AgentExecutor, PlannerAgent) uses ClaudeProvider (streaming).
-//
-//  NOTE: This uses messages.create() which is BLOCKING (non-streaming).
-//  Do NOT use this for long-running migration sessions.
-// =============================================================================
+
 
 import Anthropic from '@anthropic-ai/sdk';
 import { AIService, AICompletionResponse, ChatMessage } from '../provider.js';
@@ -38,14 +25,14 @@ export class ClaudeService implements AIService {
       if (typeof prompt === 'string') {
         messages.push({ role: 'user', content: prompt });
       } else {
-        // System message is sent separately in Anthropic API
+        
         const systemMsg = prompt.find(m => m.role === 'system');
         if (systemMsg) {
           finalSystemPrompt = systemMsg.content;
         }
 
-        // Group consecutive tool messages to prevent alternate role errors
-        // and support parallel tool calls (multiple tool_result in one user turn)
+        
+        
         const nonSystemMsgs = prompt.filter(m => m.role !== 'system');
         const groupedMsgs: any[] = [];
         for (const m of nonSystemMsgs) {

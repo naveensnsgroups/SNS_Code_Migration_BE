@@ -1,7 +1,4 @@
-// =============================================================================
-//  tools/environment/get-git-log.tool.ts
-//  Mirrors: GetGitLog (snside migration-git-tools.ts)
-// =============================================================================
+
 
 import { ToolRequest } from '../../types/tool.js';
 
@@ -10,9 +7,6 @@ import { makeToolTextResult, makeToolErrorResult } from '../../types/language-mo
 
 import { ShellExecutor } from '../shellExecutor.js';
 import { GET_GIT_LOG_FUNCTION_ID } from '../../common/workspace-functions.js';
-
-// ── Use the exact SNS IDE constant from workspace-functions.ts ────────────────
-// GET_GIT_LOG_FUNCTION_ID = 'getGitLog'
 
 export const getGitLogTool: ToolRequest = {
   id: GET_GIT_LOG_FUNCTION_ID,

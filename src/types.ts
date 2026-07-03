@@ -1,4 +1,4 @@
-// ── Standalone Types for Backend ──────────────────────────────────────────
+
 
 export type MigrationStatus =
   | 'idle'
@@ -80,10 +80,10 @@ export interface MigrateStartRequest {
     huggingface?: string;
   };
   agentsConfig?: any;
-  // AI Config panel state — saved to session and used by orchestrator/agents
-  toolsConfig?: Record<string, boolean>;                  // tool enablement map
-  aliasesConfig?: Record<string, string>;                 // alias → resolved model string
-  promptFragments?: Record<string, string>;               // fragment id → custom text
+  
+  toolsConfig?: Record<string, boolean>;                  
+  aliasesConfig?: Record<string, string>;                 
+  promptFragments?: Record<string, string>;               
 }
 
 export interface SSEEvent {
@@ -95,11 +95,11 @@ export interface SSEEvent {
     | 'complete'
     | 'error'
     | 'heartbeat'
-    | 'token_usage'    // Real token counts broadcast from AgentExecutor
-    | 'todo_update'    // Per-file progress from todoWrite tool
-    | 'tool_call'          // Structured tool start event — FE sets activeTool state
-    | 'tool_response'      // Structured tool done event  — FE clears activeTool state
-    | 'file_tree_changed'; // @parcel/watcher detected new/changed/deleted file in modernPath
+    | 'token_usage'    
+    | 'todo_update'    
+    | 'tool_call'          
+    | 'tool_response'      
+    | 'file_tree_changed'; 
   data: any;
   timestamp: string;
 }

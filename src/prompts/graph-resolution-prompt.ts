@@ -1,16 +1,6 @@
-// =============================================================================
-//  graph-resolution-prompt.ts — Stage 1, Phase 3: Graph Resolver Agent
-//
-//  Pass A (FK resolution), Pass B (call-flow graph), and Pass C step C0
-//  (importedBy + MIGRATION_ORDER) are handled by graph-resolver.ts in TypeScript.
-//  This file contains ONLY the two remaining LLM passes:
-//    - Pass C: Architecture synthesis
-//    - Pass D: Counter recovery
-// =============================================================================
+
 
 import { buildLanguageHint } from './file-analysis-prompt.js';
-
-// ── Pass C: Architecture Synthesis + Mandatory Counters ──────────────────────
 
 export const GRAPH_PASS_C_SYSTEM = `
 <role>
@@ -157,9 +147,6 @@ ReAct loop:
 C2 MUST run even if any graph is empty — a count of 0 is valid and expected.
 PHASE1_GRAPH_COMPLETE=true signals the TypeScript orchestrator that Phase 3 is done.`;
 }
-
-// ── Pass D: Counter-Only Recovery ────────────────────────────────────────────
-// Runs ONLY if Pass C failed to save G5 counters.
 
 export const GRAPH_PASS_D_SYSTEM = `
 <role>

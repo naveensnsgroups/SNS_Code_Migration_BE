@@ -1,7 +1,4 @@
-// =============================================================================
-//  tools/workspace/batch-read-files.tool.ts
-//  Mirrors: BatchFileReader (snside migration-batch-reader-tool.ts)
-// =============================================================================
+
 
 import fs from 'fs-extra';
 import path from 'path';
@@ -12,7 +9,7 @@ import { makeToolTextResult, makeToolErrorResult } from '../../types/language-mo
 
 import { BATCH_READ_FILES_FUNCTION_ID } from '../../common/workspace-functions.js';
 
-const MAX_TOTAL_BYTES = 300 * 1024; // 300KB
+const MAX_TOTAL_BYTES = 300 * 1024; 
 
 const LANG_MAP: Record<string, string> = {
   '.ts': 'typescript', '.tsx': 'typescript', '.js': 'javascript', '.jsx': 'javascript',

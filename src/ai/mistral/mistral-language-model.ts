@@ -1,20 +1,4 @@
-// =============================================================================
-//  mistral-language-model.ts — Mistral AI Streaming Provider (SNS IDE Standard)
-//
-//  Mirrors: src/ai/anthropic/anthropic-language-model.ts and
-//           src/ai/google/gemini-language-model.ts
-//
-//  Key implementation facts (verified from @mistralai/mistralai v2 SDK source):
-//  1. SDK: `new Mistral({ apiKey })` — NOT new MistralClient()
-//  2. Streaming: `client.chat.stream({ model, messages, tools, toolChoice })`
-//  3. Each stream event: `event.data.choices[0].delta` (delta has .content + .toolCalls)
-//  4. toolCalls field is camelCase — NOT tool_calls
-//  5. Tool result message: { role:"tool", toolCallId, content, name } — toolCallId camelCase
-//  6. FunctionCall.arguments: can be object OR string — handle both
-//  7. Tool format: OpenAI-compatible { type:"function", function:{ name, description, parameters }}
-//  8. Tool choice: "auto" | "any" | "none"
-//  9. UsageInfo: event.data.usage (may be null until final chunk)
-// =============================================================================
+
 
 import { Mistral } from '@mistralai/mistralai';
 import {
@@ -32,16 +16,12 @@ import {
 } from '../../types/language-model.js';
 import { ToolRequest, ToolContext } from '../../types/tool.js';
 
-// ── Config ─────────────────────────────────────────────────────────────────────
-
 export interface MistralProviderConfig {
   maxRetries?: number;
-  retryDelayRateLimit?: number;   // seconds to wait on 429 (default 60)
-  retryDelayOther?: number;       // seconds to wait on other errors (default -1 = no retry)
-  maxTokens?: number;             // default 8192
+  retryDelayRateLimit?: number;   
+  retryDelayOther?: number;       
+  maxTokens?: number;             
 }
-
-// ── Rate Limit Detection ────────────────────────────────────────────────────────
 
 function isRateLimitError(err: any): boolean {
   const msg    = String(err?.message || err || '').toLowerCase();
@@ -56,20 +36,6 @@ function isRateLimitError(err: any): boolean {
     msg.includes('too many requests')
   );
 }
-
-// ── Message Conversion ──────────────────────────────────────────────────────────
-//
-// Converts our LanguageModelMessage[] → Mistral's message array format.
-// Mistral uses OpenAI-compatible roles: system / user / assistant / tool
-//
-// Mapping:
-//   TextMessage { actor:'system' }  → { role:'system',    content: str }
-//   TextMessage { actor:'user'   }  → { role:'user',      content: str }
-//   TextMessage { actor:'ai'     }  → { role:'assistant', content: str }
-//   ToolUseMessage                  → { role:'assistant', toolCalls:[{ id, type, function }] }
-//   ToolResultMessage               → { role:'tool',      toolCallId, content, name }
-//
-// Mistral SDK v2 field names are CAMELCASE (toolCalls, toolCallId — NOT snake_case).
 
 type MistralMessage =
   | { role: 'system';    content: string }
@@ -88,8 +54,8 @@ type MistralTool = {
   function: {
     name:        string;
     description: string;
-    // Mistral SDK v2 Zod schema requires parameters to be a record — never undefined.
-    // Always provide at minimum { type:'object', properties:{} }
+    
+    
     parameters: {
       type:       'object';
       properties: Record<string, unknown>;
@@ -111,7 +77,7 @@ function transformToMistralMessages(messages: readonly LanguageModelMessage[]): 
         result.push({ role: 'assistant', content: msg.text });
       }
     } else if (msg.type === 'tool_use') {
-      // AI tool call — assistant message with toolCalls array (camelCase)
+      
       let argsStr: string;
       if (typeof msg.input === 'string') {
         argsStr = msg.input;
@@ -130,7 +96,7 @@ function transformToMistralMessages(messages: readonly LanguageModelMessage[]): 
         }],
       });
     } else if (msg.type === 'tool_result') {
-      // Tool result — role:"tool" with toolCallId (camelCase, confirmed from SDK source)
+      
       const contentStr = extractToolResultText(msg.content);
       result.push({
         role:       'tool',
@@ -157,16 +123,14 @@ function extractToolResultText(result: ToolCallResult): string {
   return String(result);
 }
 
-// ── Tool Declaration Conversion ─────────────────────────────────────────────────
-
 function buildMistralTools(tools: ToolRequest[]): MistralTool[] {
   return tools.map(t => ({
     type: 'function' as const,
     function: {
       name:        t.name,
       description: t.description,
-      // Mistral SDK v2 Zod validation requires parameters to always be a record.
-      // Always include it — use empty properties object for parameter-less tools.
+      
+      
       parameters: {
         type:       'object' as const,
         properties: t.parameters?.properties ?? {},
@@ -177,8 +141,6 @@ function buildMistralTools(tools: ToolRequest[]): MistralTool[] {
     },
   }));
 }
-
-// ── Mistral Streaming Provider ──────────────────────────────────────────────────
 
 export class MistralProvider implements StreamingProvider {
   private readonly client: Mistral;
@@ -226,11 +188,7 @@ export class MistralProvider implements StreamingProvider {
     }
   }
 
-  /**
-   * Sends a streaming request to Mistral.
-   * Returns a LanguageModelStreamResponse with async iterable stream.
-   * Each streamed part is: TextResponsePart | ToolCallResponsePart | UsageResponsePart.
-   */
+  
   async request(userRequest: UserRequest, toolCtx?: ToolContext): Promise<LanguageModelStreamResponse> {
     const mistralMessages = transformToMistralMessages(userRequest.messages);
     const tools           = userRequest.tools ?? [];
@@ -252,11 +210,7 @@ export class MistralProvider implements StreamingProvider {
     return asyncIterator;
   }
 
-  /**
-   * Runs a single Mistral streaming turn.
-   * Processes delta chunks: text → TextResponsePart, toolCalls → ToolCallResponsePart.
-   * If tool calls are returned, executes them and recursively continues the conversation.
-   */
+  
   private async *streamOneTurn(
     messages:      MistralMessage[],
     mistralTools:  MistralTool[] | undefined,
@@ -265,11 +219,11 @@ export class MistralProvider implements StreamingProvider {
     toolCtx:       ToolContext | undefined
   ): AsyncIterable<LanguageModelStreamPart> {
 
-    // Open the streaming request (with retry on transient errors)
+    
     const stream = await this.withRetry(
       () => this.client.chat.stream({
         model:      this.modelName,
-        messages:   messages as any,           // cast: our MistralMessage[] is structurally correct
+        messages:   messages as any,           
         tools:      mistralTools as any,
         toolChoice: mistralTools ? 'auto' : undefined,
         maxTokens:  this.config.maxTokens,
@@ -278,38 +232,38 @@ export class MistralProvider implements StreamingProvider {
       toolCtx
     );
 
-    // Accumulate tool call argument buffers across delta chunks
-    // Map: toolCallId → { name, argsBuffer }
+    
+    
     const toolCallMap = new Map<string, { name: string; args: string; id: string }>();
     let accumulatedText = '';
 
-    // ── Process each SSE event ────────────────────────────────────────────────
-    // SDK v2 event shape (confirmed from source): CompletionEvent = { data: CompletionChunk }
-    // CompletionChunk.choices[0].delta is DeltaMessage:
-    //   { content?: string | null; toolCalls?: ToolCall[] | null }
-    // IMPORTANT: field is `toolCalls` (camelCase) — NOT `tool_calls`
+    
+    
+    
+    
+    
 
     for await (const event of stream) {
       const chunk  = event.data;
       const choice = chunk?.choices?.[0];
-      const delta  = choice?.delta as any;  // DeltaMessage — typed as any to avoid SDK version drift
+      const delta  = choice?.delta as any;  
 
       if (delta) {
-        // ── Text chunk ─────────────────────────────────────────────────────────
+        
         if (typeof delta.content === 'string' && delta.content.length > 0) {
           accumulatedText += delta.content;
           const textPart: TextResponsePart = { content: delta.content };
           yield textPart;
         }
 
-        // ── Tool call chunk ────────────────────────────────────────────────────
-        // delta.toolCalls is camelCase (confirmed from deltamessage.ts SDK source)
-        const toolCallDeltas = delta.toolCalls ?? delta.tool_calls; // fallback for safety
+        
+        
+        const toolCallDeltas = delta.toolCalls ?? delta.tool_calls; 
         if (Array.isArray(toolCallDeltas) && toolCallDeltas.length > 0) {
           for (const tc of toolCallDeltas) {
             const tcId = tc.id ?? `call_${tc.function?.name}_${Date.now()}`;
 
-            // Normalize arguments: FunctionCall.arguments can be object OR string
+            
             let argsStr: string;
             if (typeof tc.function?.arguments === 'string') {
               argsStr = tc.function.arguments;
@@ -320,7 +274,7 @@ export class MistralProvider implements StreamingProvider {
             }
 
             if (!toolCallMap.has(tcId)) {
-              // First chunk for this tool call — announce it
+              
               toolCallMap.set(tcId, { name: tc.function?.name ?? '', args: argsStr, id: tcId });
               const toolCallPart: ToolCallResponsePart = {
                 tool_calls: [{
@@ -331,7 +285,7 @@ export class MistralProvider implements StreamingProvider {
               };
               yield toolCallPart;
             } else {
-              // Subsequent chunk — accumulate args
+              
               const existing = toolCallMap.get(tcId)!;
               existing.args += argsStr;
               if (argsStr.length > 0) {
@@ -349,8 +303,8 @@ export class MistralProvider implements StreamingProvider {
         }
       }
 
-      // ── Usage chunk ───────────────────────────────────────────────────────────
-      // event.data.usage — present in the final chunk (may be null on intermediate chunks)
+      
+      
       const usage = chunk?.usage as any;
       if (usage && (usage.promptTokens !== undefined || usage.prompt_tokens !== undefined)) {
         const usagePart: UsageResponsePart = {
@@ -361,12 +315,12 @@ export class MistralProvider implements StreamingProvider {
       }
     }
 
-    // ── Execute tool calls and recurse ────────────────────────────────────────
+    
     if (toolCallMap.size > 0) {
       const finishedCalls: StreamToolCall[] = [];
       const toolResultMessages: MistralMessage[] = [];
 
-      // Build assistant message with all tool calls (for conversation history)
+      
       const assistantMsg: MistralMessage = {
         role:    'assistant',
         content: accumulatedText,
@@ -377,7 +331,7 @@ export class MistralProvider implements StreamingProvider {
         })),
       };
 
-      // Execute all tool calls in parallel
+      
       await Promise.all(
         Array.from(toolCallMap.values()).map(async (tc) => {
           const tool = toolRequests.find(t => t.name === tc.name);
@@ -402,7 +356,7 @@ export class MistralProvider implements StreamingProvider {
 
           const resultText = extractToolResultText(result);
 
-          // Tool result message: toolCallId is camelCase (confirmed from toolmessage.ts SDK source)
+          
           toolResultMessages.push({
             role:       'tool',
             toolCallId: tc.id,
@@ -419,10 +373,10 @@ export class MistralProvider implements StreamingProvider {
         })
       );
 
-      // Yield all finished tool call parts
+      
       yield { tool_calls: finishedCalls } as ToolCallResponsePart;
 
-      // Build continuation messages and recurse
+      
       const continuationMessages: MistralMessage[] = [
         ...messages,
         assistantMsg,
@@ -439,10 +393,6 @@ export class MistralProvider implements StreamingProvider {
     }
   }
 }
-
-// ── Legacy Compatibility Shim ─────────────────────────────────────────────────
-// Mirrors GeminiService / ClaudeService pattern.
-// Allows legacy code that uses AIService.generateCompletion() to call Mistral.
 
 import { AIService, AICompletionResponse, ChatMessage } from '../provider.js';
 import { ToolDefinition } from '../../tools/registry.js';

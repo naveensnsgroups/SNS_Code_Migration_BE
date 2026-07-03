@@ -1,7 +1,4 @@
-// =============================================================================
-//  tools/compare/compare-files.tool.ts
-//  Mirrors: CompareFiles (snside migration-compare-tools.ts)
-// =============================================================================
+
 
 import fs from 'fs-extra';
 import path from 'path';
@@ -11,7 +8,6 @@ import { ToolContext } from '../../types/tool.js';
 import { makeToolTextResult, makeToolErrorResult } from '../../types/language-model.js';
 
 import { COMPARE_FILES_FUNCTION_ID } from '../../common/workspace-functions.js';
-// COMPARE_FILES_FUNCTION_ID = 'compareFiles' — SNS IDE exact value
 
 export const compareFilesTool: ToolRequest = {
   id: COMPARE_FILES_FUNCTION_ID,

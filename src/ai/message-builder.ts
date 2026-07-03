@@ -1,10 +1,4 @@
-// =============================================================================
-//  message-builder.ts — Converts legacy ChatMessage[] to LanguageModelMessage[]
-//
-//  Used by the GeminiService shim to bridge the old provider interface
-//  with the new SNS IDE standard message types.
-//  Will be removed when all callers use UserRequest directly.
-// =============================================================================
+
 
 import { LanguageModelMessage, TextMessage, ToolUseMessage, ToolResultMessage } from '../types/language-model.js';
 import { ChatMessage } from './provider.js';
@@ -32,7 +26,7 @@ export function buildMessages(
       if (m.toolCalls && m.toolCalls.length > 0) {
         for (const tc of m.toolCalls) {
           let parsedArgs: unknown = {};
-          try { parsedArgs = JSON.parse(tc.function?.arguments || '{}'); } catch { /* ignore */ }
+          try { parsedArgs = JSON.parse(tc.function?.arguments || '{}'); } catch {  }
           messages.push({
             actor: 'ai',
             type: 'tool_use',

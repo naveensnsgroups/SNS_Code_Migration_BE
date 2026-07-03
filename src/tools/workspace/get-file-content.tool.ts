@@ -1,7 +1,4 @@
-// =============================================================================
-//  tools/workspace/get-file-content.tool.ts
-//  Mirrors: FileContentFunction (snside workspace-functions.ts)
-// =============================================================================
+
 
 import fs from 'fs-extra';
 import path from 'path';
