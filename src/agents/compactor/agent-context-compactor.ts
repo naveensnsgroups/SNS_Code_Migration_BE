@@ -58,6 +58,16 @@ export function compactMessagesIfNeeded(
     tailChars += c;
   }
 
+  // Never let the retained tail BEGIN with an orphaned tool_result: the char cut
+  // can land between a tool_use and its tool_result, and every provider rejects a
+  // tool_result whose matching tool_use is missing (Anthropic/Gemini/Mistral all
+  // 400 on this). Drop leading tool_result messages until the tail starts clean
+  // (on a text or tool_use message). This is now load-bearing: after the Phase 5
+  // loop centralization the executor runs more turns, so compaction fires more.
+  while (tail.length > 0 && tail[0].type === 'tool_result') {
+    tail.shift();
+  }
+
   const before = messages.length;
   messages.splice(0, messages.length, ...head, ...tail);
 

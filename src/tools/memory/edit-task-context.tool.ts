@@ -28,7 +28,19 @@ export const editTaskContextTool: ToolRequest = {
     required: ['updates']
   },
   handler: async (arg_string: string, ctx?: ToolContext) => {
-    const args: { updates: Record<string, unknown> } = JSON.parse(arg_string || '{}');
+    let args: { updates?: Record<string, unknown> };
+    try {
+      args = JSON.parse(arg_string || '{}');
+    } catch {
+      return makeToolErrorResult(
+        'edit_task_context: invalid JSON arguments. Re-send the call with a valid JSON object: { "updates": { "KEY": value } }.'
+      );
+    }
+    if (!args.updates || typeof args.updates !== 'object' || Array.isArray(args.updates)) {
+      return makeToolErrorResult(
+        'edit_task_context: missing required "updates" object. Example: { "updates": { "LAST_FILE_ANALYZED": "src/app.ts" } }.'
+      );
+    }
     await TaskContextManager.updateContext(ctx!.sessionId, args.updates);
     return makeToolTextResult(JSON.stringify({ success: true, keysUpdated: Object.keys(args.updates) }));
   }

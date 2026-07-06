@@ -8,6 +8,7 @@ import { ToolContext } from '../../types/tool.js';
 import { makeToolTextResult, makeToolErrorResult } from '../../types/language-model.js';
 
 import { FILE_CONTENT_FUNCTION_ID } from '../../common/workspace-functions.js';
+import { parseToolArgs } from '../tool-args.js';
 
 export const getFileContentTool: ToolRequest = {
   id: FILE_CONTENT_FUNCTION_ID,
@@ -39,20 +40,22 @@ export const getFileContentTool: ToolRequest = {
     required: ['file']
   },
   handler: async (arg_string: string, ctx?: ToolContext) => {
-    const args: { file: string; offset?: number; limit?: number } = JSON.parse(arg_string || '{}');
+    const parsed = parseToolArgs<{ file: string; offset?: number; limit?: number }>(arg_string, 'getFileContent');
+    if (!parsed.ok) return parsed.error;
+    const args = parsed.value;
     if (!args.file) {
-      return makeToolTextResult(JSON.stringify({ error: 'Missing required parameter: file' }));
+      return makeToolErrorResult('getFileContent: missing required parameter "file".');
     }
     const targetPath = path.resolve(ctx!.legacyPath, args.file);
     if (!targetPath.startsWith(path.resolve(ctx!.legacyPath))) {
-      return makeToolTextResult(JSON.stringify({ error: 'Access denied: path is outside the workspace.' }));
+      return makeToolErrorResult('getFileContent: access denied — path is outside the workspace.');
     }
     if (!(await fs.pathExists(targetPath))) {
-      return makeToolTextResult(JSON.stringify({ error: `File does not exist: ${args.file}` }));
+      return makeToolErrorResult(`getFileContent: file does not exist: ${args.file}`);
     }
     const stats = await fs.stat(targetPath);
     if (stats.isDirectory()) {
-      return makeToolTextResult(JSON.stringify({ error: `${args.file} is a directory. Use getWorkspaceFileList to view its contents.` }));
+      return makeToolErrorResult(`getFileContent: "${args.file}" is a directory. Use getWorkspaceFileList to view its contents.`);
     }
     const content = await fs.readFile(targetPath, 'utf-8');
     if (args.offset !== undefined || args.limit !== undefined) {

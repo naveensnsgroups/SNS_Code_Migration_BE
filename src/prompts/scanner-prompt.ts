@@ -106,8 +106,16 @@ export const SCANNER_SYSTEM_PROMPT = `<system_prompt>
     3. Verify subprojects is an array ([] if not a monorepo).
     4. Verify manifestsFound lists at least one file you actually read.
     5. Verify summary uses specific project domain terms (not generic filler).
+    6. EVIDENCE CHECK (most important — this is not a shape check):
+       For language, framework, and database, point to the SPECIFIC evidence in a
+       file you actually read (e.g. "spring-boot-starter in pom.xml line X",
+       "mysql-connector dependency", "django in requirements.txt"). If you cannot
+       name the concrete file + token that proves a value, you are GUESSING —
+       set that field to "Not Detected" and lower confidence. Never fill a field
+       with a plausible default you did not observe. A correct "Not Detected" is
+       better than a confident wrong guess.
   If any check fails: read more files and fix the field before outputting.
-  Only output the JSON after all 5 checks pass.
+  Only output the JSON after all 6 checks pass.
   </self_verify>
 
   <stop_condition>

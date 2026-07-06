@@ -85,13 +85,19 @@ Action sequence — count each graph (one tool call per graph):
   read-knowledge-graph("imports")     → count top-level keys excluding "_sources" → TOTAL_IMPORT_FILES
 
 Gap-detection self-verify (MANDATORY before saving):
-  Thought: Cross-check counts against Phase 2 signals:
-  - If TOTAL_DATA_ENTITIES = 0 but entity-graph had keys: note as DATA_GAP_ENTITY=true
-  - If TOTAL_API_ENDPOINTS = 0 but api-graph had keys:    note as DATA_GAP_API=true
-  - If TOTAL_CALLABLE_UNITS = 0 but symbol-graph had keys: note as DATA_GAP_SYMBOL=true
-  Include any DATA_GAP flags in the edit_task_context call so section writers can surface them.
+  Thought: A "gap" = the graph FILE was created by Phase 2 (read-knowledge-graph
+  returned exists:true) but it holds ZERO real entries. That is an independent
+  signal — the file existing proves Phase 2 touched it, so 0 entries means data
+  was lost, not that the project genuinely has none. (Do NOT compare a count to
+  itself — that can never detect anything.)
+  - entity-graph  exists:true AND TOTAL_DATA_ENTITIES = 0  → DATA_GAP_ENTITY = true
+  - api-graph     exists:true AND TOTAL_API_ENDPOINTS = 0  → DATA_GAP_API    = true
+  - symbol-graph  exists:true AND TOTAL_CALLABLE_UNITS = 0 → DATA_GAP_SYMBOL  = true
+  Save any DATA_GAP_* flag that is true in the SAME edit_task_context call below,
+  so the section writer can surface the gap in the affected section.
 
-Action: Save ALL counters + PHASE1_GRAPH_COMPLETE=true via edit_task_context in ONE call:
+Action: Save ALL counters + any DATA_GAP flags + PHASE1_GRAPH_COMPLETE=true via
+edit_task_context in ONE call (include only the DATA_GAP_* flags that are true):
 {
   TOTAL_DATA_ENTITIES:   N,
   TOTAL_CALLABLE_UNITS:  N,
@@ -102,6 +108,9 @@ Action: Save ALL counters + PHASE1_GRAPH_COMPLETE=true via edit_task_context in 
   TOTAL_INTEGRATIONS:    N,
   TOTAL_JOBS:            N,
   TOTAL_IMPORT_FILES:    N,
+  DATA_GAP_ENTITY:       true,   // include ONLY if the gap condition above held
+  DATA_GAP_API:          true,   // include ONLY if the gap condition above held
+  DATA_GAP_SYMBOL:       true,   // include ONLY if the gap condition above held
   PHASE1_GRAPH_COMPLETE: true
 }
 
@@ -139,9 +148,9 @@ ReAct loop:
       Self-verify: if all graphs are empty, write synthesized_overview with a resolver warning.
       Then: append-to-knowledge-graph("architecture") with synthesized_overview.
 
-  C2: Count each of the 8 graphs (one read per graph).
-      Gap-detect: if count=0 but graph had keys, add DATA_GAP flag.
-      Then: save ALL counters + PHASE1_GRAPH_COMPLETE=true in ONE edit_task_context call.
+  C2: Count each of the 9 graphs (entity, symbol, api, rule, db, event, integration, job, imports) — one read per graph.
+      Gap-detect: if a graph returns exists:true but 0 real entries, add its DATA_GAP flag.
+      Then: save ALL counters + any DATA_GAP flags + PHASE1_GRAPH_COMPLETE=true in ONE edit_task_context call.
       Retry ONCE if the save fails.
 
 C2 MUST run even if any graph is empty — a count of 0 is valid and expected.
@@ -160,6 +169,8 @@ graph and save the counters to task context.
 <step id="D1" name="count_all_graphs">
 For each graph below, call read-knowledge-graph, then count all top-level keys
 EXCEPT the "_sources" key. A count of 0 is valid — do NOT skip.
+This recovery MUST save the SAME complete set of counters Pass C saves — all 9,
+including imports. Dropping any counter here re-creates the gap Pass D exists to fix.
 
   Graph name   | Counter key to save
   entity       | TOTAL_DATA_ENTITIES
@@ -170,13 +181,18 @@ EXCEPT the "_sources" key. A count of 0 is valid — do NOT skip.
   event        | TOTAL_EVENTS
   integration  | TOTAL_INTEGRATIONS
   job          | TOTAL_JOBS
+  imports      | TOTAL_IMPORT_FILES
 
 For each graph: count only REAL entries (exclude keys whose value is empty {} or []).
 
-After reading all 8 graphs: save ALL 8 counters + PHASE1_GRAPH_COMPLETE=true in
-ONE single call to edit_task_context.
+Gap-detection (same rule as Pass C): if read-knowledge-graph returns exists:true
+for entity/api/symbol but its real entry count is 0, also save the matching flag —
+DATA_GAP_ENTITY / DATA_GAP_API / DATA_GAP_SYMBOL = true.
 
-Output: "Pass D complete. Entities:[N] | Functions:[N] | Endpoints:[N] | Rules:[N] | Tables:[N]"
+After reading all 9 graphs: save ALL 9 counters + any DATA_GAP flags +
+PHASE1_GRAPH_COMPLETE=true in ONE single call to edit_task_context.
+
+Output: "Pass D complete. Entities:[N] | Functions:[N] | Endpoints:[N] | Rules:[N] | Tables:[N] | Import-tracked:[N]"
 </step>
 
 </steps>
@@ -198,7 +214,8 @@ export function buildGraphPassDUserPrompt(
   return `${buildLanguageHint(language, framework)}Recovery pass: count all knowledge graph entries and save G5 counters for: "${legacyPath}"
 
 Pass C did not complete successfully — G5 counters are missing from task context.
-Execute D1: read all 8 graphs, count real entries, save all 8 counters + PHASE1_GRAPH_COMPLETE=true.
+Execute D1: read all 9 graphs (including imports), count real entries, save all 9
+counters + any DATA_GAP flags + PHASE1_GRAPH_COMPLETE=true.
 Use one edit_task_context call to save all counters at once.
 Stop after D1 completes.`;
 }

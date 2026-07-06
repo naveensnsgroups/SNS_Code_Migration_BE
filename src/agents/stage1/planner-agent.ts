@@ -12,7 +12,7 @@ import {
   DISCOVERY_AGENT,
   GRAPH_RESOLVER_AGENT,
   SECTION_WRITER_AGENT,
-  STAGE1_PLANNER_AGENT,
+  ANALYSIS_AGENT,
 } from '../core/agent-definitions.js';
 import {
   DISCOVERY_SYSTEM_PROMPT,
@@ -269,8 +269,13 @@ function resolveFileIndexFromContext(ctx: Record<string, unknown>): { key: strin
   return { key: indirectKey ?? 'file_index', entries: [] };
 }
 
+// Sentinel return value: the pipeline observed a user Stop/Pause request at a
+// checkpoint and halted. Session status has already been updated by the caller's
+// cancellation callback; active_phase remains saved so the run can resume.
+export const STAGE1_ABORTED = 'STAGE1_ABORTED';
+
 export class PlannerAgent {
-  
+
   static async run(
     sessionId:       string,
     legacyPath:      string,
@@ -280,9 +285,21 @@ export class PlannerAgent {
     _aiServiceLegacy: unknown,
     onLog?:      (message: string, level?: 'info' | 'success' | 'error' | 'warning') => void,
     onProgress?: (percent: number, currentFile?: string) => void,
-    onPhase?:    (phaseId: string, status: 'active' | 'done' | 'error') => Promise<void>
+    onPhase?:    (phaseId: string, status: 'active' | 'done' | 'error') => Promise<void>,
+    shouldAbort?: () => Promise<boolean>
   ): Promise<string> {
     onLog?.('[PlannerAgent] Stage 1: Starting codebase analysis...', 'info');
+
+    // Cancellation checkpoint used at phase boundaries, between analysis passes,
+    // and between section batches. active_phase is already persisted at each of
+    // these points, so halting here is always cleanly resumable.
+    const abortRequested = async (): Promise<boolean> => {
+      try {
+        return (await shouldAbort?.()) === true;
+      } catch {
+        return false;
+      }
+    };
 
     
     const session        = await SessionManager.getSession(sessionId);
@@ -308,7 +325,10 @@ export class PlannerAgent {
       toolRegistry.getFunctions(...def.functions).filter(t => toolsConfig[t.name] !== false);
 
     const discoveryTools = filter(DISCOVERY_AGENT);
-    const analysisTools  = filter(STAGE1_PLANNER_AGENT);  
+    // Analysis phase uses the dedicated ANALYSIS_AGENT's tool set (read/extract/
+    // graph tools only). This deliberately excludes shell + directory-browsing,
+    // which the FILE_ANALYSIS_SYSTEM_PROMPT explicitly forbids anyway.
+    const analysisTools  = filter(ANALYSIS_AGENT);
     const graphTools     = filter(GRAPH_RESOLVER_AGENT);
     const sectionTools   = filter(SECTION_WRITER_AGENT);
 
@@ -328,6 +348,7 @@ export class PlannerAgent {
     
     
     if (activePhase === 'discovery') {
+      if (await abortRequested()) return STAGE1_ABORTED;
       onLog?.('[PlannerAgent] Stage 1/5: Workspace Discovery...', 'info');
       await onPhase?.('discovery', 'active');
 
@@ -443,135 +464,7 @@ export class PlannerAgent {
       
       
       // ── FILE_INDEX normalization: merge all key variants → canonical "file-index" ─────────────
-      try {
-        const staleCtx = await TaskContextManager.getContext(sessionId);
-
-        // Collect every possible key the LLM may have used
-        const CANDIDATE_KEYS = ['file-index', 'file_index', 'FILE_INDEX', 'fileIndex'] as const;
-        const foundArrays = new Map<string, any[]>();
-        for (const key of CANDIDATE_KEYS) {
-          const val = staleCtx[key];
-          if (Array.isArray(val) && val.length > 0) {
-            foundArrays.set(key, val as any[]);
-          }
-        }
-
-        if (foundArrays.size > 0) {
-          // Flatten all entries from all found keys
-          const allEntries: any[] = Array.from(foundArrays.values()).flat();
-
-          // ── Deduplicate by path ─────────────────────────────────────────────
-          // Strategy: for the same logical file, keep the entry with:
-          //   1. DONE status (over PENDING)
-          //   2. Longer/more complete path (fix truncated path bug)
-          const byPath = new Map<string, any>();
-          for (const entry of allEntries) {
-            const entryPath: string | undefined = entry?.path;
-            if (!entryPath || typeof entryPath !== 'string') continue;
-
-            const existing = byPath.get(entryPath);
-            if (!existing) {
-              byPath.set(entryPath, entry);
-            } else {
-              // Prefer DONE over PENDING
-              const existingDone = existing.read_status === 'DONE';
-              const entryDone    = entry.read_status    === 'DONE';
-              if (!existingDone && entryDone) {
-                byPath.set(entryPath, entry);
-              }
-            }
-          }
-
-          // ── Cross-key reconciliation: same basename, different paths ────────
-          // Handles the truncated-path bug where file_index used shortened paths
-          // and file-index used the full correct paths.
-          // Prefer DONE status from any key for files with matching basenames.
-          if (foundArrays.size > 1) {
-            const allPaths = Array.from(byPath.keys());
-            for (const p of allPaths) {
-              const basename = path.basename(p);
-              // Find any other entry with the same basename but different path
-              for (const [otherPath, otherEntry] of byPath) {
-                if (otherPath !== p && path.basename(otherPath) === basename) {
-                  // Two entries resolve to the same file — keep longer (fuller) path with DONE priority
-                  const current = byPath.get(p)!;
-                  const keepLonger  = p.length >= otherPath.length;
-                  const keepPath    = keepLonger ? p : otherPath;
-                  const dropPath    = keepLonger ? otherPath : p;
-                  const keepEntry   = keepLonger ? current : otherEntry;
-                  const dropEntry   = keepLonger ? otherEntry : current;
-                  // If the shorter path has DONE and longer is PENDING, merge status
-                  const mergedStatus =
-                    dropEntry.read_status === 'DONE' || keepEntry.read_status === 'DONE'
-                      ? 'DONE'
-                      : 'PENDING';
-                  byPath.set(keepPath, { ...keepEntry, read_status: mergedStatus });
-                  byPath.delete(dropPath);
-                  break;
-                }
-              }
-            }
-          }
-
-          const merged: any[] = Array.from(byPath.values());
-
-          // ── Path validation: detect suspicious/truncated paths ─────────────
-          let pathErrorCount = 0;
-          const validatedMerged = await Promise.all(
-            merged.map(async (entry: any) => {
-              if (!entry?.path) return entry;
-              const abs = path.join(legacyPath, entry.path);
-              try {
-                const exists = await fs.pathExists(abs);
-                if (!exists) {
-                  pathErrorCount++;
-                  return { ...entry, read_status: 'PATH_ERROR' };
-                }
-              } catch { /* fs errors treated as non-blocking */ }
-              return entry;
-            })
-          );
-
-          if (pathErrorCount > 0) {
-            onLog?.(
-              `[PlannerAgent] ⚠️ FILE_INDEX path validation: ${pathErrorCount} entries point to ` +
-              `non-existent files (marked PATH_ERROR). This is usually caused by the Discovery Agent ` +
-              `writing truncated paths. These files will be skipped in Phase 2.`,
-              'warning'
-            );
-          }
-
-          // ── Compute accurate source file count ────────────────────────────
-          const totalSourceFiles = validatedMerged.filter(
-            (e: any) => e?.type === 'source' && e?.read_status !== 'PATH_ERROR'
-          ).length;
-
-          // ── Save canonical index + clear all alternate keys ───────────────
-          const patch: Record<string, any> = {
-            'file-index':         validatedMerged,
-            'FILE_INDEX_KEY':     'file-index',
-            'TOTAL_SOURCE_FILES': totalSourceFiles,
-          };
-          for (const key of foundArrays.keys()) {
-            if (key !== 'file-index') patch[key] = null; // purge alternate keys
-          }
-          await TaskContextManager.updateContext(sessionId, patch);
-
-          const keyNames = [...foundArrays.keys()].join(', ');
-          onLog?.(
-            `[PlannerAgent] FILE_INDEX normalized: merged ${allEntries.length} raw entries ` +
-            `from [${keyNames}] → ${validatedMerged.length} unique entries in "file-index". ` +
-            `Source files: ${totalSourceFiles}. Path errors: ${pathErrorCount}.`,
-            'info'
-          );
-        }
-
-      } catch (normErr: any) {
-        onLog?.(
-          `[PlannerAgent] FILE_INDEX normalization warning: ${normErr?.message ?? String(normErr)}. Continuing.`,
-          'warning'
-        );
-      }
+      await PlannerAgent.normalizeFileIndexKeys(sessionId, legacyPath, onLog);
 
       await onPhase?.('file-analysis', 'active');
       await TaskContextManager.updateContext(sessionId, { active_phase: 'analysis' });
@@ -590,6 +483,7 @@ export class PlannerAgent {
     
     
     if (activePhase === 'analysis') {
+      if (await abortRequested()) return STAGE1_ABORTED;
       taskCtx = await TaskContextManager.getContext(sessionId);
       const totalFiles = (taskCtx.TOTAL_FILES as number) || 0;
       onLog?.(`[PlannerAgent] Stage 2/5: File Analysis (${totalFiles} files)...`, 'info');
@@ -636,7 +530,10 @@ export class PlannerAgent {
       const MAX_STALLS = 4;   
 
       while (true) {
-        
+        // User Stop/Pause between passes: progress is already checkpointed
+        // (LAST_FILE_ANALYZED + read_status per file), so halt cleanly here.
+        if (await abortRequested()) return STAGE1_ABORTED;
+
         taskCtx = await TaskContextManager.getContext(sessionId);
         const { key: fileIndexKey, entries: fileIndex } = resolveFileIndexFromContext(taskCtx as Record<string, unknown>);
         const pending   = fileIndex.filter((f: any) => f?.read_status !== 'DONE');
@@ -706,6 +603,11 @@ export class PlannerAgent {
 
         
         let passError: Error | null = null;
+        // Per-pass turn cap: bound the ReAct loop for one analysis pass so it
+        // cannot spin for dozens of turns and exhaust a rate-limited token budget.
+        // Allow a generous multiple of the file batch (read + graph writes + a
+        // checkpoint per file), plus headroom, but never unbounded.
+        const passMaxIterations = Math.max(12, batchSize * 6 + 8);
         const passResults = await runWithConcurrencyLimit(
           [() =>
             withPhaseTimeout(
@@ -717,14 +619,15 @@ export class PlannerAgent {
                   detectedStack.language, detectedStack.framework
                 ),
                 analysisTools, context, resolvedModel,
-                `analysis-agent-pass${passNumber}`
+                `analysis-agent-pass${passNumber}`,
+                passMaxIterations
               ),
               PHASE_TIMEOUT_MS.analysisPass,
               `analysis-pass-${passNumber}`,
               onLog
             )
           ],
-          1   
+          1
         );
 
         
@@ -748,6 +651,11 @@ export class PlannerAgent {
         }
 
         await PlannerAgent.cleanupAnalysisKeys(sessionId);
+
+        // Re-normalize FILE_INDEX keys after every pass: if the LLM saved its
+        // progress under an alternate key variant during this pass, merge it back
+        // into canonical "file-index" now instead of orphaning it until a re-run.
+        await PlannerAgent.normalizeFileIndexKeys(sessionId, legacyPath, onLog);
 
         
         
@@ -815,27 +723,32 @@ export class PlannerAgent {
     
     
     if (activePhase === 'graph-resolution') {
+      if (await abortRequested()) return STAGE1_ABORTED;
       await onPhase?.('graph-resolution', 'active');
       onLog?.('[PlannerAgent] Stage 3/5: Graph Resolution (TypeScript + Architecture Synthesis)...', 'info');
 
-      
-      const preGraphCtx        = await TaskContextManager.getContext(sessionId);
-      const totalUnitsCheck    = (preGraphCtx.TOTAL_CALLABLE_UNITS as number) ?? 0;
-      const totalEntitiesCheck = (preGraphCtx.TOTAL_DATA_ENTITIES  as number) ?? 0;
-      const totalEndptsCheck   = (preGraphCtx.TOTAL_API_ENDPOINTS  as number) ?? 0;
-      const graphsAreEmpty     = totalUnitsCheck === 0
-                              && totalEntitiesCheck === 0
-                              && totalEndptsCheck === 0;
+      // Gate on the actual Phase-2 graph files on disk. The TOTAL_* counters must NOT
+      // be used here: they are only computed later by Pass C/D below, so reading them
+      // at this point always yields 0/undefined on a first run and falsely triggers
+      // the gate (which then wrongly skips the 3A/3B TypeScript resolvers).
+      const graphsAreEmpty = await PlannerAgent.arePrimaryGraphsEmpty(modernPath);
 
       if (graphsAreEmpty) {
         onLog?.(
-          '[PlannerAgent] ⚠️ Graph quality gate: all 3 primary graphs are empty. ' +
-          'TypeScript resolvers will be no-ops. Pass C runs to save counters (all = 0).',
+          '[PlannerAgent] ⚠️ Graph quality gate: all 3 primary graphs (symbol/entity/api) ' +
+          'have no data on disk after Phase 2. TypeScript resolvers will be no-ops. ' +
+          'Pass C runs to save counters (all = 0).',
           'warning'
         );
         await TaskContextManager.updateContext(sessionId, {
           GRAPH_QUALITY_GATE_TRIGGERED: true,
-          GRAPH_QUALITY_GATE_REASON: 'All 3 primary graphs empty after Phase 2',
+          GRAPH_QUALITY_GATE_REASON: 'All 3 primary graph files (symbol/entity/api) empty or missing on disk after Phase 2',
+        });
+      } else {
+        // Clear any stale gate flag left by a previous run of this session.
+        await TaskContextManager.updateContext(sessionId, {
+          GRAPH_QUALITY_GATE_TRIGGERED: false,
+          GRAPH_QUALITY_GATE_REASON: null,
         });
       }
 
@@ -977,6 +890,7 @@ export class PlannerAgent {
     
     
     if (activePhase === 'section-writing') {
+      if (await abortRequested()) return STAGE1_ABORTED;
       onLog?.('[PlannerAgent] Stage 4/5: Writing 26 sections...', 'info');
       await onPhase?.('section-writing', 'active');
 
@@ -1016,7 +930,10 @@ export class PlannerAgent {
       onLog?.(`[PlannerAgent] Section writer concurrency: ${maxConcurrent} parallel (model: ${resolvedModel || 'default'})`, 'info');
 
       for (const batch of batches) {
-        
+        // User Stop/Pause between batches: already-written sections are on disk
+        // and detected on resume, so halting here loses no work.
+        if (await abortRequested()) return STAGE1_ABORTED;
+
         const themeNames = [...new Set(batch.map(s => getSectionThemeName(s.n)))];
         const sectionNums = batch.map(s => s.n).join(', ');
         onLog?.(
@@ -1062,6 +979,7 @@ export class PlannerAgent {
     
     
     if (activePhase === 'assembly') {
+      if (await abortRequested()) return STAGE1_ABORTED;
       onLog?.('[PlannerAgent] Stage 5/5: Assembling Stage1_Analysis.md...', 'info');
       await onPhase?.('assembly', 'active');
 
@@ -1134,7 +1052,7 @@ export class PlannerAgent {
       if (!graphExists) {
         if (section.emptyGraphIsValid) {
           
-          await PlannerAgent.writeEmptySection(sectionFile, section, 'graph file not found — not applicable for this codebase');
+          await PlannerAgent.writeEmptySection(sectionFile, section, 'graph file not found — not applicable for this codebase', sessionId);
           await TaskContextManager.updateContext(sessionId, { [`SECTION_${section.n}_STATUS`]: 'skipped-empty-graph' });
           onLog?.(`[PlannerAgent] Section ${section.n}: ${section.graph}-graph not found — writing "not applicable" note.`, 'info');
           onSectionDone?.();
@@ -1152,7 +1070,7 @@ export class PlannerAgent {
           const isEmpty = PlannerAgent.isGraphEmpty(graphData);
           if (isEmpty && section.emptyGraphIsValid) {
             
-            await PlannerAgent.writeEmptySection(sectionFile, section, `${section.graph} graph contains no entries — not applicable for this codebase`);
+            await PlannerAgent.writeEmptySection(sectionFile, section, `${section.graph} graph contains no entries — not applicable for this codebase`, sessionId);
             await TaskContextManager.updateContext(sessionId, { [`SECTION_${section.n}_STATUS`]: 'skipped-empty-graph' });
             onLog?.(`[PlannerAgent] Section ${section.n}: ${section.graph}-graph is empty — writing "not applicable" note (emptyGraphIsValid=true).`, 'info');
             onSectionDone?.();
@@ -1233,7 +1151,7 @@ export class PlannerAgent {
       onLog?.(`[PlannerAgent] Section ${section.n} fallback written from raw graph data.`, 'warning');
     } else {
       
-      await PlannerAgent.writeEmptySection(sectionFile, section, `LLM failed after 2 attempts — ${retryReason}`);
+      await PlannerAgent.writeEmptySection(sectionFile, section, `LLM failed after 2 attempts — ${retryReason}`, sessionId);
       onLog?.(`[PlannerAgent] Section ${section.n}: could not write from raw data. Informational note written.`, 'warning');
     }
 
@@ -1264,24 +1182,62 @@ export class PlannerAgent {
 
   
 
+  // Maps a section's source graph name to the DATA_GAP_* flag Pass C/D save when
+  // that graph exists but holds zero real entries (see graph-resolution-prompt.ts).
+  // Only entity/api/symbol are covered — those are the three graphs Pass C checks.
+  private static readonly DATA_GAP_KEY_BY_GRAPH: Record<string, string> = {
+    entity: 'DATA_GAP_ENTITY',
+    api:    'DATA_GAP_API',
+    symbol: 'DATA_GAP_SYMBOL',
+  };
+
   private static async writeEmptySection(
-    filePath: string,
-    section:  SectionConfig,
-    reason:   string
+    filePath:  string,
+    section:   SectionConfig,
+    reason:    string,
+    sessionId?: string
   ): Promise<void> {
     await fs.ensureDir(path.dirname(filePath));
-    const content = [
-      `## ${section.n}. ${section.name}`,
-      '',
-      `> ℹ️ Not applicable for this codebase.`,
-      `> Reason: ${reason}`,
-      '',
-      `This section covers ${section.name.toLowerCase()}, which was not detected in this project.`,
-      section.graph
-        ? `The \`${section.graph}\` knowledge graph contained no entries.`
-        : 'No relevant data was found in the task context.',
-      '',
-    ].join('\n');
+
+    // Check whether graph resolution flagged this section's graph as a confirmed
+    // DATA GAP (graph exists but is empty — data was lost, not genuinely absent).
+    // Without this check, the TypeScript fallback path silently overwrote that
+    // signal with a generic "not applicable" note and leaked internal details
+    // (byte-count/retry reasons) instead of telling the reader the truth.
+    let isConfirmedGap = false;
+    if (sessionId && section.graph && section.graph in PlannerAgent.DATA_GAP_KEY_BY_GRAPH) {
+      try {
+        const ctx = await TaskContextManager.getContext(sessionId);
+        isConfirmedGap = ctx[PlannerAgent.DATA_GAP_KEY_BY_GRAPH[section.graph]] === true;
+      } catch { /* non-blocking — fall through to the generic message */ }
+    }
+
+    const content = isConfirmedGap
+      ? [
+          `## ${section.n}. ${section.name}`,
+          '',
+          `> ⚠️ DATA GAP WARNING: the \`${section.graph}\` graph is empty, but graph resolution ` +
+            `recorded this codebase as having real entries for it. This indicates a Phase 2 ` +
+            `(File Analysis) coverage gap — this section is likely INCOMPLETE, not genuinely empty.`,
+          `> Re-run the analysis phase to recover this data.`,
+          '',
+          `This section covers ${section.name.toLowerCase()}. It could not be written from ` +
+            `available data due to the gap above.`,
+          '',
+        ].join('\n')
+      : [
+          `## ${section.n}. ${section.name}`,
+          '',
+          `> ℹ️ Not applicable for this codebase.`,
+          `> Reason: ${reason}`,
+          '',
+          `This section covers ${section.name.toLowerCase()}, which was not detected in this project.`,
+          section.graph
+            ? `The \`${section.graph}\` knowledge graph contained no entries.`
+            : 'No relevant data was found in the task context.',
+          '',
+        ].join('\n');
+
     await fs.writeFile(filePath, content, 'utf-8');
   }
 
@@ -1315,6 +1271,10 @@ export class PlannerAgent {
       ];
 
       for (const [key, value] of Object.entries(graphData)) {
+        // "_sources" is internal dedup bookkeeping (which files wrote to this
+        // graph) — not domain content. Rendering it produced a fake "### _sources"
+        // entry that looked like a real function/table in the report.
+        if (key === '_sources') continue;
         if (value === null || value === undefined) continue;
         lines.push(`### ${key}`);
         lines.push('');
@@ -1341,6 +1301,26 @@ export class PlannerAgent {
   }
 
   
+
+  // Checks the three primary Phase-2 graphs (symbol/entity/api) directly on disk.
+  // Used by the graph quality gate instead of the TOTAL_* counters, which do not
+  // exist until Pass C/D runs.
+  private static async arePrimaryGraphsEmpty(modernPath: string): Promise<boolean> {
+    const graphsDir = path.join(modernPath, '_analysis');
+    for (const name of ['symbol', 'entity', 'api']) {
+      try {
+        const raw  = await fs.readFile(path.join(graphsDir, `${name}-graph.json`), 'utf-8');
+        const data = JSON.parse(raw) as Record<string, unknown>;
+        const domainData = Object.fromEntries(
+          Object.entries(data).filter(([k]) => k !== '_sources')
+        );
+        if (!PlannerAgent.isGraphEmpty(domainData)) return false;
+      } catch {
+        // missing or unreadable file counts as empty
+      }
+    }
+    return true;
+  }
 
   private static isGraphEmpty(graphData: unknown): boolean {
     if (!graphData || typeof graphData !== 'object') return true;
@@ -1409,6 +1389,165 @@ export class PlannerAgent {
   }
 
   
+  // Merges every FILE_INDEX key variant the LLM may have written ("file_index",
+  // "FILE_INDEX", "fileIndex", ...) into the single canonical "file-index" key,
+  // deduplicates by path (DONE wins over PENDING), validates paths on disk, and
+  // purges the alternate keys. Runs after discovery AND after every analysis pass,
+  // so a mis-keyed save-back mid-analysis can never permanently orphan progress.
+  static async normalizeFileIndexKeys(
+    sessionId:  string,
+    legacyPath: string,
+    onLog?:     LogFn
+  ): Promise<void> {
+    try {
+      const staleCtx = await TaskContextManager.getContext(sessionId);
+
+      // Collect every possible key the LLM may have used
+      const CANDIDATE_KEYS = ['file-index', 'file_index', 'FILE_INDEX', 'fileIndex'] as const;
+      const foundArrays = new Map<string, any[]>();
+      for (const key of CANDIDATE_KEYS) {
+        const val = staleCtx[key];
+        if (Array.isArray(val) && val.length > 0) {
+          foundArrays.set(key, val as any[]);
+        }
+      }
+
+      if (foundArrays.size === 0) return;
+
+      // Fast path: only the canonical key exists — nothing to merge or purge.
+      if (foundArrays.size === 1 && foundArrays.has('file-index')) {
+        if (staleCtx['FILE_INDEX_KEY'] !== 'file-index') {
+          await TaskContextManager.updateContext(sessionId, { FILE_INDEX_KEY: 'file-index' });
+        }
+        return;
+      }
+
+      // Flatten all entries from all found keys
+      const allEntries: any[] = Array.from(foundArrays.values()).flat();
+
+      // ── Deduplicate by path ─────────────────────────────────────────────
+      // Strategy: for the same logical file, keep the entry with:
+      //   1. DONE status (over PENDING)
+      //   2. Longer/more complete path (fix truncated path bug)
+      const byPath = new Map<string, any>();
+      for (const entry of allEntries) {
+        const entryPath: string | undefined = entry?.path;
+        if (!entryPath || typeof entryPath !== 'string') continue;
+
+        const existing = byPath.get(entryPath);
+        if (!existing) {
+          byPath.set(entryPath, entry);
+        } else {
+          // Prefer DONE over PENDING
+          const existingDone = existing.read_status === 'DONE';
+          const entryDone    = entry.read_status    === 'DONE';
+          if (!existingDone && entryDone) {
+            byPath.set(entryPath, entry);
+          }
+        }
+      }
+
+      // ── Cross-key reconciliation: same basename, different paths ────────
+      // Handles the truncated-path bug where file_index used shortened paths
+      // and file-index used the full correct paths.
+      // Prefer DONE status from any key for files with matching basenames.
+      if (foundArrays.size > 1) {
+        const allPaths = Array.from(byPath.keys());
+        for (const p of allPaths) {
+          const basename = path.basename(p);
+          // Find any other entry with the same basename but different path
+          for (const [otherPath, otherEntry] of byPath) {
+            if (otherPath !== p && path.basename(otherPath) === basename) {
+              // Two entries resolve to the same file — keep longer (fuller) path with DONE priority
+              const current = byPath.get(p)!;
+              const keepLonger  = p.length >= otherPath.length;
+              const keepPath    = keepLonger ? p : otherPath;
+              const dropPath    = keepLonger ? otherPath : p;
+              const keepEntry   = keepLonger ? current : otherEntry;
+              const dropEntry   = keepLonger ? otherEntry : current;
+              // If the shorter path has DONE and longer is PENDING, merge status
+              const mergedStatus =
+                dropEntry.read_status === 'DONE' || keepEntry.read_status === 'DONE'
+                  ? 'DONE'
+                  : 'PENDING';
+              byPath.set(keepPath, { ...keepEntry, read_status: mergedStatus });
+              byPath.delete(dropPath);
+              break;
+            }
+          }
+        }
+      }
+
+      const merged: any[] = Array.from(byPath.values());
+
+      // ── Path validation: detect suspicious/truncated paths ─────────────
+      let pathErrorCount = 0;
+      const validatedMerged = await Promise.all(
+        merged.map(async (entry: any) => {
+          if (!entry?.path) return entry;
+          const abs = path.join(legacyPath, entry.path);
+          try {
+            const exists = await fs.pathExists(abs);
+            if (!exists) {
+              pathErrorCount++;
+              return { ...entry, read_status: 'PATH_ERROR' };
+            }
+          } catch { /* fs errors treated as non-blocking */ }
+          return entry;
+        })
+      );
+
+      if (pathErrorCount > 0) {
+        onLog?.(
+          `[PlannerAgent] ⚠️ FILE_INDEX path validation: ${pathErrorCount} entries point to ` +
+          `non-existent files (marked PATH_ERROR). This is usually caused by the Discovery Agent ` +
+          `writing truncated paths. These files will be skipped in Phase 2.`,
+          'warning'
+        );
+      }
+
+      // ── Compute accurate source file count ────────────────────────────
+      const totalSourceFiles = validatedMerged.filter(
+        (e: any) => e?.type === 'source' && e?.read_status !== 'PATH_ERROR'
+      ).length;
+
+      // ── Compute total estimated lines ONCE, deterministically ─────────
+      // Section 1 and Section 4 are separate isolated LLM calls; each summing
+      // estimatedLines itself let their totals silently disagree (arithmetic is
+      // not something to delegate to an LLM). Compute it here and have both
+      // sections read this fixed counter instead of re-summing it themselves.
+      const totalEstimatedLines = validatedMerged.reduce(
+        (sum: number, e: any) => sum + (typeof e?.estimatedLines === 'number' ? e.estimatedLines : 0),
+        0
+      );
+
+      // ── Save canonical index + clear all alternate keys ───────────────
+      const patch: Record<string, any> = {
+        'file-index':            validatedMerged,
+        'FILE_INDEX_KEY':        'file-index',
+        'TOTAL_SOURCE_FILES':    totalSourceFiles,
+        'TOTAL_ESTIMATED_LINES': totalEstimatedLines,
+      };
+      for (const key of foundArrays.keys()) {
+        if (key !== 'file-index') patch[key] = null; // purge alternate keys
+      }
+      await TaskContextManager.updateContext(sessionId, patch);
+
+      const keyNames = [...foundArrays.keys()].join(', ');
+      onLog?.(
+        `[PlannerAgent] FILE_INDEX normalized: merged ${allEntries.length} raw entries ` +
+        `from [${keyNames}] → ${validatedMerged.length} unique entries in "file-index". ` +
+        `Source files: ${totalSourceFiles}. Path errors: ${pathErrorCount}.`,
+        'info'
+      );
+    } catch (normErr: any) {
+      onLog?.(
+        `[PlannerAgent] FILE_INDEX normalization warning: ${normErr?.message ?? String(normErr)}. Continuing.`,
+        'warning'
+      );
+    }
+  }
+
   private static async cleanupAnalysisKeys(sessionId: string): Promise<void> {
     const ctx          = await TaskContextManager.getContext(sessionId);
     const analysisKeys = Object.keys(ctx).filter(k => k.startsWith('analysis:'));

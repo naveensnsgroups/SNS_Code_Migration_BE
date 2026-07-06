@@ -1,6 +1,7 @@
 
 
 import { DetectedStack, FileNode, MigrationStatus, TargetStack, TokenUsage } from '../types.js';
+import { ModelPricingConfig } from '../agents/compactor/agent-cost-estimator.js';
 
 export interface TokenUsageEntry {
   agentId: string;     
@@ -42,16 +43,23 @@ export interface MigrationSession {
     grok?: string;
     groq?: string;
     openrouter?: string;
+    mistral?: string;
     huggingface?: string;
   };
   agentsConfig?: any;
   
-  toolsConfig?: Record<string, boolean>;        
-  aliasesConfig?: Record<string, string>;        
-  promptFragments?: Record<string, string>;      
+  toolsConfig?: Record<string, boolean>;
+  aliasesConfig?: Record<string, string>;
+  promptFragments?: Record<string, string>;
+  /** User-supplied per-model $/1M-token rates — see agent-cost-estimator.ts for why
+   *  this is never a hardcoded table. Absent/unconfigured models price as null. */
+  modelPricing?: ModelPricingConfig;
   googleMaxRetries?: number;
   googleRetryDelayRateLimit?: number;
   googleRetryDelayOther?: number;
+  mistralMaxRetries?: number;
+  mistralRetryDelayRateLimit?: number;
+  mistralRetryDelayOther?: number;
   tokenUsage?: TokenUsage;                       
   tokenUsageHistory?: TokenUsageEntry[];          
 }

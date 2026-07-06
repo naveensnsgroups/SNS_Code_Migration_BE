@@ -24,11 +24,28 @@ export interface AgentLoopConfig {
   fingerprintWindow:   number;  
   fingerprintMaxDupes: number;  
 
-  
-  
-  
+
+
+
   noProgressMaxTurns: number;
+
+  // Max consecutive SUCCESSFUL bookkeeping-only tool calls (get/edit task context,
+  // todoWrite, dashboard) with no productive work (file read / graph write) in
+  // between, before the orchestrator nudges the agent to do real work or stop.
+  // Closes the blind spot where an agent spins on successful edit_task_context
+  // calls — invisible to the error-based and duplicate-based detectors.
+  bookkeepingStreakMax: number;
 }
+
+// Tools that only mutate/read pipeline state — they do NOT advance the analysis.
+// A run consisting only of these is spinning, not progressing.
+export const BOOKKEEPING_TOOL_NAMES: ReadonlySet<string> = new Set([
+  'get_task_context',
+  'edit_task_context',
+  'todoWrite',
+  'update-migration-dashboard',
+  'compress-migration-context',
+]);
 
 const FAMILY_LOOP_CONFIGS: Record<string, AgentLoopConfig> = {
 
@@ -43,6 +60,7 @@ const FAMILY_LOOP_CONFIGS: Record<string, AgentLoopConfig> = {
     fingerprintWindow:           6,
     fingerprintMaxDupes:         2,
     noProgressMaxTurns:          3,
+    bookkeepingStreakMax:      6,
   },
 
   
@@ -55,6 +73,7 @@ const FAMILY_LOOP_CONFIGS: Record<string, AgentLoopConfig> = {
     fingerprintWindow:           6,
     fingerprintMaxDupes:         2,
     noProgressMaxTurns:          3,
+    bookkeepingStreakMax:      6,
   },
 
   
@@ -68,6 +87,7 @@ const FAMILY_LOOP_CONFIGS: Record<string, AgentLoopConfig> = {
     fingerprintWindow:           4,
     fingerprintMaxDupes:         1, 
     noProgressMaxTurns:          2,
+    bookkeepingStreakMax:      6,
   },
 
   
@@ -80,6 +100,7 @@ const FAMILY_LOOP_CONFIGS: Record<string, AgentLoopConfig> = {
     fingerprintWindow:           6,
     fingerprintMaxDupes:         2,
     noProgressMaxTurns:          3,
+    bookkeepingStreakMax:      6,
   },
 
   
@@ -92,6 +113,7 @@ const FAMILY_LOOP_CONFIGS: Record<string, AgentLoopConfig> = {
     fingerprintWindow:           6,
     fingerprintMaxDupes:         2,
     noProgressMaxTurns:          3,
+    bookkeepingStreakMax:      6,
   },
 
   
@@ -106,6 +128,7 @@ const FAMILY_LOOP_CONFIGS: Record<string, AgentLoopConfig> = {
     fingerprintWindow:           6,
     fingerprintMaxDupes:         2,
     noProgressMaxTurns:          3,
+    bookkeepingStreakMax:      6,
   },
 
   
@@ -118,6 +141,7 @@ const FAMILY_LOOP_CONFIGS: Record<string, AgentLoopConfig> = {
     fingerprintWindow:           6,
     fingerprintMaxDupes:         2,
     noProgressMaxTurns:          3,
+    bookkeepingStreakMax:      6,
   },
 };
 
@@ -137,11 +161,12 @@ export type AgentLoopErrorType =
   | 'duplicate-blocked' 
   | 'config-error'      
   | 'tool-not-found'    
-  | 'stuck-tool'        
-  | 'reasoning-loop'    
-  | 'no-progress'       
-  | 'rate-limit'        
-  | 'unknown';          
+  | 'stuck-tool'
+  | 'reasoning-loop'
+  | 'no-progress'
+  | 'bookkeeping-loop'
+  | 'rate-limit'
+  | 'unknown';
 
 const ERROR_SIGNATURES: ReadonlyArray<[string, AgentLoopErrorType]> = [
   ['EMPTY DATA REJECTED',  'empty-data'],
@@ -167,16 +192,21 @@ export function classifyToolError(errorText: string): AgentLoopErrorType {
 }
 
 export interface LoopState {
-  
+
   toolCallFingerprints: string[];
-  
+
   noProgressTurns: number;
+
+  // Consecutive successful bookkeeping-only tool calls since the last productive
+  // (file-read / graph-write) action. Reset by any productive tool.
+  bookkeepingStreak: number;
 }
 
 export function createLoopState(): LoopState {
   return {
     toolCallFingerprints: [],
     noProgressTurns: 0,
+    bookkeepingStreak: 0,
   };
 }
 
@@ -193,6 +223,9 @@ export function resetStateForErrorType(state: LoopState, errorType: AgentLoopErr
     case 'no-progress':
       state.toolCallFingerprints = [];
       state.noProgressTurns      = 0;
+      break;
+    case 'bookkeeping-loop':
+      state.bookkeepingStreak = 0;
       break;
     case 'config-error':
       state.toolCallFingerprints = [];
@@ -254,6 +287,18 @@ export function buildRecoveryMessage(
         `${config.fingerprintMaxDupes} times. This action already completed. ` +
         `Do NOT repeat it. Move to the NEXT required action ` +
         `(next graph type or next file in FILE_INDEX).`
+      );
+
+    case 'bookkeeping-loop':
+      return (
+        `[ORCHESTRATOR INTERVENTION] You have made ${config.bookkeepingStreakMax} ` +
+        `state-only calls in a row (get_task_context / edit_task_context / todoWrite) ` +
+        `without any real analysis. You are spinning, not progressing — and wasting LLM calls. ` +
+        `Do ONE of these NOW: ` +
+        `(1) If a PENDING file remains: read it (getFileContent / batch-read-files) and ` +
+        `extract its data via append-to-knowledge-graph. ` +
+        `(2) If NO PENDING files remain in this batch: STOP — reply with a one-line summary ` +
+        `and DO NOT call any more tools. Do not re-save context that is already saved.`
       );
 
     case 'config-error':

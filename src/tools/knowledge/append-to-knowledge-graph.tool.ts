@@ -7,7 +7,8 @@ import { ToolRequest, ToolContext } from '../../types/tool.js';
 import { makeToolTextResult, makeToolErrorResult } from '../../types/language-model.js';
 import { APPEND_TO_KNOWLEDGE_GRAPH_FUNCTION_ID } from '../../common/workspace-functions.js';
 import { mergeGraphData, getValidGraphNames }    from './knowledge-graph-utils.js';
-import { writeJsonAtomic, readJsonWithRetry }    from '../../session/fileUtils.js';
+import { buildGraphShapeHintDoc }                from './graph-schemas.js';
+import { writeJsonAtomic, readJsonWithRetry, enqueueKeyedWrite } from '../../session/fileUtils.js';
 
 export const appendToKnowledgeGraphTool: ToolRequest = {
   id:           APPEND_TO_KNOWLEDGE_GRAPH_FUNCTION_ID,     
@@ -41,26 +42,9 @@ export const appendToKnowledgeGraphTool: ToolRequest = {
       data: {
         type: 'object',
         description:
-          'Data to merge into the graph. Shape must match the graph schema. ' +
-          'entity-graph: { "EntityName": { table, files:[...], fields:[...], relations:[...] } } ' +
-          'symbol-graph: { "funcName": { file, signature, isAsync, calledBy:[...], calls:[...] } } ' +
-          'rule-graph: { "domain": [{ rule, type, enforcement, violation, pseudocode:[...], relatedFiles:[...], migratable:bool }] } ' +
-          'api-graph: { "METHOD /path": { handler, auth, request:{}, responses:{}, middlewareChain:[...] } } ' +
-          'db-graph: { "tableName": { operations:[{ type, fields, condition, function, calledFrom:[...] }] } } ' +
-          'event-graph: { "event.name": { emittedIn, payload, listeners:[{ file, handler, does }] } } ' +
-          'config-graph: { "CONFIG_KEY": { type, required, default, purpose, usedIn:[...] } } ' +
-          'state-graph: { "EntityName": { field, modelFile, states:[...], transitions:[...] } } ' +
-          'middleware-graph: { globalPipeline:[{ order, name, file, purpose }], routeSpecific:{} } ' +
-          'security-graph: { authMechanism, tokenStrategy:{}, roles:{}, publicRoutes:[...] } ' +
-          'transform-graph: { "Name": { inputShape:{}, inputFile, outputShape:{}, outputFile } } ' +
-          'error-graph: { customErrors:{ "ErrorName": { extends, status, definedIn, thrownIn:[...] } } } ' +
-          'async-graph: { "funcName": { pattern, awaits:[...], parallelOps:[...] } } ' +
-          'test-graph: { framework, testFiles:{ "path": { covers, cases:[...], mocks:[...] } } } ' +
-          'integration-graph: { "Provider": { purpose, auth, calledFrom, operations:[...] } } ' +
-          'job-graph: { "Job Name": { schedule, scheduledIn, implementation, calls, type } } ' +
-          'call-flow-graph: { "Use Case": { steps:[...] } } ' +
-          'architecture-graph: { type, layers:[...], patterns:[...], modules:[...], entryPoint } ' +
-          'imports-graph: { "relative/path/file.ts": { imports:[...localPaths], importedBy:[...localPaths], externalPackages:[...packageNames] } }'
+          'Data to merge into the graph. Shape must match the graph schema (canonical shapes, ' +
+          'kept in sync with the analysis prompt\'s <graph_shapes>): ' +
+          buildGraphShapeHintDoc()
       },
       sourceFile: {
         type: 'string',
@@ -134,58 +118,59 @@ export const appendToKnowledgeGraphTool: ToolRequest = {
     await fs.ensureDir(analysisDir);
     const graphPath = path.join(analysisDir, `${args.graphName}-graph.json`);
 
-    
-    let existing: Record<string, any> = {};
-    try {
-      if (await fs.pathExists(graphPath)) {
-        existing = await readJsonWithRetry<Record<string, any>>(graphPath);
+    // The entire read→dedup-check→merge→write cycle is serialized per graph file.
+    // Section writers and analysis passes run concurrently; without this queue two
+    // callers read the same snapshot and the second write erases the first (data
+    // AND its _sources dedup entry) while both still report success.
+    return enqueueKeyedWrite(`graph:${graphPath}`, async () => {
+      let existing: Record<string, any> = {};
+      try {
+        if (await fs.pathExists(graphPath)) {
+          existing = await readJsonWithRetry<Record<string, any>>(graphPath);
+        }
+      } catch {
+        existing = {};
       }
-    } catch {
-      existing = {}; 
-    }
 
-    
-    
-    
-    
-    const sources: string[] = Array.isArray(existing._sources) ? existing._sources : [];
 
-    if (args.sourceFile && sources.includes(args.sourceFile)) {
-      const existingCount = Object.keys(existing).filter(k => k !== '_sources').length;
-      const skipMsg =
-        `DUPLICATE WRITE BLOCKED: "${args.sourceFile}" has already contributed to the "${args.graphName}" graph. ` +
-        `This call was rejected — no data was written. ` +
-        `ACTION REQUIRED: Do NOT call append-to-knowledge-graph again for this file+graph combination. ` +
-        `Move on to the NEXT graph type for this file, or if all graphs are done, ` +
-        `call edit-task-context to mark this file DONE (read_status="DONE") immediately.`;
-      ctx?.onLog?.(`[KnowledgeGraph] ${skipMsg}`, 'info');
-      return makeToolErrorResult(skipMsg);
-    }
+      const sources: string[] = Array.isArray(existing._sources) ? existing._sources : [];
 
-    
-    const merged = mergeGraphData(args.graphName, existing, args.data);
+      if (args.sourceFile && sources.includes(args.sourceFile)) {
+        const skipMsg =
+          `DUPLICATE WRITE BLOCKED: "${args.sourceFile}" has already contributed to the "${args.graphName}" graph. ` +
+          `This call was rejected — no data was written. ` +
+          `ACTION REQUIRED: Do NOT call append-to-knowledge-graph again for this file+graph combination. ` +
+          `Move on to the NEXT graph type for this file, or if all graphs are done, ` +
+          `call edit-task-context to mark this file DONE (read_status="DONE") immediately.`;
+        ctx?.onLog?.(`[KnowledgeGraph] ${skipMsg}`, 'info');
+        return makeToolErrorResult(skipMsg);
+      }
 
-    
-    if (args.sourceFile) {
-      merged._sources = [...sources, args.sourceFile];
-    }
 
-    
-    await writeJsonAtomic(graphPath, merged);
+      const merged = mergeGraphData(args.graphName, existing, args.data);
 
-    
-    const entryCount = Object.keys(merged).filter(k => k !== '_sources').length;
-    const message = `Graph "${args.graphName}" updated: ${entryCount} top-level entries.`
-      + (args.sourceFile ? ` (source: ${args.sourceFile})` : '');
 
-    ctx?.onLog?.(`[KnowledgeGraph] ${message}`, 'info');
+      if (args.sourceFile) {
+        merged._sources = [...sources, args.sourceFile];
+      }
 
-    return makeToolTextResult(JSON.stringify({
-      success:   true,
-      graphName: args.graphName,
-      graphPath: `_analysis/${args.graphName}-graph.json`,
-      entryCount,
-      message
-    }));
+
+      await writeJsonAtomic(graphPath, merged);
+
+
+      const entryCount = Object.keys(merged).filter(k => k !== '_sources').length;
+      const message = `Graph "${args.graphName}" updated: ${entryCount} top-level entries.`
+        + (args.sourceFile ? ` (source: ${args.sourceFile})` : '');
+
+      ctx?.onLog?.(`[KnowledgeGraph] ${message}`, 'info');
+
+      return makeToolTextResult(JSON.stringify({
+        success:   true,
+        graphName: args.graphName,
+        graphPath: `_analysis/${args.graphName}-graph.json`,
+        entryCount,
+        message
+      }));
+    });
   }
 };

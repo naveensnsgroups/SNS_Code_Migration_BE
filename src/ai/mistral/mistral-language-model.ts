@@ -8,8 +8,6 @@ import {
   TextResponsePart,
   ToolCallResponsePart,
   UsageResponsePart,
-  StreamToolCall,
-  makeToolErrorResult,
   ToolCallResult,
   UserRequest,
   StreamingProvider,
@@ -77,7 +75,7 @@ function transformToMistralMessages(messages: readonly LanguageModelMessage[]): 
         result.push({ role: 'assistant', content: msg.text });
       }
     } else if (msg.type === 'tool_use') {
-      
+
       let argsStr: string;
       if (typeof msg.input === 'string') {
         argsStr = msg.input;
@@ -86,15 +84,21 @@ function transformToMistralMessages(messages: readonly LanguageModelMessage[]): 
       } else {
         argsStr = '{}';
       }
-      result.push({
-        role: 'assistant',
-        content: '',
-        toolCalls: [{
-          id:       msg.id,
-          type:     'function',
-          function: { name: msg.name, arguments: argsStr },
-        }],
-      });
+      const toolCall: MistralToolCall = {
+        id:       msg.id,
+        type:     'function',
+        function: { name: msg.name, arguments: argsStr },
+      };
+      // The executor emits the assistant's reasoning text and its tool_use calls
+      // as separate messages. Mistral requires them as ONE assistant message
+      // (content + toolCalls) and rejects two consecutive assistant messages, so
+      // fold this tool_use into an immediately-preceding assistant text message.
+      const prev = result[result.length - 1];
+      if (prev && prev.role === 'assistant') {
+        prev.toolCalls = [...(prev.toolCalls ?? []), toolCall];
+      } else {
+        result.push({ role: 'assistant', content: '', toolCalls: [toolCall] });
+      }
     } else if (msg.type === 'tool_result') {
       
       const contentStr = extractToolResultText(msg.content);
@@ -200,8 +204,6 @@ export class MistralProvider implements StreamingProvider {
         yield* provider.streamOneTurn(
           mistralMessages,
           mistralTools,
-          tools,
-          userRequest,
           toolCtx
         );
       })(),
@@ -214,8 +216,6 @@ export class MistralProvider implements StreamingProvider {
   private async *streamOneTurn(
     messages:      MistralMessage[],
     mistralTools:  MistralTool[] | undefined,
-    toolRequests:  ToolRequest[],
-    userRequest:   UserRequest,
     toolCtx:       ToolContext | undefined
   ): AsyncIterable<LanguageModelStreamPart> {
 
@@ -235,23 +235,15 @@ export class MistralProvider implements StreamingProvider {
     
     
     const toolCallMap = new Map<string, { name: string; args: string; id: string }>();
-    let accumulatedText = '';
-
-    
-    
-    
-    
-    
 
     for await (const event of stream) {
       const chunk  = event.data;
       const choice = chunk?.choices?.[0];
-      const delta  = choice?.delta as any;  
+      const delta  = choice?.delta as any;
 
       if (delta) {
-        
+
         if (typeof delta.content === 'string' && delta.content.length > 0) {
-          accumulatedText += delta.content;
           const textPart: TextResponsePart = { content: delta.content };
           yield textPart;
         }
@@ -315,81 +307,21 @@ export class MistralProvider implements StreamingProvider {
       }
     }
 
-    
+    // Single-turn contract: emit each tool call with its COMPLETE accumulated
+    // arguments (finished:false, no result) and STOP. The AgentExecutor owns the
+    // loop — it executes tools, runs loop/stuck/duplicate detection, appends
+    // results, and re-invokes request(). Providers must NOT execute or recurse.
     if (toolCallMap.size > 0) {
-      const finishedCalls: StreamToolCall[] = [];
-      const toolResultMessages: MistralMessage[] = [];
-
-      
-      const assistantMsg: MistralMessage = {
-        role:    'assistant',
-        content: accumulatedText,
-        toolCalls: Array.from(toolCallMap.values()).map(tc => ({
-          id:       tc.id,
-          type:     'function' as const,
-          function: { name: tc.name, arguments: tc.args },
-        })),
-      };
-
-      
-      await Promise.all(
-        Array.from(toolCallMap.values()).map(async (tc) => {
-          const tool = toolRequests.find(t => t.name === tc.name);
-          let result: ToolCallResult;
-
-          if (!tool) {
-            result = makeToolErrorResult(
-              `Tool '${tc.name}' not found in available tools.`,
-              'tool-not-available'
-            );
-          } else {
-            try {
-              toolCtx?.onLog?.(`[Tool Call] ${tc.name}(${tc.args.slice(0, 80)}...)`, 'info');
-              result = await tool.handler(tc.args || '{}', toolCtx ? { ...toolCtx, toolCallId: tc.id } : undefined);
-              toolCtx?.onLog?.(`[Tool Response] ${tc.name} completed.`, 'success');
-            } catch (e: unknown) {
-              const msg = e instanceof Error ? e.message : 'Tool execution failed';
-              toolCtx?.onLog?.(`[Tool Error] ${tc.name}: ${msg}`, 'error');
-              result = makeToolErrorResult(msg);
-            }
-          }
-
-          const resultText = extractToolResultText(result);
-
-          
-          toolResultMessages.push({
-            role:       'tool',
-            toolCallId: tc.id,
-            name:       tc.name,
-            content:    resultText,
-          });
-
-          finishedCalls.push({
-            id:       tc.id,
-            finished: true,
-            result,
-            function: { name: tc.name, arguments: tc.args },
-          });
-        })
-      );
-
-      
-      yield { tool_calls: finishedCalls } as ToolCallResponsePart;
-
-      
-      const continuationMessages: MistralMessage[] = [
-        ...messages,
-        assistantMsg,
-        ...toolResultMessages,
-      ];
-
-      yield* this.streamOneTurn(
-        continuationMessages,
-        mistralTools,
-        toolRequests,
-        userRequest,
-        toolCtx
-      );
+      for (const tc of toolCallMap.values()) {
+        const consolidated: ToolCallResponsePart = {
+          tool_calls: [{
+            id: tc.id,
+            finished: false,
+            function: { name: tc.name, arguments: tc.args || '{}' },
+          }],
+        };
+        yield consolidated;
+      }
     }
   }
 }

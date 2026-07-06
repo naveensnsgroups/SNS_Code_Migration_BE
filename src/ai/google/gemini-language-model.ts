@@ -16,8 +16,6 @@ import {
   TextResponsePart,
   ToolCallResponsePart,
   UsageResponsePart,
-  StreamToolCall,
-  makeToolErrorResult,
   ToolCallResult,
 } from '../../types/language-model.js';
 import { ToolRequest, ToolContext } from '../../types/tool.js';
@@ -28,13 +26,20 @@ function convertMessageToPart(message: LanguageModelMessage): Part[] | undefined
     return [{ text: message.text }];
   }
   if (LanguageModelMessage.isToolUse(message)) {
-    return [{
+    const part: Part = {
       functionCall: {
         id: message.id,
         name: message.name,
         args: message.input as Record<string, unknown>,
       }
-    }];
+    };
+    // Gemini requires the original thoughtSignature to be echoed back on the
+    // functionCall part in history, or it rejects the request (400).
+    const sig = message.providerMetadata?.thoughtSignature;
+    if (typeof sig === 'string' && sig.length > 0) {
+      (part as { thoughtSignature?: string }).thoughtSignature = sig;
+    }
+    return [part];
   }
   if (LanguageModelMessage.isToolResult(message)) {
     const response = toFunctionResponse(message.content);
@@ -84,32 +89,6 @@ function transformToGeminiMessages(
   }
 
   return { contents, systemMessage };
-}
-
-function formatResultPreview(result: ToolCallResult): string {
-  if (result === null || result === undefined) return '';
-  try {
-    
-    if (typeof result === 'object' && 'content' in result) {
-      const wrapper = result as { content: Array<{ type: string; text?: string }> };
-      const texts = wrapper.content.filter(c => c.type === 'text').map(c => c.text ?? '');
-      const joined = texts.join('\n');
-      return joined.slice(0, 400) + (joined.length > 400 ? '\n...' : '');
-    }
-    
-    if (Array.isArray(result)) {
-      const s = JSON.stringify(result, null, 2);
-      return s.slice(0, 400) + (s.length > 400 ? '\n...' : '');
-    }
-    
-    if (typeof result === 'object') {
-      const s = JSON.stringify(result, null, 2);
-      return s.slice(0, 400) + (s.length > 400 ? '\n...' : '');
-    }
-    return String(result).slice(0, 400);
-  } catch {
-    return '';
-  }
 }
 
 export interface GeminiProviderConfig {
@@ -210,14 +189,13 @@ export class GeminiProvider {
     const genAI = new GoogleGenAI({
       apiKey: this.apiKey,
     });
-    return this.handleStreamingRequest(genAI, userRequest, toolCtx, []);
+    return this.handleStreamingRequest(genAI, userRequest, toolCtx);
   }
 
   private async handleStreamingRequest(
     genAI: GoogleGenAI,
     userRequest: UserRequest,
-    toolCtx: ToolContext | undefined,
-    extraContents: Content[]
+    toolCtx: ToolContext | undefined
   ): Promise<LanguageModelStreamResponse> {
     const { contents, systemMessage } = transformToGeminiMessages(userRequest.messages);
     const tools = userRequest.tools ?? [];
@@ -230,14 +208,12 @@ export class GeminiProvider {
         : undefined,
     }));
 
-    const allContents = [...contents, ...extraContents];
-
     const stream = await this.withRetry(
       () =>
         genAI.models.generateContentStream({
           model: this.modelName,
           config: {
-            systemInstruction: systemMessage, 
+            systemInstruction: systemMessage,
             responseModalities: [Modality.TEXT],
             ...(functionDeclarations.length > 0 && {
               toolConfig: {
@@ -247,26 +223,21 @@ export class GeminiProvider {
             }),
             temperature: 0.1,
           },
-          contents: allContents,
+          contents,
         }),
       toolCtx
     );
 
-    
-    const providerThis = this;
-
     const asyncIterator: LanguageModelStreamResponse = {
       stream: (async function* (): AsyncIterable<LanguageModelStreamPart> {
         
-        const toolCallMap = new Map<string, { name: string; args: string; id: string }>();
-        const collectedParts: Part[] = [];
+        const toolCallMap = new Map<string, { name: string; args: string; id: string; thoughtSignature?: string }>();
 
         for await (const chunk of stream) {
           const parts = chunk.candidates?.[0]?.content?.parts;
 
           if (parts) {
             for (const part of parts) {
-              collectedParts.push(part);
               if (part.text) {
                 const textPart: TextResponsePart = { content: part.text };
                 yield textPart;
@@ -274,10 +245,14 @@ export class GeminiProvider {
                 const fc = part.functionCall;
                 const callId = fc.id ?? `call_${fc.name}_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`;
                 fc.id = callId;
+                // Gemini attaches a thoughtSignature to the Part carrying the
+                // functionCall; it MUST be echoed back on the next turn or the
+                // API rejects the request. Capture it to round-trip.
+                const thoughtSignature = (part as { thoughtSignature?: string }).thoughtSignature;
 
                 if (!toolCallMap.has(callId)) {
                   const argsStr = fc.args ? JSON.stringify(fc.args) : '{}';
-                  toolCallMap.set(callId, { name: fc.name ?? '', args: argsStr, id: callId });
+                  toolCallMap.set(callId, { name: fc.name ?? '', args: argsStr, id: callId, thoughtSignature });
 
                   const toolCallPart: ToolCallResponsePart = {
                     tool_calls: [{
@@ -320,81 +295,21 @@ export class GeminiProvider {
           }
         }
 
-        
+        // Single-turn contract: emit each tool call with its COMPLETE accumulated
+        // arguments (finished:false, no result) and STOP. The AgentExecutor owns
+        // the loop — it executes tools, runs loop/stuck/duplicate detection, appends
+        // results, and re-invokes request(). Providers must NOT execute or recurse.
         if (toolCallMap.size > 0) {
-          const toolResultList: Array<{ name: string; result: ToolCallResult; id: string; arguments: string }> = [];
-          const finishedCalls: StreamToolCall[] = [];
-
           for (const [callId, tc] of toolCallMap) {
-            const tool = tools.find(t => t.name === tc.name);
-            let result: ToolCallResult;
-
-            if (!tool) {
-              result = makeToolErrorResult(
-                `Tool '${tc.name}' not found in available tools.`,
-                'tool-not-available'
-              );
-            } else {
-              try {
-                toolCtx?.onLog?.(`[Tool Call] ${tc.name}(${tc.args.slice(0, 80)}...)`, 'info');
-                
-                result = await tool.handler(tc.args, toolCtx ? { ...toolCtx, toolCallId: callId } : undefined);
-                toolCtx?.onLog?.(`[Tool Response] ${tc.name} completed.`, 'success');
-                
-                const resultPreview = formatResultPreview(result);
-                if (resultPreview) {
-                  toolCtx?.onLog?.(`[Tool Data] ${resultPreview}`, 'info');
-                }
-              } catch (e: unknown) {
-                const msg = e instanceof Error ? e.message : 'Tool execution failed';
-                toolCtx?.onLog?.(`[Tool Error] ${tc.name}: ${msg}`, 'error');
-                result = makeToolErrorResult(msg);
-              }
-            }
-
-            toolResultList.push({
-              name: tc.name,
-              result,
-              id: callId,
-              arguments: tc.args
-            });
-
-            finishedCalls.push({
-              id: callId,
-              finished: true,
-              result,
-              function: { name: tc.name, arguments: tc.args },
-            });
-
-            yield { tool_calls: finishedCalls } as ToolCallResponsePart;
-          }
-
-          
-          
-          const toolResponses: Part[] = toolResultList.map(call => ({
-            functionResponse: {
-              name: call.name,
-              response: toFunctionResponse(call.result)
-            }
-          }));
-          const responseMessage: Content = { role: 'user', parts: toolResponses };
-
-          
-          const modelResponseParts = collectedParts.filter(p => !p.thought);
-          const modelContent: Content = { role: 'model', parts: modelResponseParts };
-
-          const recursiveContents = [...extraContents, modelContent, responseMessage];
-
-          
-          const nextResponse = await providerThis.handleStreamingRequest(
-            genAI,
-            userRequest,
-            toolCtx,
-            recursiveContents
-          );
-
-          for await (const part of nextResponse.stream) {
-            yield part;
+            const consolidated: ToolCallResponsePart = {
+              tool_calls: [{
+                id: callId,
+                finished: false,
+                function: { name: tc.name, arguments: tc.args || '{}' },
+                providerMetadata: tc.thoughtSignature ? { thoughtSignature: tc.thoughtSignature } : undefined,
+              }],
+            };
+            yield consolidated;
           }
         }
       })(),

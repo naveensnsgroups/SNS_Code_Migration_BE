@@ -7,6 +7,7 @@ import { ToolRequest, ToolContext } from '../../types/tool.js';
 import { makeToolTextResult, makeToolErrorResult } from '../../types/language-model.js';
 import { READ_KNOWLEDGE_GRAPH_FUNCTION_ID } from '../../common/workspace-functions.js';
 import { getValidGraphNames }              from './knowledge-graph-utils.js';
+import { readJsonWithRetry }               from '../../session/fileUtils.js';
 
 export const readKnowledgeGraphTool: ToolRequest = {
   id:           READ_KNOWLEDGE_GRAPH_FUNCTION_ID,     
@@ -84,7 +85,9 @@ export const readKnowledgeGraphTool: ToolRequest = {
 
     let data: Record<string, any> = {};
     try {
-      data = await fs.readJson(graphPath);
+      // Retry-on-transient-failure: a concurrent append's atomic rename can make
+      // the path briefly unavailable on Windows; plain readJson would hard-fail.
+      data = await readJsonWithRetry<Record<string, any>>(graphPath);
     } catch (err: any) {
       return makeToolErrorResult(
         `Failed to read graph "${args.graphName}": ${err.message}`

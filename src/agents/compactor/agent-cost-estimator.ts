@@ -1,41 +1,54 @@
+// Cost is NEVER estimated from a hardcoded pricing table baked into this
+// codebase. Provider pricing changes over time and differs per plan/region,
+// so a static table shipped in code will always eventually be wrong — and
+// worse, silently wrong, with no way for a reader to know it drifted.
+//
+// Instead, pricing is user-supplied configuration (session.modelPricing,
+// set by the user in the frontend Settings UI) — exactly the same principle
+// Eclipse Theia's ai-core TokenUsageService follows: it tracks only real
+// token counts and has no cost/pricing concept in its core at all. Here we
+// keep the cost *feature* (the UI already surfaces it), but the source of
+// truth for a rate is always the user, never a guess baked into the app.
+//
+// If no rate is configured for a model, estimateCost returns null — every
+// caller must render that as "cost not available", never substitute $0 or
+// any other invented number.
 
+export interface ModelPricingRate {
+  /** USD per 1M base input tokens. */
+  inputPerM: number;
+  /** USD per 1M output tokens. */
+  outputPerM: number;
+  /** USD per 1M tokens written to a prompt cache. Falls back to inputPerM if omitted. */
+  cacheWritePerM?: number;
+  /** USD per 1M tokens read from a prompt cache. Falls back to inputPerM if omitted. */
+  cacheReadPerM?: number;
+}
 
-export const COST_TABLE: Record<string, [number, number]> = {
-  
-  'claude-opus-4':      [15,    75   ],
-  'claude-opus-4-5':    [15,    75   ],
-  'claude-sonnet-4':    [3,     15   ],
-  'claude-sonnet-4-5':  [3,     15   ],
-  'claude-3-5-sonnet':  [3,     15   ],
-  'claude-3-opus':      [15,    75   ],
-  'claude-3-haiku':     [0.25,  1.25 ],
-
-  
-  'gpt-4o':             [2.5,   10   ],
-  'gpt-4o-mini':        [0.15,  0.6  ],
-  'gpt-4-turbo':        [10,    30   ],
-  'gpt-3.5-turbo':      [0.5,   1.5  ],
-
-  
-  'gemini-2.5-pro':     [1.25,  10   ],
-  'gemini-2.0-flash':   [0.075, 0.3  ],
-  'gemini-1.5-pro':     [1.25,  5    ],
-  'gemini-1.5-flash':   [0.075, 0.3  ],
-
-  
-  'default':            [1,     3    ],  
-};
+/** Keyed by the exact model identifier the user configured a rate for. */
+export type ModelPricingConfig = Record<string, ModelPricingRate>;
 
 export function estimateCost(
-  inputTokens:  number,
+  inputTokens: number,
   outputTokens: number,
-  model:        string
-): number {
-  const entry = Object.entries(COST_TABLE).find(([key]) =>
-    key !== 'default' && model.toLowerCase().includes(key)
-  );
-  const [inCostPerM, outCostPerM] = entry ? entry[1] : COST_TABLE['default'];
-  const cost = (inputTokens / 1_000_000) * inCostPerM
-             + (outputTokens / 1_000_000) * outCostPerM;
+  model: string,
+  pricing?: ModelPricingConfig,
+  cacheWriteTokens = 0,
+  cacheReadTokens = 0
+): number | null {
+  if (!pricing) return null;
+
+  // Exact match only — no substring/prefix guessing. Since rates now come
+  // from the user, not the app, there is no "close enough" fallback to make;
+  // an unconfigured model is simply unpriced.
+  const rate = pricing[model];
+  if (!rate) return null;
+
+  const cost =
+    (inputTokens       / 1_000_000) * rate.inputPerM +
+    (outputTokens      / 1_000_000) * rate.outputPerM +
+    (cacheWriteTokens  / 1_000_000) * (rate.cacheWritePerM ?? rate.inputPerM) +
+    (cacheReadTokens   / 1_000_000) * (rate.cacheReadPerM  ?? rate.inputPerM);
+
   return Math.round(cost * 10_000) / 10_000;
 }

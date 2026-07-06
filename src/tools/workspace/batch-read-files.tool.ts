@@ -8,6 +8,7 @@ import { ToolContext } from '../../types/tool.js';
 import { makeToolTextResult, makeToolErrorResult } from '../../types/language-model.js';
 
 import { BATCH_READ_FILES_FUNCTION_ID } from '../../common/workspace-functions.js';
+import { parseToolArgs } from '../tool-args.js';
 
 const MAX_TOTAL_BYTES = 300 * 1024; 
 
@@ -49,13 +50,14 @@ export const batchReadFilesTool: ToolRequest = {
     required: ['files']
   },
   handler: async (arg_string: string, ctx?: ToolContext) => {
-    const args: { files: Array<{ path: string; offset?: number; limit?: number }> } = JSON.parse(arg_string || '{}');
-    const entries = args.files ?? [];
+    const parsed = parseToolArgs<{ files: Array<{ path: string; offset?: number; limit?: number }> }>(arg_string, 'batch-read-files');
+    if (!parsed.ok) return parsed.error;
+    const entries = parsed.value.files ?? [];
     if (!Array.isArray(entries) || entries.length === 0) {
-      return makeToolTextResult(JSON.stringify({ error: 'files array is required and must not be empty' }));
+      return makeToolErrorResult('batch-read-files: "files" array is required and must not be empty.');
     }
     if (entries.length > 10) {
-      return makeToolTextResult(JSON.stringify({ error: 'Max 10 files per batch call. Split into multiple batches.' }));
+      return makeToolErrorResult('batch-read-files: max 10 files per call. Split into multiple batches.');
     }
 
     let totalBytes = 0;

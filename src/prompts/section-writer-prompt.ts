@@ -27,7 +27,7 @@ export const SECTION_CONFIG: SectionConfig[] = [
     n: 1,
     name: 'Project Identity',
     graph: null,
-    ctxKeys: ['lang-profiles', 'TOTAL_FILES', 'PRIMARY_LANGUAGE', 'MONOREPO', 'MONOREPO_TYPE', 'RUNTIME_VERSIONS'],
+    ctxKeys: ['lang-profiles', 'TOTAL_FILES', 'TOTAL_ESTIMATED_LINES', 'PRIMARY_LANGUAGE', 'MONOREPO', 'MONOREPO_TYPE', 'RUNTIME_VERSIONS'],
     emptyGraphIsValid: true,    
     minContentBytes: 300,
     specificInstructions: `Load lang-profiles and inline task context keys.
@@ -45,9 +45,20 @@ Write a comprehensive project identity section including:
     Go → go mod | Ruby → bundler | .NET → nuget | C/C++ → conan / vcpkg / cmake
   - Repository type (monorepo / single project)
   - Total source files (TOTAL_FILES from context)
-  - Estimated total lines of code (sum of estimatedLines from file-index)
-  - Runtime versions (from RUNTIME_VERSIONS)
-  - All subprojects (if MONOREPO=true, list each with its language and framework)`,
+  - Estimated total lines of code: use TOTAL_ESTIMATED_LINES from context VERBATIM.
+    Do NOT sum estimatedLines from file-index yourself — that number is computed once,
+    deterministically, in code specifically so it always matches Section 4's total.
+    If TOTAL_ESTIMATED_LINES is missing from context, write "not measured" (never guess).
+  - All subprojects (if MONOREPO=true, list each with its language and framework)
+
+  ANALYSIS HOST TOOLCHAIN (NOT this project's runtime — do not present it as one):
+  RUNTIME_VERSIONS lists interpreter/toolchain versions detected on the MACHINE RUNNING
+  THIS ANALYSIS (it may show Python/Node/Java even for a COBOL or PHP project — that only
+  means those tools happen to be installed on the analysis server; it says NOTHING about
+  the target codebase). Present it in its own clearly-labeled subsection, e.g.
+  "### Analysis Host Toolchain (reference only — not the project's own runtime)",
+  separate from the project's actual detected language/framework/version above. Never
+  imply these versions belong to the analyzed project.`,
   },
   {
     n: 2,
@@ -57,13 +68,20 @@ Write a comprehensive project identity section including:
     minContentBytes: 500,
     specificInstructions: `Call read-knowledge-graph("architecture").
 
-PRIMARY DATA SOURCE: Look for the "synthesized_overview" key in the architecture graph.
-  This was built by the Graph Resolver from ALL graphs combined.
+The architecture graph can hold TWO shapes in the same file — use BOTH:
+  (1) "synthesized_overview" (nested object) — built by the Graph Resolver from ALL graphs.
+  (2) FLAT top-level fields — type, layers, patterns, modules, entryPoint,
+      communicationProtocol, frontendExists — written directly during Phase 2 from the
+      app/bootstrap/main file. These are real first-hand observations; never ignore them.
 
-FALLBACK (if synthesized_overview is missing or empty — resolver may have hit context limit):
-  Read entity-graph, api-graph, symbol-graph, and middleware-graph directly.
-  Build the architecture overview from those raw graphs instead.
-  Add this note at top: "> ℹ️ synthesized_overview was not generated — rebuilt from raw graphs."
+PRIMARY DATA SOURCE: "synthesized_overview" if present and non-empty.
+  Then MERGE IN any flat top-level fields above that add detail (e.g. an entryPoint or
+  patterns the synthesis missed). Do not drop flat fields just because synthesized_overview exists.
+
+FALLBACK ORDER if synthesized_overview is missing or empty (resolver may have hit context limit):
+  1. First use the FLAT top-level architecture-graph fields — they are direct Phase 2 observations.
+  2. Then supplement from entity-graph, api-graph, symbol-graph, and middleware-graph directly.
+  Add this note at top: "> ℹ️ synthesized_overview was not generated — rebuilt from flat architecture fields + raw graphs."
 
 Write a complete architecture overview including:
   - System type and overall pattern
@@ -855,8 +873,16 @@ Write a comprehensive risk scorecard for migration planning:
 
 ### Language & Runtime
   Primary language: [PRIMARY_LANGUAGE from context]
-  Runtime versions: [RUNTIME_VERSIONS from context]
   Monorepo: [MONOREPO from context] — [MONOREPO_TYPE if monorepo]
+
+  Analysis host toolchain (reference only — NOT this project's own runtime):
+  RUNTIME_VERSIONS is a JSON object of interpreter/tool versions detected on the
+  MACHINE RUNNING THIS ANALYSIS, not the target codebase. NEVER paste it as raw JSON.
+  Render it as a clean bullet list, one tool per line, e.g.:
+    - Node.js: v22.18.0
+    - Python: 3.13.14
+  Skip any entry whose value is "not installed". If RUNTIME_VERSIONS is missing, write
+  "not measured" — do not fabricate values.
 
 ### High-Churn Files (Migration Risk)
   Files with highest commit frequency = most actively changed = highest breakage risk.
@@ -966,7 +992,13 @@ Save the result to the output file path given. Then stop.
 7. EMPTY GRAPH VALIDATION — MANDATORY before writing "None detected in this codebase":
    a. Call get_task_context and read ALL counters:
       TOTAL_CALLABLE_UNITS, TOTAL_DATA_ENTITIES, TOTAL_API_ENDPOINTS,
-      TOTAL_DB_TABLES, TOTAL_EVENTS, TOTAL_INTEGRATIONS, TOTAL_JOBS.
+      TOTAL_DB_TABLES, TOTAL_EVENTS, TOTAL_INTEGRATIONS, TOTAL_JOBS,
+      TOTAL_BUSINESS_RULES.
+      ALSO read the gap flags saved by graph resolution (Pass C/D):
+      DATA_GAP_ENTITY, DATA_GAP_API, DATA_GAP_SYMBOL. If the flag for THIS
+      section's graph is true, the graph was created but lost its data — write
+      the DATA GAP WARNING (rule 7c) at the top of the section, even if you have
+      no other signal. This is a confirmed cross-phase gap; never hide it.
    b. Cross-check the graph for THIS section against its counter:
       Graph         | Counter to check         | Threshold
       symbol-graph  | TOTAL_CALLABLE_UNITS     | > 20
@@ -976,12 +1008,17 @@ Save the result to the output file path given. Then stop.
       event-graph   | TOTAL_EVENTS             | > 0
       integration   | TOTAL_INTEGRATIONS       | > 0
       job-graph     | TOTAL_JOBS               | > 0
-   c. If the relevant graph is EMPTY and its counter EXCEEDS the threshold above:
+      rule-graph    | TOTAL_BUSINESS_RULES     | > 0
+   c. If the relevant graph is EMPTY and its counter is GREATER THAN 0
+      (whether or not it exceeds the threshold above):
       → Write this DATA GAP WARNING at the TOP of the section:
       "> ⚠️ DATA GAP WARNING: The [graph-name] is empty, but [counter]=[N] was recorded.
       > This indicates a Phase 2 or Phase 3 analysis gap. Section content is incomplete.
       > Re-run the analysis to regenerate this graph."
       → Then write what you CAN determine from other available graphs.
+      NOTE: the Threshold column is only a guide for how ALARMING the gap is
+      (a count far above threshold is a severe gap). ANY non-zero counter with an
+      empty graph is a DATA GAP — never silently write "None detected" in that case.
    d. If the relevant counter IS exactly the number 0:
       → The project genuinely has none of these items. Write "None detected." normally.
       → This is NOT an error — many projects have no events, no jobs, no integrations.
@@ -992,8 +1029,11 @@ Save the result to the output file path given. Then stop.
       > The 'None detected' result below may be incorrect. Re-run the full analysis."
       → Then write "None detected (counter not set — re-run to verify)."
       → This is DIFFERENT from d above: 0 means zero, missing means unknown.
-   f. For graphs with no corresponding counter (rule/middleware/security/etc.):
+   f. For graphs with genuinely no corresponding counter (middleware/security/config/
+      state/transform/error/async/test/call-flow):
       → Write "None detected in this codebase." normally.
+      → NOTE: rule-graph DOES have a counter (TOTAL_BUSINESS_RULES) — it is handled by
+      rules b–e above, NOT here. Never treat rule-graph as counter-less.
 </rules>
 
 <output_format>

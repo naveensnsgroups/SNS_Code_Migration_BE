@@ -1,7 +1,7 @@
 import { SessionManager } from '../../session/sessionManager.js';
 import { EventBroadcaster } from '../../routes/stream.js';
 import { TaskContextManager } from '../../session/taskContext.js';
-import { PlannerAgent } from '../stage1/planner-agent.js';
+import { PlannerAgent, STAGE1_ABORTED } from '../stage1/planner-agent.js';
 import { ShellExecutor } from '../../tools/shellExecutor.js';
 import { writeSessionFile } from '../../tools/fileWriter.js';
 import { scanProjectDirectory } from '../../tools/fileScanner.js';
@@ -24,7 +24,11 @@ export class MigrationOrchestrator {
   static stopSession(sessionId: string) {
     this.stoppedSessions.add(sessionId);
     this.pausedSessions.delete(sessionId);
-    this.activeSessions.delete(sessionId);  
+    // NOTE: do NOT remove from activeSessions here. The pipeline promise is still
+    // running until it observes the stop flag at its next checkpoint; removing the
+    // guard early would allow a second concurrent run of the same session, and two
+    // pipelines writing the same taskContext/graphs corrupts state. The finally()
+    // in startMigration clears activeSessions when the pipeline actually exits.
     ShellExecutor.kill(sessionId);
   }
 
@@ -278,26 +282,34 @@ export class MigrationOrchestrator {
     
     if (isAgentEnabled('planner-agent')) {
       await updatePhase('discovery', 'active');
-      
-      
-      await PlannerAgent.run(
+
+
+      const result = await PlannerAgent.run(
         sessionId,
         legacyPath,
         modernPath,
         currentSession.detectedStack!,
         currentSession.targetStack!,
-        null,  
+        null,
         async (msg, lvl) => log(msg, lvl ?? 'info', 'stage1'),
         async (percent, currentFile) => {
-          
+
           await SessionManager.updateSession(sessionId, {
             progress:    percent,
             currentFile: currentFile ?? '',
           });
           EventBroadcaster.broadcast(sessionId, 'progress', { percent, currentFile: currentFile ?? '' });
         },
-        updatePhase   
+        updatePhase,
+        checkCancellation
       );
+
+      // Stop/Pause was observed at a pipeline checkpoint: session status has
+      // already been set by checkCancellation — do not mark the run complete.
+      if (result === STAGE1_ABORTED) {
+        await log('[Pipeline] Stage 1 halted by user request. Resume to continue from the saved phase.', 'warning', 'stage1');
+        return;
+      }
     } else {
       await log('Skipping Stage 1: Analysis Agent is disabled in settings.', 'warning', 'stage1');
       await writeSessionFile(modernPath, 'Stage1_Analysis.md', '# Legacy Codebase Analysis\n\nSkipped by user settings.');

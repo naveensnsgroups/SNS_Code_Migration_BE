@@ -1,6 +1,20 @@
 import fs from 'fs-extra';
 import path from 'path';
 
+// ── Keyed write serialization ────────────────────────────────────────────────
+// Every read→merge→write cycle on a shared JSON file (task context, knowledge
+// graphs, session token totals) must run through this queue, keyed by the file
+// it mutates. Without it, two concurrent agents read the same stale snapshot,
+// each merges its own data, and the second write silently erases the first.
+const writeQueues = new Map<string, Promise<void>>();
+
+export function enqueueKeyedWrite<T>(key: string, fn: () => Promise<T>): Promise<T> {
+  const tail   = writeQueues.get(key) ?? Promise.resolve();
+  const result = tail.then(() => fn());
+  writeQueues.set(key, result.then(() => {}, () => {}));
+  return result;
+}
+
 export async function writeJsonAtomic(filePath: string, data: any, options: { spaces?: number } = { spaces: 2 }): Promise<void> {
   const tempPath = `${filePath}.tmp-${Math.random().toString(36).substring(2, 8)}`;
   await fs.ensureDir(path.dirname(filePath));

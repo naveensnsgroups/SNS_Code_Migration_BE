@@ -173,10 +173,23 @@ export class SessionManager {
     readCachedInputTokens?: number
   ): Promise<void> {
     try {
-      const session = await this.getSession(sessionId);
-      if (session) {
-        const { estimateCost } = await import('../agents/compactor/agent-cost-estimator.js');
-        const estimatedCost = estimateCost(inputTokens, outputTokens, modelName);
+      const { estimateCost } = await import('../agents/compactor/agent-cost-estimator.js');
+
+      // The read-of-current-totals and the accumulate+write must happen inside the
+      // SAME queued slot. Computing totals before enqueueing lets two concurrent
+      // completions read the same snapshot and the second write drop the first's
+      // tokens (silent undercount). Do not call updateSession here — a nested
+      // enqueueWrite on the same session would deadlock the queue.
+      const newTotals = await this.enqueueWrite(sessionId, async () => {
+        const session = await this.getSession(sessionId);
+        if (!session) return null;
+
+        // Cost uses the user-configured rate for THIS model, read fresh from the
+        // session inside the queue — never a hardcoded table (see agent-cost-estimator.ts).
+        const thisCallCost = estimateCost(
+          inputTokens, outputTokens, modelName, session.modelPricing,
+          cachedInputTokens ?? 0, readCachedInputTokens ?? 0
+        );
 
         const ex = session.tokenUsage;
         const accumulatedInput = (ex?.inputTokens ?? 0) + inputTokens;
@@ -185,13 +198,27 @@ export class SessionManager {
         const accumulatedReadCached = (ex?.readCachedInputTokens ?? 0) + (readCachedInputTokens ?? 0);
         const accumulatedTotal = accumulatedInput + accumulatedOutput + accumulatedCached;
 
-        const newTotals = {
+        // If this call's cost is unknown (no rate configured) AND nothing has been
+        // priced so far, the running total stays null (honest "unavailable") rather
+        // than silently treating the unknown call as $0.
+        const priorCost = ex?.estimatedCost ?? null;
+        const accumulatedCost =
+          thisCallCost === null && priorCost === null ? null
+          : (priorCost ?? 0) + (thisCallCost ?? 0);
+        // Distinct from "fully unavailable": some calls WERE priced, but at least
+        // one model used in this session has no configured rate, so the total is
+        // a real but INCOMPLETE lower bound — the UI must say so, not present it
+        // as the full cost.
+        const costIncomplete = thisCallCost === null || (ex as any)?.costIncomplete === true;
+
+        const totals = {
           inputTokens: accumulatedInput,
           outputTokens: accumulatedOutput,
           cachedInputTokens: accumulatedCached > 0 ? accumulatedCached : undefined,
           readCachedInputTokens: accumulatedReadCached > 0 ? accumulatedReadCached : undefined,
           totalTokens: accumulatedTotal,
-          estimatedCost: (ex?.estimatedCost ?? 0) + estimatedCost,
+          estimatedCost: accumulatedCost,
+          costIncomplete: accumulatedCost !== null ? costIncomplete : undefined,
           model: modelName,
         };
 
@@ -206,12 +233,16 @@ export class SessionManager {
           timestamp: new Date().toISOString(),
         };
 
-        const existingHistory = session.tokenUsageHistory ?? [];
-        await this.updateSession(sessionId, {
-          tokenUsage: newTotals,
-          tokenUsageHistory: [...existingHistory, entry],
-        });
+        const updatedSession = {
+          ...session,
+          tokenUsage: totals,
+          tokenUsageHistory: [...(session.tokenUsageHistory ?? []), entry],
+        };
+        await this.saveSession(updatedSession);
+        return totals;
+      });
 
+      if (newTotals) {
         const { EventBroadcaster } = await import('../routes/stream.js');
         EventBroadcaster.broadcast(sessionId, 'token_usage', newTotals);
       }

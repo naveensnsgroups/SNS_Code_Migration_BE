@@ -34,9 +34,12 @@ import {
   resetStateForErrorType,
   createLoopState,
   LoopState,
+  BOOKKEEPING_TOOL_NAMES,
 } from './agent-loop-config.js';
+import { isToolCallContentWrapper } from '../../types/language-model.js';
 
-export { COST_TABLE, estimateCost } from '../compactor/agent-cost-estimator.js';
+export { estimateCost } from '../compactor/agent-cost-estimator.js';
+export type { ModelPricingRate, ModelPricingConfig } from '../compactor/agent-cost-estimator.js';
 
 function sortKeysDeep(val: unknown): unknown {
   if (Array.isArray(val)) return val.map(sortKeysDeep);
@@ -53,8 +56,35 @@ function normalizeToolArgs(rawArgs: string): string {
   try {
     return JSON.stringify(sortKeysDeep(JSON.parse(rawArgs)));
   } catch {
-    return rawArgs; 
+    return rawArgs;
   }
+}
+
+// Extract the human-readable text a tool result carries (what the LLM received),
+// for the observability channel. Handles the structured content-wrapper, plain
+// strings, and arbitrary objects.
+function extractResultText(result: unknown): string {
+  if (result === undefined || result === null) return '';
+  if (typeof result === 'string') return result;
+  if (isToolCallContentWrapper(result as any)) {
+    return (result as any).content
+      .map((c: any) => c.text ?? c.data ?? '')
+      .filter(Boolean)
+      .join('\n');
+  }
+  try { return JSON.stringify(result); } catch { return String(result); }
+}
+
+// Show the real result up to a generous cap (default ~12KB) so the UI can display
+// full file reads / graph reads / edit payloads — not a tiny 300-char snippet.
+// Anything larger is truncated with an honest marker.
+function truncateForLog(text: string, cap = 12_000): string {
+  if (!text) return '';
+  if (text.length <= cap) return text;
+  return (
+    text.slice(0, cap) +
+    `\n… [truncated — showing ${(cap / 1000).toFixed(0)}KB of ${(text.length / 1000).toFixed(1)}KB; the agent used the full result]`
+  );
 }
 
 const RATE_LIMIT_PATTERNS = [
@@ -105,12 +135,19 @@ export class AgentExecutor {
     tools: ToolRequest[],
     context: ToolContext,
     modelName = '',
-    agentId = 'migration-agent'
+    agentId = 'migration-agent',
+    // Optional per-run cap on turns. The analysis phase passes a small value so a
+    // single pass cannot run 30+ turns and blow a rate-limited token/minute budget.
+    maxIterationsOverride?: number
   ): Promise<string> {
-    
-    
-    
+
+
+
     const loopConfig = resolveLoopConfig(modelName);
+    const effectiveMaxIterations = Math.min(
+      loopConfig.maxIterations,
+      maxIterationsOverride && maxIterationsOverride > 0 ? maxIterationsOverride : loopConfig.maxIterations
+    );
     const loopState: LoopState = createLoopState();
 
     
@@ -127,7 +164,7 @@ export class AgentExecutor {
     
     const compactionCharBudget = resolveCompactionCharBudget(modelName);
 
-    while (iteration < loopConfig.maxIterations) {
+    while (iteration < effectiveMaxIterations) {
       iteration++;
 
       
@@ -146,7 +183,7 @@ export class AgentExecutor {
       
       let turnText = '';
       
-      const pendingToolCalls = new Map<string, { id: string; name: string; args: string }>();
+      const pendingToolCalls = new Map<string, { id: string; name: string; args: string; providerMetadata?: Record<string, unknown> }>();
 
       
       const response = await requestWithRetry(provider, userRequest, context);
@@ -180,11 +217,14 @@ export class AgentExecutor {
         } else if (isToolCallResponsePart(part)) {
           for (const tc of part.tool_calls) {
             if (tc.id && tc.function?.name && !tc.finished) {
-              
+              // Merge so a later consolidated part (full args) does not wipe the
+              // providerMetadata captured on an earlier part for the same call.
+              const prev = pendingToolCalls.get(tc.id);
               pendingToolCalls.set(tc.id, {
                 id: tc.id,
                 name: tc.function.name,
                 args: tc.function.arguments ?? '{}',
+                providerMetadata: tc.providerMetadata ?? prev?.providerMetadata,
               });
             } else if (tc.id && tc.finished) {
               
@@ -207,6 +247,7 @@ export class AgentExecutor {
                 }
                 
                 EventBroadcaster.broadcast(context.sessionId, 'tool_response', {
+                  id: tc.id,
                   toolName:  existing.name,
                   success:   !hasToolError(tc.result as ToolCallResult),
                   inStream:  true,
@@ -256,7 +297,15 @@ export class AgentExecutor {
       
       
       if (pendingToolCalls.size > 0) {
-        
+        // Preserve the assistant's reasoning text from this turn as history before
+        // its tool_use calls. Providers now stream one turn and do NOT build the
+        // assistant message themselves (the executor owns the loop), so the text
+        // would otherwise be dropped. Provider message transforms merge this text
+        // with the following tool_use blocks into one assistant message.
+        if (turnText.trim()) {
+          messages.push({ actor: 'ai', type: 'text', text: turnText } as TextMessage);
+        }
+
         for (const tc of pendingToolCalls.values()) {
           let parsedInput: unknown = {};
           try { parsedInput = JSON.parse(tc.args); } catch {  }
@@ -267,6 +316,7 @@ export class AgentExecutor {
             id: tc.id,
             name: tc.name,
             input: parsedInput,
+            providerMetadata: tc.providerMetadata,
           } as ToolUseMessage);
         }
 
@@ -307,33 +357,52 @@ export class AgentExecutor {
               let parsedArgs: Record<string, unknown> = {};
               try { parsedArgs = JSON.parse(tc.args) as Record<string, unknown>; } catch {  }
               EventBroadcaster.broadcast(context.sessionId, 'tool_call', {
-                name: tc.name, args: parsedArgs, agentId,
+                id: tc.id, name: tc.name, args: parsedArgs, agentId,
               });
 
               try {
-                
+
                 result = await tool.handler(tc.args, { ...context, toolCallId: tc.id });
-                context.onLog?.(`[Tool Response] Completed "${tc.name}" successfully.`, 'success');
+                const isErr = hasToolError(result);
+                // Emit the ACTUAL result to the observability channel so the UI can
+                // show what the tool returned (not just "completed"). This was lost
+                // when tool execution moved out of the providers — restore it here.
+                const resultText = extractResultText(result);
+                if (resultText) {
+                  context.onLog?.(`[Tool Data] ${truncateForLog(resultText)}`, 'info');
+                }
+                context.onLog?.(`[Tool Response] Completed "${tc.name}" ${isErr ? 'with error' : 'successfully'}.`, isErr ? 'warning' : 'success');
                 EventBroadcaster.broadcast(context.sessionId, 'tool_response', {
-                  name: tc.name, success: true,
+                  id: tc.id,
+                  name: tc.name,
+                  success: !isErr,
+                  args: parsedArgs,
+                  resultPreview: truncateForLog(resultText, 1200),
                 });
 
-                
+
                 loopState.toolCallFingerprints.push(fingerprint);
                 if (loopState.toolCallFingerprints.length > loopConfig.fingerprintWindow) {
-                  loopState.toolCallFingerprints.shift(); 
+                  loopState.toolCallFingerprints.shift();
                 }
-                
-                
-                if (!hasToolError(result)) {
+
+
+                if (!isErr) {
                   loopState.toolCallFingerprints = loopState.toolCallFingerprints
                     .filter(f => !f.startsWith(`${tc.name}::`));
+                  // Productive-progress tracking: bookkeeping tools accumulate the
+                  // streak; any productive tool (read/graph/write) resets it.
+                  if (BOOKKEEPING_TOOL_NAMES.has(tc.name)) {
+                    loopState.bookkeepingStreak++;
+                  } else {
+                    loopState.bookkeepingStreak = 0;
+                  }
                 }
               } catch (err: unknown) {
                 const errMsg = err instanceof Error ? err.message : 'Unknown tool execution error';
                 context.onLog?.(`[Tool Error] Failed executing "${tc.name}": ${errMsg}`, 'error');
                 EventBroadcaster.broadcast(context.sessionId, 'tool_response', {
-                  name: tc.name, success: false,
+                  id: tc.id, name: tc.name, success: false,
                 });
                 result = makeToolErrorResult(errMsg);
 
@@ -361,22 +430,34 @@ export class AgentExecutor {
         
         
         {
+          // Stuck-tool detection: within the last `stuckToolWindow` tool results,
+          // a single tool accumulating >= `stuckToolMaxErrors` errors with zero
+          // successes triggers a recovery injection. Both config knobs are live:
+          // window = how far back to look, maxErrors = per-model trigger threshold.
           const allResults = messages.filter(m => m.type === 'tool_result') as ToolResultMessage[];
           const lastN      = allResults.slice(-loopConfig.stuckToolWindow);
-          if (lastN.length >= loopConfig.stuckToolWindow) {
-            const firstName        = lastN[0].name;
-            const allSameToolErrors = lastN.every(
-              r => r.name === firstName && r.is_error === true
-            );
-            if (allSameToolErrors) {
-              const stuckMsg = buildRecoveryMessage('stuck-tool', firstName, loopConfig);
-              messages.push({ actor: 'user', type: 'text', text: stuckMsg } as TextMessage);
-              resetStateForErrorType(loopState, 'stuck-tool');
-              context.onLog?.(
-                `[AgentExecutor] STUCK DETECTED: "${firstName}" failed ` +
-                `${loopConfig.stuckToolMaxErrors}x in a row — injected recovery.`,
-                'warning'
-              );
+          if (lastN.length > 0) {
+            const errorCounts   = new Map<string, number>();
+            const successNames  = new Set<string>();
+            for (const r of lastN) {
+              if (r.is_error === true) {
+                errorCounts.set(r.name, (errorCounts.get(r.name) ?? 0) + 1);
+              } else {
+                successNames.add(r.name);
+              }
+            }
+            for (const [name, errCount] of errorCounts) {
+              if (errCount >= loopConfig.stuckToolMaxErrors && !successNames.has(name)) {
+                const stuckMsg = buildRecoveryMessage('stuck-tool', name, loopConfig);
+                messages.push({ actor: 'user', type: 'text', text: stuckMsg } as TextMessage);
+                resetStateForErrorType(loopState, 'stuck-tool');
+                context.onLog?.(
+                  `[AgentExecutor] STUCK DETECTED: "${name}" failed ` +
+                  `${errCount}x within the last ${lastN.length} tool results — injected recovery.`,
+                  'warning'
+                );
+                break;
+              }
             }
           }
         }
@@ -409,12 +490,27 @@ export class AgentExecutor {
               );
             }
           } else if (thisTurnErrors < thisTurnIds.length) {
-            
+
             loopState.noProgressTurns = 0;
           }
         }
 
-        
+        // Bookkeeping-loop detection: the agent is making SUCCESSFUL state-only
+        // calls (edit_task_context / get_task_context / todoWrite) without any
+        // productive analysis in between. Invisible to the error/duplicate
+        // detectors, so guard it explicitly: nudge to do real work or stop.
+        if (loopState.bookkeepingStreak >= loopConfig.bookkeepingStreakMax) {
+          const bkMsg = buildRecoveryMessage('bookkeeping-loop', '', loopConfig);
+          messages.push({ actor: 'user', type: 'text', text: bkMsg } as TextMessage);
+          context.onLog?.(
+            `[AgentExecutor] BOOKKEEPING LOOP: ${loopState.bookkeepingStreak} state-only calls ` +
+            `with no analysis — injected recovery nudge.`,
+            'warning'
+          );
+          resetStateForErrorType(loopState, 'bookkeeping-loop');
+        }
+
+
         continue;
       }
 
@@ -425,9 +521,9 @@ export class AgentExecutor {
 
     
     context.onLog?.(
-      `[AgentExecutor] Max ${loopConfig.maxIterations} iterations reached. Agent may have written output files.`,
+      `[AgentExecutor] Max ${effectiveMaxIterations} iterations reached. Agent may have written output files.`,
       'warning'
     );
-    return lastTextResponse || `Agent completed ${loopConfig.maxIterations} turns. Check output workspace for generated files.`;
+    return lastTextResponse || `Agent completed ${effectiveMaxIterations} turns. Check output workspace for generated files.`;
   }
 }

@@ -19,23 +19,35 @@ export const compressMigrationContextTool: ToolRequest = {
     'Call when CONTEXT_SIZE_WARNING=true is set in task context.',
   parameters: { type: 'object', properties: {}, required: [] },
   handler: async (_arg_string: string, ctx?: ToolContext) => {
-    const taskCtx = await TaskContextManager.getContext(ctx!.sessionId);
-    const ARCHIVE_KEYS = ['file-index', 'rules-by-file', 'lang-profiles', 'dep-matrix', 'symbols', 'analysis'];
-    const archived: string[] = [];
-    const archiveData: Record<string, unknown> = {};
-    const keptKeys: string[] = [];
-
-    for (const [key, value] of Object.entries(taskCtx)) {
-      const shouldArchive = ARCHIVE_KEYS.some(ak => key === ak || key.startsWith(ak + ':'));
-      if (shouldArchive && value !== undefined) { archiveData['archive-' + key] = value; archived.push(key); }
-      else { keptKeys.push(key); }
+    if (!ctx?.sessionId) {
+      return makeToolErrorResult('compress-migration-context: sessionId missing from tool context.');
     }
 
-    const updates: Record<string, unknown> = { ...archiveData, CONTEXT_COMPACTED: true, CONTEXT_SIZE_WARNING: false };
-    for (const key of archived) updates[key] = undefined;
+    const ARCHIVE_KEYS = ['file-index', 'rules-by-file', 'lang-profiles', 'dep-matrix', 'symbols', 'analysis'];
+    const archived: string[] = [];
+    const keptKeys: string[] = [];
 
-    await TaskContextManager.updateContext(ctx!.sessionId, updates);
-    ctx!.onLog?.(`[Context] Archived ${archived.length} large keys. Kept ${keptKeys.length} HOT keys.`, 'info');
+    // The decide-what-to-archive step and the archive+delete step run atomically
+    // inside the per-session context queue. Deciding from a separate earlier read
+    // would let a concurrent write land in between and then be deleted here.
+    await TaskContextManager.transformContext(ctx.sessionId, (taskCtx) => {
+      const updated: Record<string, unknown> = {};
+      for (const [key, value] of Object.entries(taskCtx)) {
+        const shouldArchive = ARCHIVE_KEYS.some(ak => key === ak || key.startsWith(ak + ':'));
+        if (shouldArchive && value !== undefined) {
+          updated['archive-' + key] = value;
+          archived.push(key);
+        } else {
+          updated[key] = value;
+          keptKeys.push(key);
+        }
+      }
+      updated.CONTEXT_COMPACTED    = true;
+      updated.CONTEXT_SIZE_WARNING = false;
+      return updated;
+    });
+
+    ctx.onLog?.(`[Context] Archived ${archived.length} large keys. Kept ${keptKeys.length} HOT keys.`, 'info');
     return makeToolTextResult(JSON.stringify({ archived, keptKeys, contextSizeReduced: archived.length > 0 }));
   }
 };

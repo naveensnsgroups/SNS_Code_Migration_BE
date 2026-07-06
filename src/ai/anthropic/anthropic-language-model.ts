@@ -8,8 +8,6 @@ import {
   TextResponsePart,
   ToolCallResponsePart,
   UsageResponsePart,
-  StreamToolCall,
-  makeToolErrorResult,
   ToolCallResult,
   UserRequest,
   StreamingProvider,
@@ -249,8 +247,6 @@ export class ClaudeProvider implements StreamingProvider {
           anthropicMessages,
           systemPrompt,
           anthropicTools,
-          tools,
-          userRequest,
           toolCtx
         );
       })(),
@@ -264,8 +260,6 @@ export class ClaudeProvider implements StreamingProvider {
     messages: AnthMessageParam[],
     systemPrompt: string | undefined,
     anthropicTools: AnthTool[] | undefined,
-    toolRequests: ToolRequest[],
-    userRequest: UserRequest,
     toolCtx: ToolContext | undefined
   ): AsyncIterable<LanguageModelStreamPart> {
     
@@ -393,86 +387,22 @@ export class ClaudeProvider implements StreamingProvider {
       }
     }
 
-    
+    // Single-turn contract: emit each tool call with its COMPLETE accumulated
+    // arguments (finished:false, no result) and STOP. The AgentExecutor owns the
+    // loop — it executes the tools, runs loop/stuck/duplicate detection, appends
+    // the results, and re-invokes request() for the next turn. Providers must NOT
+    // execute tools or self-recurse; doing so bypassed every executor safety net.
     if (toolUseBlocks.length > 0) {
-      
-      const assistantContent: AnthContentBlock[] = [];
-      if (accumulatedText.trim()) {
-        assistantContent.push({ type: 'text', text: accumulatedText });
-      }
       for (const block of toolUseBlocks) {
-        let parsedInput: Record<string, unknown> = {};
-        try { parsedInput = JSON.parse(block.inputJson || '{}'); } catch {  }
-        assistantContent.push({
-          type: 'tool_use',
-          id: block.id,
-          name: block.name,
-          input: parsedInput,
-        });
+        const consolidated: ToolCallResponsePart = {
+          tool_calls: [{
+            id: block.id,
+            finished: false,
+            function: { name: block.name, arguments: block.inputJson || '{}' },
+          }],
+        };
+        yield consolidated;
       }
-
-      
-      const toolResultBlocks: AnthToolResultBlock[] = [];
-      const finishedCalls: StreamToolCall[] = [];
-
-      await Promise.all(toolUseBlocks.map(async (block) => {
-        const tool = toolRequests.find(t => t.name === block.name);
-        let result: ToolCallResult;
-
-        if (!tool) {
-          result = makeToolErrorResult(
-            `Tool '${block.name}' not found in available tools.`,
-            'tool-not-available'
-          );
-        } else {
-          try {
-            toolCtx?.onLog?.(`[Tool Call] ${block.name}(${block.inputJson.slice(0, 80)}...)`, 'info');
-            
-            result = await tool.handler(block.inputJson || '{}', toolCtx ? { ...toolCtx, toolCallId: block.id } : undefined);
-            toolCtx?.onLog?.(`[Tool Response] ${block.name} completed.`, 'success');
-          } catch (e: unknown) {
-            const msg = e instanceof Error ? e.message : 'Tool execution failed';
-            toolCtx?.onLog?.(`[Tool Error] ${block.name}: ${msg}`, 'error');
-            result = makeToolErrorResult(msg);
-          }
-        }
-
-        const resultText = extractTextFromToolResult(result);
-
-        toolResultBlocks.push({
-          type: 'tool_result',
-          tool_use_id: block.id,
-          content: [{ type: 'text', text: resultText }],
-          is_error: false,
-        } as AnthToolResultBlock);
-
-        finishedCalls.push({
-          id: block.id,
-          finished: true,
-          result,
-          function: { name: block.name, arguments: block.inputJson },
-        });
-      }));
-
-      
-      yield { tool_calls: finishedCalls } as ToolCallResponsePart;
-
-      
-      const continuationMessages: AnthMessageParam[] = [
-        ...messages,
-        { role: 'assistant', content: assistantContent },
-        { role: 'user', content: toolResultBlocks },
-      ];
-
-      
-      yield* this.streamOneTurn(
-        continuationMessages,
-        systemPrompt,
-        anthropicTools,
-        toolRequests,
-        userRequest,
-        toolCtx
-      );
     }
   }
 }

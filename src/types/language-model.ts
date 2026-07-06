@@ -11,12 +11,17 @@ export interface TextMessage {
 export interface ToolUseMessage {
   actor: 'ai';
   type: 'tool_use';
-  
+
   id: string;
-  
+
   name: string;
-  
+
   input: unknown;
+  // Opaque provider-specific data that must survive the history round-trip.
+  // Gemini requires each functionCall's `thoughtSignature` to be echoed back on
+  // the next turn or it rejects the request (400 INVALID_ARGUMENT). Other
+  // providers leave this undefined and ignore it.
+  providerMetadata?: Record<string, unknown>;
 }
 
 export interface ToolResultMessage {
@@ -93,14 +98,17 @@ export interface StreamToolCall {
   id?: string;
   function?: {
     name?: string;
-    
+
     arguments?: string;
   };
-  
+
   finished?: boolean;
   result?: ToolCallResult;
-  
+
   argumentsDelta?: boolean;
+  // Provider-specific data to preserve for the history round-trip (e.g. Gemini
+  // thoughtSignature). Carried from the stream into the ToolUseMessage.
+  providerMetadata?: Record<string, unknown>;
 }
 
 export type LanguageModelStreamPart = TextResponsePart | UsageResponsePart | ToolCallResponsePart;

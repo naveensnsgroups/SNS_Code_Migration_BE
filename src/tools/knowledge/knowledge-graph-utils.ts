@@ -128,9 +128,33 @@ export function deepMergeObjects(target: GraphData, source: GraphData): GraphDat
   return result;
 }
 
+// Canonical, key-order-independent serialization for dedup. Without deep key
+// sorting, two logically-identical entries whose object keys were emitted in a
+// different order (common LLM non-determinism) serialize differently and slip
+// past dedup — inflating rule/transform/test graphs and skewing the counts that
+// drive the Section 26 Risk Scorecard.
+function canonicalStringify(val: unknown): string {
+  if (Array.isArray(val)) return `[${val.map(canonicalStringify).join(',')}]`;
+  if (val !== null && typeof val === 'object') {
+    const obj = val as Record<string, unknown>;
+    const body = Object.keys(obj)
+      .sort()
+      .map((k) => `${JSON.stringify(k)}:${canonicalStringify(obj[k])}`)
+      .join(',');
+    return `{${body}}`;
+  }
+  return JSON.stringify(val);
+}
+
 function deduplicatedAppend(existing: any[], incoming: any[]): any[] {
-  const seen = new Set(existing.map((x) => JSON.stringify(x)));
-  const newItems = incoming.filter((item) => !seen.has(JSON.stringify(item)));
+  const seen = new Set(existing.map((x) => canonicalStringify(x)));
+  const newItems: any[] = [];
+  for (const item of incoming) {
+    const key = canonicalStringify(item);
+    if (seen.has(key)) continue;
+    seen.add(key); // also dedup within the incoming batch itself
+    newItems.push(item);
+  }
   return [...existing, ...newItems];
 }
 

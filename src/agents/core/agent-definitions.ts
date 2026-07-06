@@ -73,63 +73,13 @@ export const SCANNER_AGENT: AgentDefinition = {
   ],
 };
 
-export const STAGE1_PLANNER_AGENT_ID = 'migration-planner-stage1';
-
-export const STAGE1_PLANNER_AGENT: AgentDefinition = {
-  id: STAGE1_PLANNER_AGENT_ID,
-  name: 'Migration Planner (Stage 1)',
-  description:
-    'Analyzes the legacy codebase, detects the technology stack, classifies files by complexity, ' +
-    'and generates `Stage1_Analysis.md` and `migration-plan.md` in the modern output workspace. ' +
-    'Uses a two-phase approach: Phase 1 discovers project structure and Phase 2 produces the plan.',
-  tags: ['planner', 'analyzer', 'stage1'],
-  functions: [
-    GET_WORKSPACE_DIRECTORY_STRUCTURE_FUNCTION_ID,
-    GET_WORKSPACE_FILE_LIST_FUNCTION_ID,
-    FILE_CONTENT_FUNCTION_ID,
-    SEARCH_IN_WORKSPACE_FUNCTION_ID,
-    FIND_FILES_BY_PATTERN_FUNCTION_ID,
-    GET_DEPENDENCY_TREE_FUNCTION_ID,
-    GET_GIT_LOG_FUNCTION_ID,
-    GET_ENVIRONMENT_INFO_FUNCTION_ID,
-    EXTRACT_FILE_SYMBOLS_FUNCTION_ID,
-    SCAN_ASSET_FILES_FUNCTION_ID,
-    CAPTURED_SHELL_EXECUTION_ID,
-    
-    
-    
-    BATCH_READ_FILES_FUNCTION_ID,
-    GET_TASK_CONTEXT_FUNCTION_ID,
-    EDIT_TASK_CONTEXT_FUNCTION_ID,
-    WRITE_FILE_FUNCTION_ID,
-    APPEND_TO_KNOWLEDGE_GRAPH_FUNCTION_ID,
-    READ_KNOWLEDGE_GRAPH_FUNCTION_ID,
-  ],
-  variables: ['sessionId', 'legacyPath', 'modernPath', 'targetStack'],
-  languageModelRequirements: [
-    {
-      purpose: 'analysis',
-      identifier: 'alias:reasoning-model',  
-    }
-  ],
-  prompts: [
-    {
-      id: 'migration-planner-stage1-system',
-      defaultVariant: {
-        id: 'migration-planner-stage1-system-default',
-        label: 'Stage 1 Planner System Prompt',
-        
-        template: FILE_ANALYSIS_SYSTEM_PROMPT,
-      }
-    }
-  ],
-  agentSpecificVariables: [
-    { name: 'legacyPath',  description: 'Absolute path to the legacy project root.', usedInPrompt: true },
-    { name: 'modernPath',  description: 'Absolute path to the modern output folder.', usedInPrompt: true },
-    { name: 'targetStack', description: 'The target technology stack.',               usedInPrompt: true },
-    { name: 'sessionId',   description: 'Current migration session identifier.',      usedInPrompt: false },
-  ],
-};
+// NOTE: The former `STAGE1_PLANNER_AGENT` ("migration-planner-stage1") was removed.
+// It was a legacy unified planner, superseded by the Discovery → Analysis →
+// Graph-Resolver → Section-Writer sequence. It was still registered as an invokable
+// agent (surfaced via /api/config/agents) even though the pipeline never invoked it,
+// and its own description ("generates Stage1_Analysis.md") contradicted its assigned
+// prompt (FILE_ANALYSIS_SYSTEM_PROMPT, which states "You never write report documents").
+// The analysis phase now uses ANALYSIS_AGENT's tool set directly.
 
 import { agentService } from '../../core/agent-service.js';
 
@@ -227,7 +177,6 @@ export const SECTION_WRITER_AGENT: AgentDefinition = {
 };
 
 AgentRegistry.register(SCANNER_AGENT);
-AgentRegistry.register(STAGE1_PLANNER_AGENT);
 AgentRegistry.register(DISCOVERY_AGENT);
 AgentRegistry.register(GRAPH_RESOLVER_AGENT);
 AgentRegistry.register(SECTION_WRITER_AGENT);
@@ -247,6 +196,7 @@ export const ANALYSIS_AGENT: AgentDefinition = {
     BATCH_READ_FILES_FUNCTION_ID,
     EXTRACT_FILE_SYMBOLS_FUNCTION_ID,
     SEARCH_IN_WORKSPACE_FUNCTION_ID,
+    FIND_FILES_BY_PATTERN_FUNCTION_ID,   // locate imported local files (related_files_rule)
     GET_TASK_CONTEXT_FUNCTION_ID,
     EDIT_TASK_CONTEXT_FUNCTION_ID,
     APPEND_TO_KNOWLEDGE_GRAPH_FUNCTION_ID,
@@ -276,7 +226,6 @@ export const ANALYSIS_AGENT: AgentDefinition = {
 AgentRegistry.register(ANALYSIS_AGENT);
 
 agentService.registerAgent(SCANNER_AGENT);
-agentService.registerAgent(STAGE1_PLANNER_AGENT);
 agentService.registerAgent(DISCOVERY_AGENT);
 agentService.registerAgent(GRAPH_RESOLVER_AGENT);
 agentService.registerAgent(SECTION_WRITER_AGENT);
@@ -284,7 +233,6 @@ agentService.registerAgent(ANALYSIS_AGENT);
 
 export const ALL_AGENT_DEFINITIONS = [
   SCANNER_AGENT,
-  STAGE1_PLANNER_AGENT,
   DISCOVERY_AGENT,
   ANALYSIS_AGENT,
   GRAPH_RESOLVER_AGENT,

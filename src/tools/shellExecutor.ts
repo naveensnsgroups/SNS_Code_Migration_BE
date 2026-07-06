@@ -24,8 +24,28 @@ export interface ShellResult {
 }
 
 export class ShellExecutor {
-  private static activeProcesses: Map<string, ChildProcess> = new Map();
-  private static canceledSessions: Set<string>             = new Set();
+  // A session can run multiple shell commands concurrently, so track a SET of
+  // processes per session. A single-slot map would let a second spawn overwrite
+  // the first's handle, after which kill(sessionId) can no longer reach the
+  // still-running first process (leaked; Stop button broken for it).
+  private static activeProcesses: Map<string, Set<ChildProcess>> = new Map();
+  private static canceledSessions: Set<string>                   = new Set();
+
+  private static trackProcess(sessionId: string, child: ChildProcess): void {
+    let set = this.activeProcesses.get(sessionId);
+    if (!set) {
+      set = new Set();
+      this.activeProcesses.set(sessionId, set);
+    }
+    set.add(child);
+  }
+
+  private static untrackProcess(sessionId: string, child: ChildProcess): void {
+    const set = this.activeProcesses.get(sessionId);
+    if (!set) return;
+    set.delete(child);
+    if (set.size === 0) this.activeProcesses.delete(sessionId);
+  }
 
   
   static execute(
@@ -53,7 +73,7 @@ export class ShellExecutor {
         env: { ...process.env, FORCE_COLOR: '1' },
       });
 
-      this.activeProcesses.set(sessionId, child);
+      this.trackProcess(sessionId, child);
 
       
       child.stdout?.on('data', (data: Buffer) => {
@@ -93,11 +113,15 @@ export class ShellExecutor {
         if (settled) return;
         settled = true;
         clearTimeout(timeoutTimer);
-        this.activeProcesses.delete(sessionId);
+        this.untrackProcess(sessionId, child);
 
         const duration    = Date.now() - startTime;
         const wasCanceled = this.canceledSessions.has(sessionId);
-        this.canceledSessions.delete(sessionId);
+        // Only consume the canceled flag once no other process of this session
+        // is still running — they were all killed by the same cancel request.
+        if (!this.activeProcesses.has(sessionId)) {
+          this.canceledSessions.delete(sessionId);
+        }
 
         if (signal || killed) {
           resolve({
@@ -129,8 +153,10 @@ export class ShellExecutor {
         if (settled) return;
         settled = true;
         clearTimeout(timeoutTimer);
-        this.activeProcesses.delete(sessionId);
-        this.canceledSessions.delete(sessionId);
+        this.untrackProcess(sessionId, child);
+        if (!this.activeProcesses.has(sessionId)) {
+          this.canceledSessions.delete(sessionId);
+        }
 
         options.onLog?.(`[Command execution error]: ${err.message}`, true);
 
@@ -150,11 +176,13 @@ export class ShellExecutor {
 
   
   static kill(sessionId: string): boolean {
-    const child = this.activeProcesses.get(sessionId);
-    if (!child) return false;
+    const children = this.activeProcesses.get(sessionId);
+    if (!children || children.size === 0) return false;
 
     this.canceledSessions.add(sessionId);
-    this.killProcessTree(child);
+    for (const child of children) {
+      this.killProcessTree(child);
+    }
     this.activeProcesses.delete(sessionId);
     return true;
   }

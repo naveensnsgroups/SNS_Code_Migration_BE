@@ -41,7 +41,7 @@ export const getDirectoryStructureTool: ToolRequest = {
   handler: async (_arg_string: string, ctx?: ToolContext) => {
     const basePath = path.resolve(ctx!.legacyPath);
     if (!(await fs.pathExists(basePath))) {
-      return makeToolTextResult(JSON.stringify({ error: 'Directory does not exist' }));
+      return makeToolErrorResult('getWorkspaceDirectoryStructure: workspace directory does not exist.');
     }
     const tree = await buildTree(basePath);
     return makeToolTextResult(JSON.stringify(tree, null, 2));

@@ -60,7 +60,10 @@ export interface TokenUsage {
   cachedInputTokens?: number;
   readCachedInputTokens?: number;
   totalTokens: number;
-  estimatedCost: number;
+  /** null when no pricing rate is configured for the model(s) used — never a guessed number. */
+  estimatedCost: number | null;
+  /** true if estimatedCost is a real but PARTIAL sum — at least one model used had no configured rate. */
+  costIncomplete?: boolean;
   provider?: string;
   model?: string;
 }
