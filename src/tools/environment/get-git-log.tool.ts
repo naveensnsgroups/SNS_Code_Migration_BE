@@ -1,7 +1,4 @@
-// =============================================================================
-//  tools/environment/get-git-log.tool.ts
-//  Mirrors: GetGitLog (snside migration-git-tools.ts)
-// =============================================================================
+
 
 import { ToolRequest } from '../../types/tool.js';
 
@@ -10,9 +7,7 @@ import { makeToolTextResult, makeToolErrorResult } from '../../types/language-mo
 
 import { ShellExecutor } from '../shellExecutor.js';
 import { GET_GIT_LOG_FUNCTION_ID } from '../../common/workspace-functions.js';
-
-// ── Use the exact SNS IDE constant from workspace-functions.ts ────────────────
-// GET_GIT_LOG_FUNCTION_ID = 'getGitLog'
+import { parseToolArgs } from '../tool-args.js';
 
 export const getGitLogTool: ToolRequest = {
   id: GET_GIT_LOG_FUNCTION_ID,
@@ -30,8 +25,9 @@ export const getGitLogTool: ToolRequest = {
     required: []
   },
   handler: async (arg_string: string, ctx?: ToolContext) => {
-    const args: { maxCommits?: number } = JSON.parse(arg_string || '{}');
-    const max = args.maxCommits ?? 200;
+    const parsed = parseToolArgs<{ maxCommits?: number }>(arg_string, 'getGitLog');
+    if (!parsed.ok) return parsed.error;
+    const max = parsed.value.maxCommits ?? 200;
     try {
       const res = await ShellExecutor.execute(
         ctx!.sessionId,
@@ -39,7 +35,7 @@ export const getGitLogTool: ToolRequest = {
         { cwd: ctx!.legacyPath, timeoutMs: 15000 }
       );
       if (res.code !== 0) {
-        return makeToolTextResult(JSON.stringify({ error: 'Git log failed. Not a git repo or git not installed.', stderr: res.stderr }));
+        return makeToolErrorResult(`getGitLog: git log failed (not a git repo or git not installed). ${res.stderr ?? ''}`.trim());
       }
 
       const lines = res.stdout.split('\n');
@@ -68,7 +64,7 @@ export const getGitLogTool: ToolRequest = {
 
       return makeToolTextResult(JSON.stringify({ totalCommits: commits.length, commits: commits.slice(0, 20), highChurnFiles, deadCodeCandidates, note: `Full history: ${commits.length} commits analyzed.` }));
     } catch (err: unknown) {
-      return makeToolTextResult(JSON.stringify({ error: (err as Error).message }));
+      return makeToolErrorResult(`getGitLog failed: ${(err as Error).message}`);
     }
   }
 };

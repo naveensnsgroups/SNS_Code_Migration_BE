@@ -1,19 +1,11 @@
 import { Router, Request, Response, NextFunction } from 'express';
 import { ShellExecutor } from '../tools/shellExecutor.js';
 
-// ─────────────────────────────────────────────────────────────────────────────
-//  GET /api/mcp/status
-//  Returns real MCP (Model Context Protocol) server connection statuses.
-//  - filesystem-local: always connected (backend has direct file access)
-//  - git-connector:    checks if git is installed via ShellExecutor
-//  - chrome-devtools:  always disconnected (no browser in backend mode)
-// ─────────────────────────────────────────────────────────────────────────────
-
 const router = Router();
 
 router.get('/status', async (req: Request, res: Response, next: NextFunction) => {
   try {
-    // Check if git is available
+    
     let gitStatus = 'disconnected';
     let gitVersion = 'not installed';
     try {

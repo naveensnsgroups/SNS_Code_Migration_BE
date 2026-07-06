@@ -1,7 +1,4 @@
-// =============================================================================
-//  tools/output/copy-static-assets.tool.ts
-//  Mirrors: CopyStaticAssets (snside migration-asset-tools.ts)
-// =============================================================================
+
 
 import fs from 'fs-extra';
 import path from 'path';
@@ -11,7 +8,6 @@ import { ToolContext } from '../../types/tool.js';
 import { makeToolTextResult, makeToolErrorResult } from '../../types/language-model.js';
 
 import { COPY_STATIC_ASSETS_FUNCTION_ID } from '../../common/workspace-functions.js';
-// COPY_STATIC_ASSETS_FUNCTION_ID = 'copyStaticAssets' — SNS IDE exact value
 
 export const copyStaticAssetsTool: ToolRequest = {
   id: COPY_STATIC_ASSETS_FUNCTION_ID,

@@ -7,15 +7,19 @@ import fs from 'fs-extra';
 import path from 'path';
 import { fileURLToPath } from 'url';
 
+function pathsOverlap(candidate: string, reference: string): boolean {
+  const a = path.resolve(candidate).replace(/[\\/]+$/, '').toLowerCase();
+  const b = path.resolve(reference).replace(/[\\/]+$/, '').toLowerCase();
+  const sep = path.sep.toLowerCase();
+  
+  return a === b || a.startsWith(b + sep) || b.startsWith(a + sep);
+}
+
 const router = Router();
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
-/**
- * POST /api/migrate/start
- * Starts or resumes the background modernization pipeline.
- */
 router.post('/start', async (req: Request, res: Response, next: NextFunction) => {
   try {
     const {
@@ -34,48 +38,79 @@ router.post('/start', async (req: Request, res: Response, next: NextFunction) =>
       return;
     }
 
-    // Override modernPath if localOutputPath is specified
+    
+    
+    
+    
     if (localOutputPath && localOutputPath.trim() !== '') {
       const targetModernPath = path.resolve(localOutputPath);
+      const sourcePath       = path.resolve(session.projectPath);
+
+      if (pathsOverlap(targetModernPath, sourcePath)) {
+        res.status(400).json({
+          error:
+            `Invalid localOutputPath: "${targetModernPath}" overlaps with the source project path "${sourcePath}". ` +
+            'The migration output folder must be completely separate from the source project. ' +
+            'Please choose a different output directory (e.g. a sibling folder like "E:\\my-project-modern\\") ' +
+            'or leave the field blank to use the default session output folder.',
+          code: 'OUTPUT_PATH_OVERLAPS_SOURCE',
+        });
+        return;
+      }
+
       await SessionManager.updateSession(sessionId, { modernPath: targetModernPath });
-      await SessionManager.addLog(sessionId, `Modern output workspace set to custom local folder: ${targetModernPath}`, 'info');
+      await SessionManager.addLog(
+        sessionId,
+        `Modern output workspace set to custom local folder: ${targetModernPath}`,
+        'info'
+      );
     }
 
-    // Save AI config settings to session (used by orchestrator + agents)
-    // Save AI config settings to session (used by orchestrator + agents)
+    
+    
     const {
-      googleMaxRetries, googleRetryDelayRateLimit, googleRetryDelayOther
+      googleMaxRetries, googleRetryDelayRateLimit, googleRetryDelayOther,
+      mistralMaxRetries, mistralRetryDelayRateLimit, mistralRetryDelayOther,
+      modelPricing
     } = req.body as any;
 
     if (
-      toolsConfig || aliasesConfig || promptFragments ||
+      toolsConfig || aliasesConfig || promptFragments || modelPricing ||
       googleMaxRetries !== undefined || googleRetryDelayRateLimit !== undefined ||
-      googleRetryDelayOther !== undefined
+      googleRetryDelayOther !== undefined ||
+      mistralMaxRetries !== undefined || mistralRetryDelayRateLimit !== undefined ||
+      mistralRetryDelayOther !== undefined
     ) {
       await SessionManager.updateSession(sessionId, {
         ...(toolsConfig && { toolsConfig }),
         ...(aliasesConfig && { aliasesConfig }),
         ...(promptFragments && { promptFragments }),
+        // User-supplied per-model $/1M rates — never a hardcoded table. See
+        // agent-cost-estimator.ts. Absent entirely if the user configured none.
+        ...(modelPricing && { modelPricing }),
         ...(googleMaxRetries !== undefined && { googleMaxRetries: parseInt(googleMaxRetries, 10) }),
         ...(googleRetryDelayRateLimit !== undefined && { googleRetryDelayRateLimit: parseInt(googleRetryDelayRateLimit, 10) }),
         ...(googleRetryDelayOther !== undefined && { googleRetryDelayOther: parseInt(googleRetryDelayOther, 10) }),
+        ...(mistralMaxRetries !== undefined && { mistralMaxRetries: parseInt(mistralMaxRetries, 10) }),
+        ...(mistralRetryDelayRateLimit !== undefined && { mistralRetryDelayRateLimit: parseInt(mistralRetryDelayRateLimit, 10) }),
+        ...(mistralRetryDelayOther !== undefined && { mistralRetryDelayOther: parseInt(mistralRetryDelayOther, 10) }),
       });
     }
 
-    // Resolve final modernPath (may have been updated above by localOutputPath override)
+    
     const updatedSession = await SessionManager.getSession(sessionId);
     const resolvedModernPath = updatedSession?.modernPath ?? session.modernPath;
 
-    // Ensure output directory exists before watching
-    // (agent may not have created it yet — watcher will catch new files once they appear)
+    
+    
     await fs.ensureDir(resolvedModernPath);
 
-    // ── Start disk watcher (SNS IDE: ParcelFileSystemWatcherService.watch()) ──
-    // Non-blocking: watcher runs in background, emits SSE 'file_tree_changed' on any
-    // file CREATED/UPDATED/DELETED inside modernPath.
+    
+    
+    
     FileWatcherService.startWatching(sessionId, resolvedModernPath);
 
-    // Launch background worker without blocking the HTTP response
+    
     MigrationOrchestrator.startMigration(sessionId, targetStack, apiKey, apiKeys, agentsConfig);
 
     res.json({ success: true, message: 'Migration pipeline started.' });
@@ -84,11 +119,6 @@ router.post('/start', async (req: Request, res: Response, next: NextFunction) =>
   }
 });
 
-
-/**
- * POST /api/migrate/stop
- * Terminates the current active migration.
- */
 router.post('/stop', async (req: Request, res: Response, next: NextFunction) => {
   try {
     const { sessionId } = req.body;
@@ -100,7 +130,7 @@ router.post('/stop', async (req: Request, res: Response, next: NextFunction) => 
 
     MigrationOrchestrator.stopSession(sessionId);
 
-    // ── Stop disk watcher (SNS IDE: Disposable.dispose()) ──────────────────
+    
     FileWatcherService.stopWatching(sessionId);
 
     res.json({ success: true, message: 'Migration stopping requested.' });
@@ -109,10 +139,6 @@ router.post('/stop', async (req: Request, res: Response, next: NextFunction) => 
   }
 });
 
-/**
- * POST /api/migrate/pause
- * Pauses the current active migration.
- */
 router.post('/pause', async (req: Request, res: Response, next: NextFunction) => {
   try {
     const { sessionId } = req.body;
@@ -129,10 +155,6 @@ router.post('/pause', async (req: Request, res: Response, next: NextFunction) =>
   }
 });
 
-/**
- * GET /api/migrate/tree
- * Returns modernized project file tree
- */
 router.get('/tree', async (req: Request, res: Response, next: NextFunction) => {
   try {
     const { sessionId } = req.query;
@@ -161,15 +183,6 @@ router.get('/tree', async (req: Request, res: Response, next: NextFunction) => {
   }
 });
 
-/**
- * GET /api/migrate/tokens
- * Returns the persisted token usage from session.json for the given session.
- * Mirrors SNS IDE TokenUsageFrontendService.getTokenUsageData() aggregation pattern.
- *
- * Response includes:
- *   tokenUsage   — cumulative session totals (inputTokens, outputTokens, totalTokens, estimatedCost, model)
- *   modelBreakdown — per-model aggregation of tokenUsageHistory (SNS IDE pattern)
- */
 router.get('/tokens', async (req: Request, res: Response, next: NextFunction) => {
   try {
     const { sessionId } = req.query;
@@ -184,7 +197,7 @@ router.get('/tokens', async (req: Request, res: Response, next: NextFunction) =>
       return;
     }
 
-    // Aggregate history by model (SNS IDE TokenUsageFrontendService.aggregateTokenUsages pattern)
+    
     const history = session.tokenUsageHistory ?? [];
     const modelMap = new Map<string, {
       inputTokens: number;
@@ -215,6 +228,8 @@ router.get('/tokens', async (req: Request, res: Response, next: NextFunction) =>
       }
     }
 
+    const { estimateCost } = await import('../agents/compactor/agent-cost-estimator.js');
+
     const modelBreakdown = Array.from(modelMap.entries()).map(([modelId, data]) => {
       const breakdown: any = {
         modelId,
@@ -222,6 +237,12 @@ router.get('/tokens', async (req: Request, res: Response, next: NextFunction) =>
         outputTokens: data.outputTokens,
         totalTokens: data.inputTokens + data.outputTokens + data.cachedInputTokens,
         lastUsed: data.lastUsed,
+        // null when the user hasn't configured a rate for this exact model —
+        // rendered as "not available" by the frontend, never a guessed number.
+        estimatedCost: estimateCost(
+          data.inputTokens, data.outputTokens, modelId, session.modelPricing,
+          data.cachedInputTokens, data.readCachedInputTokens
+        ),
       };
       if (data.cachedInputTokens > 0) {
         breakdown.cachedInputTokens = data.cachedInputTokens;
@@ -236,6 +257,68 @@ router.get('/tokens', async (req: Request, res: Response, next: NextFunction) =>
       tokenUsage: session.tokenUsage ?? null,
       modelBreakdown,
       sessionId,
+    });
+  } catch (err) {
+    next(err);
+  }
+});
+
+// Update the user-supplied per-model pricing rates for a session. Applies
+// retroactively: /tokens recomputes cost fresh from session.modelPricing on
+// every read, so setting a rate here immediately re-prices already-recorded
+// token history — no re-run needed. See agent-cost-estimator.ts.
+router.post('/pricing', async (req: Request, res: Response, next: NextFunction) => {
+  try {
+    const { sessionId, modelPricing } = req.body as {
+      sessionId?: string;
+      modelPricing?: Record<string, { inputPerM: number; outputPerM: number; cacheWritePerM?: number; cacheReadPerM?: number }>;
+    };
+    if (!sessionId || !modelPricing) {
+      res.status(400).json({ error: 'Missing sessionId or modelPricing.', code: 'BAD_REQUEST' });
+      return;
+    }
+
+    const session = await SessionManager.getSession(sessionId);
+    if (!session) {
+      res.status(404).json({ error: 'Session not found.', code: 'NOT_FOUND' });
+      return;
+    }
+
+    await SessionManager.updateSession(sessionId, {
+      modelPricing: { ...(session.modelPricing ?? {}), ...modelPricing },
+    });
+
+    res.json({ success: true });
+  } catch (err) {
+    next(err);
+  }
+});
+
+// Full restorable session state for the frontend (e.g. after a page reload).
+// Deliberately omits apiKey/apiKeys — those are never sent back to the client.
+router.get('/state', async (req: Request, res: Response, next: NextFunction) => {
+  try {
+    const { sessionId } = req.query;
+    if (!sessionId) {
+      res.status(400).json({ error: 'Missing sessionId parameter.', code: 'BAD_REQUEST' });
+      return;
+    }
+
+    const session = await SessionManager.getSession(sessionId as string);
+    if (!session) {
+      res.status(404).json({ error: 'Session not found.', code: 'NOT_FOUND' });
+      return;
+    }
+
+    res.json({
+      sessionId:     session.sessionId,
+      status:        session.status,
+      fileTree:      session.fileTree,
+      detectedStack: session.detectedStack ?? null,
+      targetStack:   session.targetStack ?? null,
+      phases:        session.phases,
+      progress:      session.progress ?? 0,
+      currentFile:   session.currentFile ?? '',
     });
   } catch (err) {
     next(err);

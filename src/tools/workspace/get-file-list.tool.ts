@@ -1,7 +1,4 @@
-// =============================================================================
-//  tools/workspace/get-file-list.tool.ts
-//  Mirrors: GetWorkspaceFileList (snside workspace-functions.ts)
-// =============================================================================
+
 
 import fs from 'fs-extra';
 import path from 'path';
@@ -11,6 +8,7 @@ import { ToolContext } from '../../types/tool.js';
 import { makeToolTextResult, makeToolErrorResult } from '../../types/language-model.js';
 
 import { GET_WORKSPACE_FILE_LIST_FUNCTION_ID } from '../../common/workspace-functions.js';
+import { parseToolArgs } from '../tool-args.js';
 
 const EXCLUDE_DIRS = new Set([
   'node_modules', '.git', 'dist', 'build', '__pycache__',
@@ -38,13 +36,15 @@ export const getFileListTool: ToolRequest = {
     required: ['path']
   },
   handler: async (arg_string: string, ctx?: ToolContext) => {
-    const args: { path: string } = JSON.parse(arg_string || '{"path":""}');
+    const parsed = parseToolArgs<{ path?: string }>(arg_string, 'getWorkspaceFileList');
+    if (!parsed.ok) return parsed.error;
+    const args = parsed.value;
     const targetPath = path.resolve(ctx!.legacyPath, args.path || '');
     if (!targetPath.startsWith(path.resolve(ctx!.legacyPath))) {
-      return makeToolTextResult(JSON.stringify({ error: 'Access denied: path is outside the workspace.' }));
+      return makeToolErrorResult('getWorkspaceFileList: access denied — path is outside the workspace.');
     }
     if (!(await fs.pathExists(targetPath))) {
-      return makeToolTextResult(JSON.stringify({ error: `Directory does not exist: ${args.path || '/'}` }));
+      return makeToolErrorResult(`getWorkspaceFileList: directory does not exist: ${args.path || '/'}`);
     }
     const items = await fs.readdir(targetPath, { withFileTypes: true });
     const result = items

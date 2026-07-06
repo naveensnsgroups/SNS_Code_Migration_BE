@@ -1,13 +1,4 @@
-// =============================================================================
-//  huggingface/huggingface-service.ts — HuggingFace Inference API Service
-//
-//  SNS IDE folder structure:
-//    src/ai/huggingface/
-//      huggingface-service.ts  ← this file
-//
-//  Uses HuggingFace Inference API (text-generation endpoint).
-//  No streaming support yet — uses blocking fetch.
-// =============================================================================
+
 
 import { AIService, AICompletionResponse } from '../provider.js';
 

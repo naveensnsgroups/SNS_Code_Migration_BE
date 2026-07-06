@@ -11,11 +11,6 @@ interface SearchMatch {
   content: string;
 }
 
-/**
- * GET /api/search
- * Query: sessionId, query
- * Searches legacy codebase for matching text lines
- */
 router.get('/', async (req: Request, res: Response, next: NextFunction) => {
   try {
     const { sessionId, query } = req.query;
@@ -37,13 +32,13 @@ router.get('/', async (req: Request, res: Response, next: NextFunction) => {
       return;
     }
 
-    // Scan the codebase to get files list
+    
     const { fileList } = await scanProjectDirectory(session.projectPath);
     const matches: SearchMatch[] = [];
 
-    // Search in each source code file
+    
     for (const filePath of fileList) {
-      // Limit search to text files to avoid binary scans
+      
       if (!filePath.match(/\.(js|ts|tsx|jsx|json|py|java|php|rb|go|rs|cs|kt|env|yml|yaml|sql|sh|html|css|md|txt)$/i)) {
         continue;
       }
@@ -61,14 +56,14 @@ router.get('/', async (req: Request, res: Response, next: NextFunction) => {
               content: lineContent.trim(),
             });
 
-            // Cap results at 50 to prevent huge payloads
+            
             if (matches.length >= 50) {
               break;
             }
           }
         }
       } catch (err) {
-        // Skip files that fail to read
+        
       }
 
       if (matches.length >= 50) {

@@ -1,11 +1,4 @@
-// =============================================================================
-//  tools/knowledge/read-knowledge-graph.tool.ts
-//
-//  Reads a fully-merged knowledge graph at report-writing time (Phase 1_5).
-//  Called by the Graph Resolver Agent and Section Writer Agent.
-//
-//  SNS IDE standard: tool ID mirrors workspace-functions.ts constant exactly.
-// =============================================================================
+
 
 import path from 'path';
 import fs   from 'fs-extra';
@@ -14,9 +7,10 @@ import { ToolRequest, ToolContext } from '../../types/tool.js';
 import { makeToolTextResult, makeToolErrorResult } from '../../types/language-model.js';
 import { READ_KNOWLEDGE_GRAPH_FUNCTION_ID } from '../../common/workspace-functions.js';
 import { getValidGraphNames }              from './knowledge-graph-utils.js';
+import { readJsonWithRetry }               from '../../session/fileUtils.js';
 
 export const readKnowledgeGraphTool: ToolRequest = {
-  id:           READ_KNOWLEDGE_GRAPH_FUNCTION_ID,     // 'read-knowledge-graph'
+  id:           READ_KNOWLEDGE_GRAPH_FUNCTION_ID,     
   name:         'read-knowledge-graph',
   providerName: 'migration-knowledge',
   description:
@@ -91,17 +85,19 @@ export const readKnowledgeGraphTool: ToolRequest = {
 
     let data: Record<string, any> = {};
     try {
-      data = await fs.readJson(graphPath);
+      // Retry-on-transient-failure: a concurrent append's atomic rename can make
+      // the path briefly unavailable on Windows; plain readJson would hard-fail.
+      data = await readJsonWithRetry<Record<string, any>>(graphPath);
     } catch (err: any) {
       return makeToolErrorResult(
         `Failed to read graph "${args.graphName}": ${err.message}`
       );
     }
 
-    // Strip internal _sources metadata before returning to the agent.
+    
     const { _sources, ...domainData } = data;
 
-    // ── Optional filtering ───────────────────────────────────────────────────────────────
+    
     let filteredData: Record<string, any> = domainData;
     const f = args.filter;
     if (f) {
@@ -116,7 +112,7 @@ export const readKnowledgeGraphTool: ToolRequest = {
       }
     }
 
-    // ── Optional limit ─────────────────────────────────────────────────────────────────
+    
     let truncated = false;
     const limit = typeof args.limit === 'number' && args.limit > 0 ? args.limit : undefined;
     if (limit && Object.keys(filteredData).length > limit) {
@@ -125,7 +121,7 @@ export const readKnowledgeGraphTool: ToolRequest = {
       truncated = true;
     }
 
-    // ── Quality stats (symbol-graph only) ──────────────────────────────────────────────
+    
     let qualityStats: Record<string, number> | undefined;
     if (args.graphName === 'symbol') {
       const entries = Object.values(domainData) as any[];

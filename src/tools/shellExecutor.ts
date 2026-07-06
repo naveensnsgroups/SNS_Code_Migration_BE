@@ -1,22 +1,10 @@
-// =============================================================================
-//  tools/shellExecutor.ts
-//  Mirrors: ShellExecutionServerImpl (snside/packages/ai-terminal/src/node/shell-execution-server-impl.ts)
-//
-//  Key facts from SNS IDE reference:
-//  1. MAX_OUTPUT_SIZE = 1MB cap per stream (prevent memory blow-up)
-//  2. detached=true on non-Windows (for process group kill via -pid)
-//  3. windowsHide=true (prevent console windows from flashing on Windows)
-//  4. killProcessTree uses taskkill /T /F on Windows (kills child processes too)
-//  5. On close: timed_out detected via killed flag (not exit code 124)
-//  6. Returns { code, stdout, stderr, duration, timedOut, canceled }
-//  7. error event resolves (not rejects) — callers should check code !== 0
-// =============================================================================
+
 
 import { spawn, ChildProcess, execSync } from 'child_process';
 
-const DEFAULT_TIMEOUT_MS = 120_000;  // 2 minutes (matches SNS IDE)
-const MAX_TIMEOUT_MS     = 600_000;  // 10 minutes cap
-const MAX_OUTPUT_SIZE    = 1024 * 1024; // 1 MB per stream
+const DEFAULT_TIMEOUT_MS = 120_000;  
+const MAX_TIMEOUT_MS     = 600_000;  
+const MAX_OUTPUT_SIZE    = 1024 * 1024; 
 
 interface CommandOptions {
   cwd: string;
@@ -24,32 +12,42 @@ interface CommandOptions {
   timeoutMs?: number;
 }
 
-// ── Return type — matches ShellExecutionResult from SNS IDE ──────────────────
-// Source: snside/packages/ai-terminal/src/common/shell-execution-server.ts
 export interface ShellResult {
-  code:        number;           // exitCode from SNS IDE (0=success, undefined→-1 for killed)
+  code:        number;           
   stdout:      string;
   stderr:      string;
   error?:      string;
   duration:    number;
-  timedOut:    boolean;          // derived from killed flag (not in SNS IDE directly)
-  canceled?:   boolean;          // matches SNS IDE: canceled?: boolean
-  resolvedCwd?: string;          // matches SNS IDE: resolvedCwd?: string
+  timedOut:    boolean;          
+  canceled?:   boolean;          
+  resolvedCwd?: string;          
 }
 
 export class ShellExecutor {
-  private static activeProcesses: Map<string, ChildProcess> = new Map();
-  private static canceledSessions: Set<string>             = new Set();
+  // A session can run multiple shell commands concurrently, so track a SET of
+  // processes per session. A single-slot map would let a second spawn overwrite
+  // the first's handle, after which kill(sessionId) can no longer reach the
+  // still-running first process (leaked; Stop button broken for it).
+  private static activeProcesses: Map<string, Set<ChildProcess>> = new Map();
+  private static canceledSessions: Set<string>                   = new Set();
 
-  /**
-   * Run a terminal command inside the specified working directory.
-   * Mirrors ShellExecutionServerImpl.execute() from SNS IDE.
-   *
-   * Differences from SNS IDE (necessary for our standalone Express context):
-   *  - Uses sessionId instead of executionId (same semantics)
-   *  - onLog streams each line to SSE (SNS IDE uses Theia terminal widget)
-   *  - FORCE_COLOR=1 so build tools produce coloured output in the FE terminal
-   */
+  private static trackProcess(sessionId: string, child: ChildProcess): void {
+    let set = this.activeProcesses.get(sessionId);
+    if (!set) {
+      set = new Set();
+      this.activeProcesses.set(sessionId, set);
+    }
+    set.add(child);
+  }
+
+  private static untrackProcess(sessionId: string, child: ChildProcess): void {
+    const set = this.activeProcesses.get(sessionId);
+    if (!set) return;
+    set.delete(child);
+    if (set.size === 0) this.activeProcesses.delete(sessionId);
+  }
+
+  
   static execute(
     sessionId: string,
     command: string,
@@ -66,30 +64,30 @@ export class ShellExecutor {
       let killed  = false;
       let settled = false;
 
-      // ── Spawn (matches SNS IDE spawn options exactly) ──────────────────────
+      
       const child = spawn(command, [], {
         cwd:         options.cwd,
         shell:       true,
-        detached:    process.platform !== 'win32', // process group kill on Unix
-        windowsHide: true,                         // no console flash on Windows
+        detached:    process.platform !== 'win32', 
+        windowsHide: true,                         
         env: { ...process.env, FORCE_COLOR: '1' },
       });
 
-      this.activeProcesses.set(sessionId, child);
+      this.trackProcess(sessionId, child);
 
-      // ── Accumulate stdout (capped at 1 MB — matches SNS IDE) ──────────────
+      
       child.stdout?.on('data', (data: Buffer) => {
         const str = data.toString();
         if (stdout.length < MAX_OUTPUT_SIZE) {
           stdout += str;
         }
-        // Also stream each line to SSE terminal (our extension over SNS IDE)
+        
         str.split(/\r?\n/).forEach(line => {
           if (line.trim()) options.onLog?.(line, false);
         });
       });
 
-      // ── Accumulate stderr (capped at 1 MB — matches SNS IDE) ──────────────
+      
       child.stderr?.on('data', (data: Buffer) => {
         const str = data.toString();
         if (stderr.length < MAX_OUTPUT_SIZE) {
@@ -100,7 +98,7 @@ export class ShellExecutor {
         });
       });
 
-      // ── Timeout (matches SNS IDE setTimeout → killProcessTree) ─────────────
+      
       const timeoutTimer = setTimeout(() => {
         killed = true;
         options.onLog?.(
@@ -110,16 +108,20 @@ export class ShellExecutor {
         this.killProcessTree(child);
       }, effectiveTimeout);
 
-      // ── Process close (matches SNS IDE 'close' handler) ────────────────────
+      
       child.on('close', (code, signal) => {
         if (settled) return;
         settled = true;
         clearTimeout(timeoutTimer);
-        this.activeProcesses.delete(sessionId);
+        this.untrackProcess(sessionId, child);
 
         const duration    = Date.now() - startTime;
         const wasCanceled = this.canceledSessions.has(sessionId);
-        this.canceledSessions.delete(sessionId);
+        // Only consume the canceled flag once no other process of this session
+        // is still running — they were all killed by the same cancel request.
+        if (!this.activeProcesses.has(sessionId)) {
+          this.canceledSessions.delete(sessionId);
+        }
 
         if (signal || killed) {
           resolve({
@@ -146,17 +148,19 @@ export class ShellExecutor {
         }
       });
 
-      // ── Process error (matches SNS IDE 'error' handler — resolves not rejects) ──
+      
       child.on('error', (err: Error) => {
         if (settled) return;
         settled = true;
         clearTimeout(timeoutTimer);
-        this.activeProcesses.delete(sessionId);
-        this.canceledSessions.delete(sessionId);
+        this.untrackProcess(sessionId, child);
+        if (!this.activeProcesses.has(sessionId)) {
+          this.canceledSessions.delete(sessionId);
+        }
 
         options.onLog?.(`[Command execution error]: ${err.message}`, true);
 
-        // Resolve (not reject) so callers always get a result — check code !== 0
+        
         resolve({
           code:        1,
           stdout,
@@ -170,42 +174,36 @@ export class ShellExecutor {
     });
   }
 
-  /**
-   * Kills any currently running command for a session.
-   * Mirrors ShellExecutionServerImpl.cancel() + killProcessTree().
-   */
+  
   static kill(sessionId: string): boolean {
-    const child = this.activeProcesses.get(sessionId);
-    if (!child) return false;
+    const children = this.activeProcesses.get(sessionId);
+    if (!children || children.size === 0) return false;
 
     this.canceledSessions.add(sessionId);
-    this.killProcessTree(child);
+    for (const child of children) {
+      this.killProcessTree(child);
+    }
     this.activeProcesses.delete(sessionId);
     return true;
   }
 
-  /**
-   * Kills the process and its entire child tree.
-   * Mirrors ShellExecutionServerImpl.killProcessTree().
-   * On Windows: taskkill /T /F (terminate tree, force)
-   * On Unix: kill(-pid, SIGTERM) on the process group
-   */
+  
   private static killProcessTree(child: ChildProcess): void {
     if (!child.pid) return;
 
     try {
       if (process.platform === 'win32') {
-        // /T = kill entire process tree, /F = force
+        
         execSync(`taskkill /pid ${child.pid} /T /F`, { stdio: 'ignore' });
       } else {
-        // Negative PID kills the whole process group (requires detached=true)
+        
         process.kill(-child.pid, 'SIGTERM');
       }
     } catch {
       try {
         child.kill('SIGKILL');
       } catch {
-        // Process already dead
+        
       }
     }
   }

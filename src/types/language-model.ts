@@ -1,63 +1,43 @@
-// =============================================================================
-//  language-model.ts — SNS IDE Standard Message Types
-//
-//  Mirrors: snside/packages/ai-core/src/common/language-model.ts
-//
-//  All provider adapters (Gemini, Anthropic, OpenAI) MUST convert their
-//  native response formats into these types before returning.
-// =============================================================================
 
-// ── Message Actors ────────────────────────────────────────────────────────────
 
-/** Who sent this message. Mirrors SNS IDE MessageActor. */
 export type MessageActor = 'user' | 'ai' | 'system';
 
-// ── Message Types (the 4 we use in our tool loop) ────────────────────────────
-
-/** A plain text message from user, system, or AI. */
 export interface TextMessage {
   actor: MessageActor;
   type: 'text';
   text: string;
 }
 
-/**
- * An AI request to call a tool.
- * actor is always 'ai'. input is the parsed arguments object.
- * Mirrors SNS IDE ToolUseMessage.
- */
 export interface ToolUseMessage {
   actor: 'ai';
   type: 'tool_use';
-  /** Unique ID assigned by the LLM for this specific call — used to match the result. */
+
   id: string;
-  /** Tool name (same as ToolRequest.name). */
+
   name: string;
-  /** Raw parsed arguments object from the LLM. */
+
   input: unknown;
+  // Opaque provider-specific data that must survive the history round-trip.
+  // Gemini requires each functionCall's `thoughtSignature` to be echoed back on
+  // the next turn or it rejects the request (400 INVALID_ARGUMENT). Other
+  // providers leave this undefined and ignore it.
+  providerMetadata?: Record<string, unknown>;
 }
 
-/**
- * The result of a tool call fed back to the LLM.
- * actor is always 'user'. Mirrors SNS IDE ToolResultMessage.
- */
 export interface ToolResultMessage {
   actor: 'user';
   type: 'tool_result';
-  /** Must match the ToolUseMessage.id this result answers. */
+  
   tool_use_id: string;
-  /** Tool name — required by Gemini for functionResponse.name. */
+  
   name: string;
-  /** The result content from the tool handler. */
+  
   content: ToolCallResult;
-  /** Set true if the tool threw an error. */
+  
   is_error?: boolean;
 }
 
-/** Union of all message types used in a conversation. */
 export type LanguageModelMessage = TextMessage | ToolUseMessage | ToolResultMessage;
-
-// ── Type Guards ───────────────────────────────────────────────────────────────
 
 export namespace LanguageModelMessage {
   export function isText(m: LanguageModelMessage): m is TextMessage {
@@ -71,19 +51,12 @@ export namespace LanguageModelMessage {
   }
 }
 
-// ── Tool Call Result Types ────────────────────────────────────────────────────
-// Mirrors SNS IDE ToolCallResult / ToolCallContent
-
 export interface ToolCallTextContent  { type: 'text';  text: string }
 export interface ToolCallErrorContent { type: 'error'; data: string; errorKind?: string }
 export interface ToolCallContentWrapper {
   content: Array<ToolCallTextContent | ToolCallErrorContent>;
 }
 
-/**
- * What a tool handler returns.
- * Mirrors SNS IDE:  ToolCallResult = undefined | object | string | ToolCallContent
- */
 export type ToolCallResult = undefined | object | string | ToolCallContentWrapper;
 
 export function makeToolTextResult(text: string): ToolCallContentWrapper {
@@ -102,27 +75,21 @@ export function hasToolError(r: ToolCallResult): boolean {
   return isToolCallContentWrapper(r) && r.content.some(c => c.type === 'error');
 }
 
-// ── Stream Response Parts ─────────────────────────────────────────────────────
-// Mirrors SNS IDE LanguageModelStreamResponsePart
-
-/** A text chunk streamed from the LLM. */
 export interface TextResponsePart {
   content: string;
 }
 
-/** Token usage metadata — yielded at end of stream. */
 export interface UsageResponsePart {
-  /** Total input/prompt tokens for this request. */
+  
   input_tokens: number;
-  /** Total output/completion tokens for this request. */
+  
   output_tokens: number;
-  /** Optional: tokens written to cache (Anthropic). */
+  
   cache_creation_input_tokens?: number;
-  /** Optional: tokens read from cache (Anthropic). */
+  
   cache_read_input_tokens?: number;
 }
 
-/** A tool call streamed from the LLM (may be partial — argumentsDelta = true). */
 export interface ToolCallResponsePart {
   tool_calls: StreamToolCall[];
 }
@@ -131,14 +98,17 @@ export interface StreamToolCall {
   id?: string;
   function?: {
     name?: string;
-    /** If argumentsDelta = true, this is a delta to append. Otherwise it's complete. */
+
     arguments?: string;
   };
-  /** True when the full call is complete and the result is attached. */
+
   finished?: boolean;
   result?: ToolCallResult;
-  /** When true, function.arguments is a delta chunk, not complete JSON. */
+
   argumentsDelta?: boolean;
+  // Provider-specific data to preserve for the history round-trip (e.g. Gemini
+  // thoughtSignature). Carried from the stream into the ToolUseMessage.
+  providerMetadata?: Record<string, unknown>;
 }
 
 export type LanguageModelStreamPart = TextResponsePart | UsageResponsePart | ToolCallResponsePart;
@@ -155,9 +125,6 @@ export function isToolCallResponsePart(p: LanguageModelStreamPart): p is ToolCal
   return 'tool_calls' in p && Array.isArray((p as ToolCallResponsePart).tool_calls);
 }
 
-// ── Language Model Request ────────────────────────────────────────────────────
-// Mirrors SNS IDE LanguageModelRequest + UserRequest
-
 export interface LanguageModelRequest {
   messages: LanguageModelMessage[];
   tools?: import('./tool.js').ToolRequest[];
@@ -170,8 +137,6 @@ export interface UserRequest extends LanguageModelRequest {
   agentId?: string;
   modelName?: string;
 }
-
-// ── Language Model Response ───────────────────────────────────────────────────
 
 export interface LanguageModelStreamResponse {
   stream: AsyncIterable<LanguageModelStreamPart>;

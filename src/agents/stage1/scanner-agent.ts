@@ -239,7 +239,7 @@ async function readCachedScanResult(
       };
     }
   } catch {
-    /* cache miss — proceed with fresh scan */
+    
   }
   return null;
 }

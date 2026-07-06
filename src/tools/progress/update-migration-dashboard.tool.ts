@@ -1,7 +1,4 @@
-// =============================================================================
-//  tools/progress/update-migration-dashboard.tool.ts
-//  Mirrors: MigrationProgressDashboard (snside migration-progress-dashboard-tool.ts)
-// =============================================================================
+
 
 import { ToolRequest } from '../../types/tool.js';
 
@@ -11,7 +8,6 @@ import { makeToolTextResult, makeToolErrorResult } from '../../types/language-mo
 import { EventBroadcaster } from '../../routes/stream.js';
 import { SessionManager } from '../../session/sessionManager.js';
 import { UPDATE_MIGRATION_DASHBOARD_FUNCTION_ID } from '../../common/workspace-functions.js';
-// UPDATE_MIGRATION_DASHBOARD_FUNCTION_ID = 'update-migration-dashboard' — SNS IDE exact value
 
 export const updateMigrationDashboardTool: ToolRequest = {
   id: UPDATE_MIGRATION_DASHBOARD_FUNCTION_ID,

@@ -1,7 +1,4 @@
-// =============================================================================
-//  tools/output/write-file.tool.ts
-//  Writes output files (Stage1_Analysis.md etc.) to modernPath.
-// =============================================================================
+
 
 import { ToolRequest } from '../../types/tool.js';
 
@@ -10,7 +7,7 @@ import { makeToolTextResult, makeToolErrorResult } from '../../types/language-mo
 
 import { writeSessionFile } from '../fileWriter.js';
 import { WRITE_FILE_FUNCTION_ID } from '../../common/workspace-functions.js';
-// WRITE_FILE_FUNCTION_ID = 'write_file' — SNS IDE exact value
+import { parseToolArgs } from '../tool-args.js';
 
 export const writeFileTool: ToolRequest = {
   id: WRITE_FILE_FUNCTION_ID,
@@ -31,10 +28,15 @@ export const writeFileTool: ToolRequest = {
     required: ['content']
   },
   handler: async (arg_string: string, ctx?: ToolContext) => {
-    const args: { relativePath?: string; path?: string; file_path?: string; content: string } = JSON.parse(arg_string || '{}');
+    const parsed = parseToolArgs<{ relativePath?: string; path?: string; file_path?: string; content: string }>(arg_string, 'write_file');
+    if (!parsed.ok) return parsed.error;
+    const args = parsed.value;
     const resolvedPath = args.relativePath || args.path || args.file_path;
     if (!resolvedPath) {
-      return makeToolTextResult(JSON.stringify({ error: 'Missing destination path. Provide relativePath, path, or file_path.' }));
+      return makeToolErrorResult('write_file: missing destination path. Provide relativePath, path, or file_path.');
+    }
+    if (typeof args.content !== 'string') {
+      return makeToolErrorResult('write_file: missing required "content" (string).');
     }
     await writeSessionFile(ctx!.modernPath, resolvedPath, args.content);
     return makeToolTextResult(JSON.stringify({ success: true, path: resolvedPath, message: `File written successfully to ${resolvedPath}` }));

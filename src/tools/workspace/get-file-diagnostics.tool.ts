@@ -1,8 +1,4 @@
-// =============================================================================
-//  tools/workspace/get-file-diagnostics.tool.ts
-//  Mirrors: FileDiagnosticProvider (snside workspace-functions.ts)
-//  NOTE: Returns empty list in BE mode — no LSP available. Kept for prompt compat.
-// =============================================================================
+
 
 import { ToolRequest } from '../../types/tool.js';
 import { makeToolTextResult, makeToolErrorResult } from '../../types/language-model.js';

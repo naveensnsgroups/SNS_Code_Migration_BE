@@ -1,7 +1,4 @@
-// =============================================================================
-//  tools/workspace/get-dependency-tree.tool.ts
-//  Mirrors: GetDependencyTree (snside migration-dependency-tools.ts)
-// =============================================================================
+
 
 import fs from 'fs-extra';
 import path from 'path';
@@ -12,8 +9,7 @@ import { ToolContext } from '../../types/tool.js';
 import { makeToolTextResult, makeToolErrorResult } from '../../types/language-model.js';
 
 import { GET_DEPENDENCY_TREE_FUNCTION_ID } from '../../common/workspace-functions.js';
-
-// ── Manifest parsers ──────────────────────────────────────────────────────────
+import { parseToolArgs } from '../tool-args.js';
 
 function parsePackageJson(content: string) {
   try {
@@ -118,16 +114,15 @@ function parsePyprojectToml(content: string) {
   return { dependencies: deps };
 }
 
-// ── Tool ──────────────────────────────────────────────────────────────────────
-
 export const getDependencyTreeTool: ToolRequest = {
   id: GET_DEPENDENCY_TREE_FUNCTION_ID,
   name: 'getDependencyTree',
   providerName: 'migration-workspace',
   description:
-    'Reads and parses ALL dependency manifests in the legacy workspace ' +
-    '(package.json, requirements.txt, pom.xml, go.mod, Cargo.toml, build.gradle, composer.json, Gemfile, *.csproj, pyproject.toml). ' +
-    'Returns a structured JSON object with all dependency names and versions per manifest. ' +
+    'Reads and parses the dependency manifests in the legacy workspace it supports: ' +
+    'package.json, requirements.txt, Pipfile, pom.xml, build.gradle, go.mod, Cargo.toml, ' +
+    'Gemfile, composer.json, pyproject.toml (Poetry). ' +
+    'Returns a structured JSON object with dependency names and versions per manifest. ' +
     'Use this during Phase 1 Discovery to build the Dependency section in Stage1_Analysis.md.',
   parameters: {
     type: 'object',
@@ -137,10 +132,12 @@ export const getDependencyTreeTool: ToolRequest = {
     required: []
   },
   handler: async (arg_string: string, ctx?: ToolContext) => {
-    const args: { path?: string } = JSON.parse(arg_string || '{}');
+    const parsed = parseToolArgs<{ path?: string }>(arg_string, 'getDependencyTree');
+    if (!parsed.ok) return parsed.error;
+    const args = parsed.value;
     const basePath = args.path ? path.resolve(ctx!.legacyPath, args.path) : ctx!.legacyPath;
     if (!basePath.startsWith(path.resolve(ctx!.legacyPath))) {
-      return makeToolTextResult(JSON.stringify({ error: 'Access denied: path is outside the workspace.' }));
+      return makeToolErrorResult('getDependencyTree: access denied — path is outside the workspace.');
     }
 
     const manifests = [
@@ -166,7 +163,7 @@ export const getDependencyTreeTool: ToolRequest = {
           const content = await fs.readFile(filePath, 'utf-8');
           results.push({ type: m.type, file: m.file, ...m.parser(content) });
         }
-      } catch { /* skip unreadable */ }
+      } catch {  }
     }
 
     for (const relPath of extraPackageJsonFiles) {
@@ -174,7 +171,7 @@ export const getDependencyTreeTool: ToolRequest = {
       try {
         const content = await fs.readFile(path.join(basePath, relPath), 'utf-8');
         results.push({ type: 'npm', file: relPath, ...parsePackageJson(content) });
-      } catch { /* skip */ }
+      } catch {  }
     }
 
     if (results.length === 0) {

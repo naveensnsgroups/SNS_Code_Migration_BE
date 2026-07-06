@@ -1,34 +1,31 @@
-// ── Session Types for Express Backend ──────────────────────────────────────
+
 
 import { DetectedStack, FileNode, MigrationStatus, TargetStack, TokenUsage } from '../types.js';
+import { ModelPricingConfig } from '../agents/compactor/agent-cost-estimator.js';
 
-/**
- * Per-request token usage record — mirrors SNS IDE TokenUsageService.TokenUsage.
- * Stored as an array in session.json so the frontend can aggregate by model.
- */
 export interface TokenUsageEntry {
-  agentId: string;     // agent that made the request
-  model: string;       // model identifier
-  requestId: string;   // unique per LLM request turn
+  agentId: string;     
+  model: string;       
+  requestId: string;   
   inputTokens: number;
   outputTokens: number;
   cachedInputTokens?: number;
   readCachedInputTokens?: number;
-  timestamp: string;   // ISO string
+  timestamp: string;   
 }
 
 export interface MigrationSession {
   sessionId: string;
   status: MigrationStatus;
-  projectPath: string; // Path to the legacy files
-  modernPath: string;  // Path to the modern files
+  projectPath: string; 
+  modernPath: string;  
   detectedStack?: DetectedStack;
   targetStack?: TargetStack;
   apiKey?: string;
   totalFiles: number;
   rawFileCount?: number;
   completedFiles: number;
-  progress?: number;       // 0-100 — persisted for SSE reconnect replay (Fix 6)
+  progress?: number;       
   currentFile?: string;
   startedAt?: string;
   completedAt?: string;
@@ -46,18 +43,25 @@ export interface MigrationSession {
     grok?: string;
     groq?: string;
     openrouter?: string;
+    mistral?: string;
     huggingface?: string;
   };
   agentsConfig?: any;
-  // AI Config panel state
-  toolsConfig?: Record<string, boolean>;        // tool enablement map
-  aliasesConfig?: Record<string, string>;        // alias → resolved model string
-  promptFragments?: Record<string, string>;      // fragment id → custom prompt text
+  
+  toolsConfig?: Record<string, boolean>;
+  aliasesConfig?: Record<string, string>;
+  promptFragments?: Record<string, string>;
+  /** User-supplied per-model $/1M-token rates — see agent-cost-estimator.ts for why
+   *  this is never a hardcoded table. Absent/unconfigured models price as null. */
+  modelPricing?: ModelPricingConfig;
   googleMaxRetries?: number;
   googleRetryDelayRateLimit?: number;
   googleRetryDelayOther?: number;
-  tokenUsage?: TokenUsage;                       // cumulative token counts for this session
-  tokenUsageHistory?: TokenUsageEntry[];          // per-request history (SNS IDE TokenUsageService pattern)
+  mistralMaxRetries?: number;
+  mistralRetryDelayRateLimit?: number;
+  mistralRetryDelayOther?: number;
+  tokenUsage?: TokenUsage;                       
+  tokenUsageHistory?: TokenUsageEntry[];          
 }
 
 export interface LogEntry {

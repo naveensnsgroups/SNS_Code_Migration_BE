@@ -1,15 +1,4 @@
-// =============================================================================
-//  agent-definitions.ts — Formal Agent Registrations
-//
-//  Mirrors: snside/packages/ai-ide/src/common/orchestrator-chat-agent.ts
-//           snside/packages/ai-ide/src/common/universal-chat-agent.ts
-//
-//  Every agent used in the platform MUST be declared here.
-//  These definitions are used by:
-//   - AIConfigTab (UI: shows agent info, tools, model requirements)
-//   - MigrationOrchestrator (model resolution + tool filtering)
-//   - AgentRegistry (runtime lookup)
-// =============================================================================
+
 
 import { AgentDefinition, AgentRegistry } from '../../types/agent.js';
 import {
@@ -44,14 +33,6 @@ import {
   FILE_ANALYSIS_SYSTEM_PROMPT,
 } from '../../prompts/file-analysis-prompt.js';
 
-// =============================================================================
-//  SCANNER AGENT — Codebase Discovery (Pre-Stage 1)
-//
-//  Runs before Stage 1. Rapidly inspects manifests to classify the tech stack.
-//  Tools: read-only workspace tools only (no writes).
-//  Prompt: imported from prompts/scanner-prompt.ts
-// =============================================================================
-
 export const SCANNER_AGENT_ID = 'codebase-scanner';
 
 export const SCANNER_AGENT: AgentDefinition = {
@@ -73,7 +54,7 @@ export const SCANNER_AGENT: AgentDefinition = {
   languageModelRequirements: [
     {
       purpose: 'stack-detection',
-      identifier: 'alias:fast-model',   // Resolved via aliasesConfig in session
+      identifier: 'alias:fast-model',   
     }
   ],
   prompts: [
@@ -82,7 +63,7 @@ export const SCANNER_AGENT: AgentDefinition = {
       defaultVariant: {
         id: 'codebase-scanner-system-default',
         label: 'Scanner System Prompt',
-        // Template is stored in prompts/scanner-prompt.ts — not inlined here
+        
         template: SCANNER_SYSTEM_PROMPT,
       }
     }
@@ -92,95 +73,15 @@ export const SCANNER_AGENT: AgentDefinition = {
   ],
 };
 
-// =============================================================================
-//  STAGE 1 — Migration Planner Agent (Phase 1: Analysis + Phase 2: Planning)
-// =============================================================================
-
-export const STAGE1_PLANNER_AGENT_ID = 'migration-planner-stage1';
-
-export const STAGE1_PLANNER_AGENT: AgentDefinition = {
-  id: STAGE1_PLANNER_AGENT_ID,
-  name: 'Migration Planner (Stage 1)',
-  description:
-    'Analyzes the legacy codebase, detects the technology stack, classifies files by complexity, ' +
-    'and generates `Stage1_Analysis.md` and `migration-plan.md` in the modern output workspace. ' +
-    'Uses a two-phase approach: Phase 1 discovers project structure and Phase 2 produces the plan.',
-  tags: ['planner', 'analyzer', 'stage1'],
-  functions: [
-    GET_WORKSPACE_DIRECTORY_STRUCTURE_FUNCTION_ID,
-    GET_WORKSPACE_FILE_LIST_FUNCTION_ID,
-    FILE_CONTENT_FUNCTION_ID,
-    SEARCH_IN_WORKSPACE_FUNCTION_ID,
-    FIND_FILES_BY_PATTERN_FUNCTION_ID,
-    GET_DEPENDENCY_TREE_FUNCTION_ID,
-    GET_GIT_LOG_FUNCTION_ID,
-    GET_ENVIRONMENT_INFO_FUNCTION_ID,
-    EXTRACT_FILE_SYMBOLS_FUNCTION_ID,
-    SCAN_ASSET_FILES_FUNCTION_ID,
-    CAPTURED_SHELL_EXECUTION_ID,
-    // NOTE: TODO_WRITE, UPDATE_MIGRATION_DASHBOARD, COMPRESS_MIGRATION_CONTEXT,
-    // WRITE_MIGRATION_FILES, FIND_MIGRATION_SESSION, COMPARE_FILES removed —
-    // these are not registered in the tool registry and caused noisy warnings.
-    BATCH_READ_FILES_FUNCTION_ID,
-    GET_TASK_CONTEXT_FUNCTION_ID,
-    EDIT_TASK_CONTEXT_FUNCTION_ID,
-    WRITE_FILE_FUNCTION_ID,
-    APPEND_TO_KNOWLEDGE_GRAPH_FUNCTION_ID,
-    READ_KNOWLEDGE_GRAPH_FUNCTION_ID,
-  ],
-  variables: ['sessionId', 'legacyPath', 'modernPath', 'targetStack'],
-  languageModelRequirements: [
-    {
-      purpose: 'analysis',
-      identifier: 'alias:reasoning-model',  // Resolved by MigrationOrchestrator
-    }
-  ],
-  prompts: [
-    {
-      id: 'migration-planner-stage1-system',
-      defaultVariant: {
-        id: 'migration-planner-stage1-system-default',
-        label: 'Stage 1 Planner System Prompt',
-        // Template is stored in prompts/file-analysis-prompt.ts — single source of truth
-        template: FILE_ANALYSIS_SYSTEM_PROMPT,
-      }
-    }
-  ],
-  agentSpecificVariables: [
-    { name: 'legacyPath',  description: 'Absolute path to the legacy project root.', usedInPrompt: true },
-    { name: 'modernPath',  description: 'Absolute path to the modern output folder.', usedInPrompt: true },
-    { name: 'targetStack', description: 'The target technology stack.',               usedInPrompt: true },
-    { name: 'sessionId',   description: 'Current migration session identifier.',      usedInPrompt: false },
-  ],
-};
-
-// =============================================================================
-//  Registration — Auto-register all agents on module import
-//  Registers into BOTH:
-//   - AgentRegistry (existing type registry — used by agents for self-lookup)
-//   - agentService  (SNS IDE-standard singleton — used by orchestrator dispatch)
-// =============================================================================
+// NOTE: The former `STAGE1_PLANNER_AGENT` ("migration-planner-stage1") was removed.
+// It was a legacy unified planner, superseded by the Discovery → Analysis →
+// Graph-Resolver → Section-Writer sequence. It was still registered as an invokable
+// agent (surfaced via /api/config/agents) even though the pipeline never invoked it,
+// and its own description ("generates Stage1_Analysis.md") contradicted its assigned
+// prompt (FILE_ANALYSIS_SYSTEM_PROMPT, which states "You never write report documents").
+// The analysis phase now uses ANALYSIS_AGENT's tool set directly.
 
 import { agentService } from '../../core/agent-service.js';
-
-AgentRegistry.register(SCANNER_AGENT);
-AgentRegistry.register(STAGE1_PLANNER_AGENT);
-
-agentService.registerAgent(SCANNER_AGENT);
-agentService.registerAgent(STAGE1_PLANNER_AGENT);
-
-export const ALL_AGENT_DEFINITIONS = [
-  SCANNER_AGENT,
-  STAGE1_PLANNER_AGENT,
-];
-
-// =============================================================================
-//  DISCOVERY AGENT — Stage 1, Phase 1: Workspace Discovery Only
-//
-//  Job: catalog all source files, detect language/framework, build FILE_INDEX.
-//  Does NOT read source file content. Does NOT analyze code.
-//  Tools: read-only workspace tools + task context (no knowledge graph tools).
-// =============================================================================
 
 export const DISCOVERY_AGENT_ID = 'discovery-agent';
 
@@ -215,14 +116,6 @@ export const DISCOVERY_AGENT: AgentDefinition = {
   ],
 };
 
-// =============================================================================
-//  GRAPH RESOLVER AGENT — Stage 1, Phase 3: Cross-Reference Resolution
-//
-//  Job: resolve FK relationships, call chains, auth requirements, build call
-//  flows, and synthesize architecture overview from all knowledge graphs.
-//  Tools: knowledge graph read/write + search only (no file reading needed).
-// =============================================================================
-
 export const GRAPH_RESOLVER_AGENT_ID = 'graph-resolver-agent';
 
 export const GRAPH_RESOLVER_AGENT: AgentDefinition = {
@@ -237,7 +130,7 @@ export const GRAPH_RESOLVER_AGENT: AgentDefinition = {
     SEARCH_IN_WORKSPACE_FUNCTION_ID,
     FIND_FILES_BY_PATTERN_FUNCTION_ID,
     GET_WORKSPACE_DIRECTORY_STRUCTURE_FUNCTION_ID,
-    FILE_CONTENT_FUNCTION_ID,          // Added: FK resolution needs to READ entity files to confirm definitions
+    FILE_CONTENT_FUNCTION_ID,          
     GET_TASK_CONTEXT_FUNCTION_ID,
     EDIT_TASK_CONTEXT_FUNCTION_ID,
     APPEND_TO_KNOWLEDGE_GRAPH_FUNCTION_ID,
@@ -252,14 +145,6 @@ export const GRAPH_RESOLVER_AGENT: AgentDefinition = {
     { name: 'legacyPath', description: 'Absolute path to the legacy project root.', usedInPrompt: true },
   ],
 };
-
-// =============================================================================
-//  SECTION WRITER AGENT — Stage 1, Phase 4: One Section Per Run
-//
-//  Job: write exactly ONE section of Stage1_Analysis.md from its designated
-//  knowledge graph. Each run is a fresh context window — no exhaustion.
-//  Tools: read-knowledge-graph + write_file + task context (read only).
-// =============================================================================
 
 export const SECTION_WRITER_AGENT_ID = 'section-writer-agent';
 
@@ -291,19 +176,65 @@ export const SECTION_WRITER_AGENT: AgentDefinition = {
   ],
 };
 
-// Register new agents
+AgentRegistry.register(SCANNER_AGENT);
 AgentRegistry.register(DISCOVERY_AGENT);
 AgentRegistry.register(GRAPH_RESOLVER_AGENT);
 AgentRegistry.register(SECTION_WRITER_AGENT);
 
+export const ANALYSIS_AGENT_ID = 'analysis-agent';
+
+export const ANALYSIS_AGENT: AgentDefinition = {
+  id: ANALYSIS_AGENT_ID,
+  name: 'Analysis Agent',
+  description:
+    'Unified file analysis agent for Stage 1 Phase 2. ' +
+    'Reads all pending source files sequentially and writes to all applicable knowledge graphs. ' +
+    'Replaces 5 parallel domain-specific agents. Works across any language or framework.',
+  tags: ['analysis', 'stage1', 'phase2'],
+  functions: [
+    FILE_CONTENT_FUNCTION_ID,
+    BATCH_READ_FILES_FUNCTION_ID,
+    EXTRACT_FILE_SYMBOLS_FUNCTION_ID,
+    SEARCH_IN_WORKSPACE_FUNCTION_ID,
+    FIND_FILES_BY_PATTERN_FUNCTION_ID,   // locate imported local files (related_files_rule)
+    GET_TASK_CONTEXT_FUNCTION_ID,
+    EDIT_TASK_CONTEXT_FUNCTION_ID,
+    APPEND_TO_KNOWLEDGE_GRAPH_FUNCTION_ID,
+    READ_KNOWLEDGE_GRAPH_FUNCTION_ID,
+  ],
+  variables: ['legacyPath', 'language', 'framework'],
+  languageModelRequirements: [
+    { purpose: 'file-analysis', identifier: 'alias:reasoning-model' }
+  ],
+  prompts: [
+    {
+      id: 'analysis-agent-system',
+      defaultVariant: {
+        id: 'analysis-agent-system-default',
+        label: 'Analysis Agent System Prompt',
+        template: FILE_ANALYSIS_SYSTEM_PROMPT,
+      }
+    }
+  ],
+  agentSpecificVariables: [
+    { name: 'legacyPath', description: 'Absolute path to the legacy project root.', usedInPrompt: true },
+    { name: 'language',   description: 'Detected primary language.',                 usedInPrompt: true },
+    { name: 'framework',  description: 'Detected primary framework.',                usedInPrompt: true },
+  ],
+};
+
+AgentRegistry.register(ANALYSIS_AGENT);
+
+agentService.registerAgent(SCANNER_AGENT);
 agentService.registerAgent(DISCOVERY_AGENT);
 agentService.registerAgent(GRAPH_RESOLVER_AGENT);
 agentService.registerAgent(SECTION_WRITER_AGENT);
+agentService.registerAgent(ANALYSIS_AGENT);
 
-export const ALL_AGENT_DEFINITIONS_V2 = [
+export const ALL_AGENT_DEFINITIONS = [
   SCANNER_AGENT,
-  STAGE1_PLANNER_AGENT,
   DISCOVERY_AGENT,
+  ANALYSIS_AGENT,
   GRAPH_RESOLVER_AGENT,
   SECTION_WRITER_AGENT,
 ];

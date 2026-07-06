@@ -1,13 +1,4 @@
-// =============================================================================
-//  routes/config.ts
-//
-//  GET /api/config/agents       → real agent definitions (agent-definitions.ts)
-//  GET /api/config/tools        → all registered tools (toolRegistry)
-//  GET /api/config/skills       → real SKILL.md files from /skills directory
-//  GET /api/config/skill-content?id=  → full content of one skill file
-//
-//  Frontend AIConfigTab fetches these — NO hardcoded/mock data on FE side.
-// =============================================================================
+
 
 import { Router, Request, Response, NextFunction } from 'express';
 import fs from 'fs-extra';
@@ -17,7 +8,6 @@ import { toolRegistry } from '../core/tool-invocation-registry.js';
 
 const router = Router();
 
-// ── GET /api/config/agents ────────────────────────────────────────────────────
 router.get('/agents', (_req: Request, res: Response, next: NextFunction) => {
   try {
     const agents = ALL_AGENT_DEFINITIONS.map(agent => ({
@@ -44,7 +34,6 @@ router.get('/agents', (_req: Request, res: Response, next: NextFunction) => {
   } catch (err) { next(err); }
 });
 
-// ── GET /api/config/tools ─────────────────────────────────────────────────────
 router.get('/tools', (_req: Request, res: Response, next: NextFunction) => {
   try {
     const tools = toolRegistry.getAllFunctions().map(tool => ({
@@ -57,9 +46,6 @@ router.get('/tools', (_req: Request, res: Response, next: NextFunction) => {
   } catch (err) { next(err); }
 });
 
-// ── GET /api/config/skills ────────────────────────────────────────────────────
-// Reads the real /skills directory. Each skill = skills/<name>/SKILL.md
-// Parses YAML frontmatter (name, description) — SNS IDE standard format.
 router.get('/skills', async (_req: Request, res: Response, next: NextFunction) => {
   try {
     const skillsDir = path.join(process.cwd(), 'skills');
@@ -75,7 +61,7 @@ router.get('/skills', async (_req: Request, res: Response, next: NextFunction) =
         const content = await fs.readFile(skillFile, 'utf-8');
         const stat    = await fs.stat(skillFile);
 
-        // Parse YAML frontmatter
+        
         let skillName   = entry.name;
         let description = '';
         const fmMatch = content.match(/^---\r?\n([\s\S]*?)\r?\n---/);
@@ -100,8 +86,6 @@ router.get('/skills', async (_req: Request, res: Response, next: NextFunction) =
   } catch (err) { next(err); }
 });
 
-// ── GET /api/config/skill-content?id=<skill-id> ──────────────────────────────
-// Returns full SKILL.md content for the FE preview panel.
 router.get('/skill-content', async (req: Request, res: Response, next: NextFunction) => {
   try {
     const skillId = ((req.query['id'] as string) || '').replace(/[^a-z0-9-]/g, '');
@@ -116,8 +100,6 @@ router.get('/skill-content', async (req: Request, res: Response, next: NextFunct
   } catch (err) { next(err); }
 });
 
-// ── GET /api/config/sessions ──────────────────────────────────────────────────
-// Returns summary of all sessions for FE session restore on page refresh.
 import { SessionManager } from '../session/sessionManager.js';
 
 router.get('/sessions', async (_req: Request, res: Response, next: NextFunction) => {
@@ -125,7 +107,7 @@ router.get('/sessions', async (_req: Request, res: Response, next: NextFunction)
     const sessions = await SessionManager.listSessions();
     const summary = sessions
       .sort((a, b) => (b.startedAt ?? '').localeCompare(a.startedAt ?? ''))
-      .slice(0, 20) // cap at 20 most recent
+      .slice(0, 20) 
       .map(s => ({
         sessionId:  s.sessionId,
         status:     s.status,

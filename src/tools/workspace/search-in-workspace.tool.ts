@@ -1,7 +1,4 @@
-// =============================================================================
-//  tools/workspace/search-in-workspace.tool.ts
-//  Mirrors: WorkspaceSearchProvider (snside workspace-functions.ts)
-// =============================================================================
+
 
 import fs from 'fs-extra';
 import path from 'path';
@@ -12,6 +9,7 @@ import { ToolContext } from '../../types/tool.js';
 import { makeToolTextResult, makeToolErrorResult } from '../../types/language-model.js';
 
 import { SEARCH_IN_WORKSPACE_FUNCTION_ID } from '../../common/workspace-functions.js';
+import { parseToolArgs, requireStringArg } from '../tool-args.js';
 
 const IGNORE_PATTERNS = [
   '**/node_modules/**', '**/.git/**', '**/dist/**', '**/build/**',
@@ -38,7 +36,11 @@ export const searchInWorkspaceTool: ToolRequest = {
     required: ['query']
   },
   handler: async (arg_string: string, ctx?: ToolContext) => {
-    const args: { query: string } = JSON.parse(arg_string || '{}');
+    const parsed = parseToolArgs<{ query: string }>(arg_string, 'searchInWorkspace');
+    if (!parsed.ok) return parsed.error;
+    const q = requireStringArg(parsed.value.query, 'query', 'searchInWorkspace');
+    if (!q.ok) return q.error;
+    const args = { query: q.value };
     const basePath = ctx!.legacyPath;
     const files = await glob('**/*', { cwd: basePath, onlyFiles: true, ignore: IGNORE_PATTERNS, dot: true });
     const results: { file: string; line: number; content: string }[] = [];
@@ -57,7 +59,7 @@ export const searchInWorkspaceTool: ToolRequest = {
             }
           }
         }
-      } catch { /* skip binary/unreadable files */ }
+      } catch {  }
     }
 
     return makeToolTextResult(JSON.stringify({ results, total: results.length }));

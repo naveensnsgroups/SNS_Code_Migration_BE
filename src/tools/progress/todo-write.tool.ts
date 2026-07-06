@@ -1,7 +1,4 @@
-// =============================================================================
-//  tools/progress/todo-write.tool.ts
-//  Mirrors: TodoWriteTool (snside todo-tool.ts)
-// =============================================================================
+
 
 import { ToolRequest } from '../../types/tool.js';
 
@@ -11,7 +8,7 @@ import { makeToolTextResult, makeToolErrorResult } from '../../types/language-mo
 import { TaskContextManager } from '../../session/taskContext.js';
 import { EventBroadcaster } from '../../routes/stream.js';
 import { TODO_WRITE_FUNCTION_ID } from '../../common/workspace-functions.js';
-// TODO_WRITE_FUNCTION_ID = 'todoWrite' — SNS IDE exact value
+import { parseToolArgs } from '../tool-args.js';
 
 export const todoWriteTool: ToolRequest = {
   id: TODO_WRITE_FUNCTION_ID,
@@ -40,7 +37,12 @@ export const todoWriteTool: ToolRequest = {
     required: ['todos']
   },
   handler: async (arg_string: string, ctx?: ToolContext) => {
-    const args: { todos: Array<{ title: string; status: string; priority?: string }> } = JSON.parse(arg_string || '{}');
+    const parsed = parseToolArgs<{ todos: Array<{ title: string; status: string; priority?: string }> }>(arg_string, 'todoWrite');
+    if (!parsed.ok) return parsed.error;
+    const args = parsed.value;
+    if (!Array.isArray(args.todos)) {
+      return makeToolErrorResult('todoWrite: "todos" must be an array of { title, status } items.');
+    }
     await TaskContextManager.updateContext(ctx!.sessionId, { 'todo-list': args.todos });
     EventBroadcaster.broadcast(ctx!.sessionId, 'todo_update', { todos: args.todos, timestamp: new Date().toISOString() });
     const completed = args.todos.filter(t => t.status === 'completed').length;

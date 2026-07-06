@@ -1,7 +1,4 @@
-// =============================================================================
-//  tools/memory/edit-task-context.tool.ts
-//  Persistent memory — update/merge into the session task context JSON.
-// =============================================================================
+
 
 import { ToolRequest } from '../../types/tool.js';
 
@@ -10,7 +7,6 @@ import { makeToolTextResult, makeToolErrorResult } from '../../types/language-mo
 
 import { TaskContextManager } from '../../session/taskContext.js';
 import { EDIT_TASK_CONTEXT_FUNCTION_ID } from '../../common/workspace-functions.js';
-// EDIT_TASK_CONTEXT_FUNCTION_ID = 'edit_task_context' — SNS IDE exact value
 
 export const editTaskContextTool: ToolRequest = {
   id: EDIT_TASK_CONTEXT_FUNCTION_ID,
@@ -32,7 +28,19 @@ export const editTaskContextTool: ToolRequest = {
     required: ['updates']
   },
   handler: async (arg_string: string, ctx?: ToolContext) => {
-    const args: { updates: Record<string, unknown> } = JSON.parse(arg_string || '{}');
+    let args: { updates?: Record<string, unknown> };
+    try {
+      args = JSON.parse(arg_string || '{}');
+    } catch {
+      return makeToolErrorResult(
+        'edit_task_context: invalid JSON arguments. Re-send the call with a valid JSON object: { "updates": { "KEY": value } }.'
+      );
+    }
+    if (!args.updates || typeof args.updates !== 'object' || Array.isArray(args.updates)) {
+      return makeToolErrorResult(
+        'edit_task_context: missing required "updates" object. Example: { "updates": { "LAST_FILE_ANALYZED": "src/app.ts" } }.'
+      );
+    }
     await TaskContextManager.updateContext(ctx!.sessionId, args.updates);
     return makeToolTextResult(JSON.stringify({ success: true, keysUpdated: Object.keys(args.updates) }));
   }

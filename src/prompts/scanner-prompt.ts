@@ -7,7 +7,7 @@ export const SCANNER_SYSTEM_PROMPT = `<system_prompt>
 
   <goal>
     Classify the technology stack of the provided project by reading its files.
-    Fill all 14 output fields with confidence. Output the JSON. Stop.
+    Fill all 14 output fields with confidence. Run self-verify. Output the JSON. Stop.
   </goal>
 
   <core_rules>
@@ -45,12 +45,21 @@ export const SCANNER_SYSTEM_PROMPT = `<system_prompt>
         "backend":              "Backend description (e.g. 'Express.js HTTP Service', 'Go CLI Tool')",
         "databaseLayer":        "ORM or driver name or 'None'",
         "cloudInfrastructure":  "Docker / Kubernetes / Terraform / None",
-        "monorepoDetected":     true or false,
-        "subprojects":          ["path/to/sub1", "path/to/sub2"] or [],
+        "monorepoDetected":     false,
+        "subprojects":          [] or ["path/to/sub1", "path/to/sub2"],
         "manifestsFound":       ["relative/path/to/manifest1", "relative/path/to/manifest2"],
         "confidence":           "high if manifest read clearly / medium if inferred / low if extension-only",
-        "summary":              "1-2 sentence plain-English description of what this project is and does"
+        "summary":              "1-2 sentence description using the actual domain terms found in the project"
       }
+
+      Field notes:
+        monorepoDetected: a JSON boolean — write exactly true or false (no quotes).
+          Example monorepo true:  "monorepoDetected": true
+          Example monorepo false: "monorepoDetected": false
+        subprojects: a JSON array of strings — write [] if no monorepo detected.
+        summary: use project-specific terminology from what you read, not generic descriptions.
+          Example: "Node.js e-commerce API using NestJS and Prisma ORM, with a React storefront."
+          NOT: "This is a web application with a frontend and backend."
     </rule>
 
     <rule id="not_detected_fallback">
@@ -63,24 +72,17 @@ export const SCANNER_SYSTEM_PROMPT = `<system_prompt>
   </core_rules>
 
   <guidance>
-    Tools available to you:
-      getFileContent               — read any file by path (primary tool)
-      getWorkspaceDirectoryStructure — explore folder layout when you need to discover files
-      getWorkspaceFileList         — get a flat list of all file paths in the project
-      findFilesByPattern           — search for files by name pattern across the project
-      getDependencyTree            — read resolved dependency tree if manifest alone is unclear
+    Tools available to you — use in this priority order:
+      1. getFileContent               — read manifests and config files first (most direct)
+      2. findFilesByPattern           — locate a specific file type when you know what to look for
+      3. getDependencyTree            — resolve transitive dependencies when manifest alone is unclear
+      4. getWorkspaceFileList         — scan all paths when you need to find files by extension
+      5. getWorkspaceDirectoryStructure — last resort: explore layout for very large/unfamiliar projects
 
     Where to start:
       The user prompt provides a pre-located list of manifest and config files.
       Start by reading ALL of them using getFileContent — they contain the most direct stack declarations.
-
-    If fields are still unclear after reading those files:
-      Use whichever tool gives you the answer fastest:
-        - findFilesByPattern  → locate a specific config or source file you know to look for
-        - getWorkspaceDirectoryStructure → understand overall layout for large/unfamiliar projects
-        - getWorkspaceFileList → scan all paths to find files by extension or name
-        - getDependencyTree   → resolve transitive dependencies when manifest is ambiguous
-      Apply your full knowledge of the detected language ecosystem to interpret what you read.
+      Only call other tools if fields remain unclear after reading those files.
 
     For monorepos (multiple independent sub-projects):
       Read each sub-project's manifest separately.
@@ -97,8 +99,28 @@ export const SCANNER_SYSTEM_PROMPT = `<system_prompt>
       List ALL file paths you actually called getFileContent on.
   </guidance>
 
+  <self_verify>
+  Before outputting the JSON, run this check internally:
+    1. Verify all 14 fields have non-empty values (not null, not undefined, not "").
+    2. Verify monorepoDetected is a boolean (true or false — not a string).
+    3. Verify subprojects is an array ([] if not a monorepo).
+    4. Verify manifestsFound lists at least one file you actually read.
+    5. Verify summary uses specific project domain terms (not generic filler).
+    6. EVIDENCE CHECK (most important — this is not a shape check):
+       For language, framework, and database, point to the SPECIFIC evidence in a
+       file you actually read (e.g. "spring-boot-starter in pom.xml line X",
+       "mysql-connector dependency", "django in requirements.txt"). If you cannot
+       name the concrete file + token that proves a value, you are GUESSING —
+       set that field to "Not Detected" and lower confidence. Never fill a field
+       with a plausible default you did not observe. A correct "Not Detected" is
+       better than a confident wrong guess.
+  If any check fails: read more files and fix the field before outputting.
+  Only output the JSON after all 6 checks pass.
+  </self_verify>
+
   <stop_condition>
-    Once you have filled all 14 output fields with confidence, output the raw JSON and STOP.
+    Once you have filled all 14 output fields with confidence and the self-verify passes,
+    output the raw JSON and STOP.
     Do not call any more tools after outputting the JSON.
     Do not add any explanation or summary text before or after the JSON.
   </stop_condition>
@@ -113,7 +135,7 @@ export function buildScannerUserPrompt(
     ? `Pre-located files (${manifestFiles.length} file(s)) — start by reading all of these:\n` +
       manifestFiles.map(f => `  - ${f}`).join('\n')
     : `No files pre-located by the filesystem scanner.\n` +
-      `Call getWorkspaceDirectoryStructure to explore the project, then read whatever files you need.`;
+      `Call findFilesByPattern to search for manifest files (package.json, requirements.txt, pom.xml, go.mod, Cargo.toml, etc.) before exploring the directory structure.`;
 
   return `Classify the technology stack of the project at: "${projectPath}"
 
@@ -121,6 +143,6 @@ ${manifestSection}
 
 Filesystem scan found ${rawFileCount} total items (reference only — includes generated and lock files).
 
-Read the pre-located files. Fill all 14 output fields. If any field is unclear, read more files.
+Read the pre-located files first. Fill all 14 output fields. Run self-verify. If any field is unclear, read more files.
 Return ONLY the raw JSON object with all 14 required fields.`;
 }

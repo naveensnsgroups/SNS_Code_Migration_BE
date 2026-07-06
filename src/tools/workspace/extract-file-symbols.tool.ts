@@ -1,7 +1,4 @@
-// =============================================================================
-//  tools/workspace/extract-file-symbols.tool.ts
-//  Mirrors: ExtractFileSymbols (snside migration-large-file-tools.ts)
-// =============================================================================
+
 
 import fs from 'fs-extra';
 import path from 'path';
@@ -11,20 +8,21 @@ import { ToolContext } from '../../types/tool.js';
 import { makeToolTextResult, makeToolErrorResult } from '../../types/language-model.js';
 
 import { EXTRACT_FILE_SYMBOLS_FUNCTION_ID } from '../../common/workspace-functions.js';
-
-// ── Use the exact SNS IDE constant from workspace-functions.ts ────────────────
-// EXTRACT_FILE_SYMBOLS_FUNCTION_ID = 'extractFileSymbols'
+import { parseToolArgs } from '../tool-args.js';
 
 export const extractFileSymbolsTool: ToolRequest = {
   id: EXTRACT_FILE_SYMBOLS_FUNCTION_ID,
   name: 'extractFileSymbols',
   providerName: 'migration-workspace',
   description:
-    'Extracts the symbol map (functions, classes, methods) from a source file and returns ' +
-    'the recommended reading strategy based on file size. ' +
+    'Returns the file line count, a size-based reading strategy, and a BEST-EFFORT list of ' +
+    'top-level symbols (functions, classes, methods) found by regex. ' +
+    'The symbol list is a heuristic aid for planning reads — it is NOT a complete parse and may ' +
+    'miss or mislabel symbols, especially in languages other than JS/TS, Python, Java, Go, and PHP. ' +
+    'Treat symbolCount as approximate; always read the actual file content for real analysis. ' +
     'readingStrategy: SMALL (≤200 lines) = read whole file; MEDIUM (201-500) = symbol-targeted reads; ' +
     'LARGE (501-2500) = chunked reads with checkpoints; ULTRA_LARGE (2500+) = multi-pass streaming. ' +
-    'ALWAYS call this before getFileContent on any source file.',
+    'Useful to call before getFileContent on a source file to pick the reading strategy.',
   parameters: {
     type: 'object',
     properties: {
@@ -33,17 +31,22 @@ export const extractFileSymbolsTool: ToolRequest = {
     required: ['file']
   },
   handler: async (arg_string: string, ctx?: ToolContext) => {
-    const args: { file: string } = JSON.parse(arg_string || '{}');
+    const parsed = parseToolArgs<{ file: string }>(arg_string, 'extractFileSymbols');
+    if (!parsed.ok) return parsed.error;
+    const args = parsed.value;
+    if (!args.file) {
+      return makeToolErrorResult('extractFileSymbols: missing required parameter "file".');
+    }
     const targetPath = path.resolve(ctx!.legacyPath, args.file);
     if (!targetPath.startsWith(path.resolve(ctx!.legacyPath))) {
-      return makeToolTextResult(JSON.stringify({ error: 'Access denied.' }));
+      return makeToolErrorResult('extractFileSymbols: access denied — path is outside the workspace.');
     }
     if (!(await fs.pathExists(targetPath))) {
-      return makeToolTextResult(JSON.stringify({ error: `File not found: ${args.file}` }));
+      return makeToolErrorResult(`extractFileSymbols: file not found: ${args.file}`);
     }
     const stat = await fs.stat(targetPath);
     if (stat.isDirectory()) {
-      return makeToolTextResult(JSON.stringify({ error: 'Path is a directory.' }));
+      return makeToolErrorResult(`extractFileSymbols: "${args.file}" is a directory.`);
     }
 
     const content = await fs.readFile(targetPath, 'utf-8');
