@@ -1025,8 +1025,9 @@ export class PlannerAgent {
     onSectionDone?:   () => void
   ): Promise<void> {
     const nn          = String(section.n).padStart(2, '0');
-    const sectionFile = path.join(modernPath, '_analysis', 'sections', `section-${nn}.md`);
-    const graphsDir   = path.join(modernPath, '_analysis'); 
+    const sectionRelativePath = path.join('_analysis', 'sections', `section-${nn}.md`);
+    const sectionFile = path.join(modernPath, sectionRelativePath);
+    const graphsDir   = path.join(modernPath, '_analysis');
 
     if (alreadyWritten.has(section.n)) {
       onLog?.(`[PlannerAgent] Section ${section.n} already on disk — skipping.`, 'info');
@@ -1089,10 +1090,17 @@ export class PlannerAgent {
     onLog?.(`[PlannerAgent] Writing section ${section.n}: ${section.name}...`, 'info');
     const userPrompt = buildSectionUserPrompt(section, modernPath, language, framework);
 
-    
+    // Never trust the model's own write_file path argument for section writing —
+    // the correct destination is already known deterministically in code. Without
+    // this, a model that writes good content to the wrong path gets scored as
+    // "file was not created", triggers an unnecessary retry, and the good content
+    // is stranded at an orphaned path while a worse fallback lands at the real one.
+    const lockedTools = PlannerAgent.lockWriteFileTool(tools, sectionRelativePath);
+
+
     await withPhaseTimeout(
       AgentExecutor.execute(
-        provider, systemPrompt, userPrompt, tools, context,
+        provider, systemPrompt, userPrompt, lockedTools, context,
         resolvedModel, `section-${section.n}`
       ),
       PHASE_TIMEOUT_MS.section,
@@ -1123,7 +1131,7 @@ export class PlannerAgent {
     
     await withPhaseTimeout(
       AgentExecutor.execute(
-        provider, systemPrompt, retryPrompt, tools, context,
+        provider, systemPrompt, retryPrompt, lockedTools, context,
         resolvedModel, `section-${section.n}-retry`
       ),
       PHASE_TIMEOUT_MS.section,
@@ -1155,8 +1163,36 @@ export class PlannerAgent {
       onLog?.(`[PlannerAgent] Section ${section.n}: could not write from raw data. Informational note written.`, 'warning');
     }
 
-    
+
     onSectionDone?.();
+  }
+
+  // Returns a copy of `tools` where write_file ignores whatever relativePath/
+  // path/file_path the model supplies and always writes to `lockedRelativePath`
+  // instead. The model still sees the same tool name/description/schema — this
+  // is a deterministic server-side correction, not a prompt-level suggestion,
+  // so it cannot be defeated by the model choosing a different path.
+  private static lockWriteFileTool(
+    tools: ReturnType<typeof toolRegistry.getFunctions>,
+    lockedRelativePath: string
+  ): ReturnType<typeof toolRegistry.getFunctions> {
+    return tools.map(tool => {
+      if (tool.name !== 'write_file') return tool;
+      return {
+        ...tool,
+        handler: async (arg_string: string, ctx?: ToolContext) => {
+          let args: Record<string, unknown> = {};
+          try { args = JSON.parse(arg_string || '{}'); } catch { /* fall through with empty args */ }
+          const corrected = JSON.stringify({
+            ...args,
+            relativePath: lockedRelativePath,
+            path: undefined,
+            file_path: undefined,
+          });
+          return tool.handler(corrected, ctx);
+        },
+      };
+    });
   }
 
   
