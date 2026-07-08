@@ -77,7 +77,7 @@ export async function assembleSections(
       const placeholder = [
         `## ${n}. ${SECTION_NAMES[n]}`,
         '',
-        '> ⚠️ This section was not written during the analysis run.',
+        '> Warning: this section was not written during the analysis run.',
         '> Re-run the analyzer to generate this section.',
         '',
       ].join('\n');
@@ -93,7 +93,7 @@ export async function assembleSections(
   const completenessCount = 26 - missingSections.length;
   const statusRows = SECTION_NUMBERS.map(n => {
     const done = !missingSections.includes(n);
-    return `| ${String(n).padStart(2)} | ${SECTION_NAMES[n].padEnd(40)} | ${done ? '✅ Written' : '❌ Missing'} |`;
+    return `| ${String(n).padStart(2)} | ${SECTION_NAMES[n].padEnd(40)} | ${done ? 'Written' : 'Missing'} |`;
   });
 
   const statusBlock = [
@@ -101,8 +101,8 @@ export async function assembleSections(
     '',
     `> **${completenessCount}/26 sections written** · Generated: ${new Date().toISOString()}`,
     missingSections.length > 0
-      ? `> ⚠️ ${missingSections.length} section(s) incomplete — re-run the analyzer to complete them.`
-      : '> ✅ All 26 sections written successfully.',
+      ? `> ${missingSections.length} section(s) incomplete — re-run the analyzer to complete them.`
+      : '> All 26 sections written successfully.',
     '',
     '| #  | Section Name                             | Status    |',
     '|:---|:-----------------------------------------|:----------|',

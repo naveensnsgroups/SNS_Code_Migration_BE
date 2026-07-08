@@ -83,12 +83,18 @@ router.get('/:sessionId', async (req: Request, res: Response) => {
         })}\n\n`);
       }
 
-      
+
+      // `phase` must be the actual overall session status, not the phase id —
+      // most phase ids ('scan', 'section-writing', ...) aren't valid
+      // MigrationStatus values themselves ('scanning' is; 'scan' isn't), so
+      // reusing the id here made the FE log "unrecognized migration status"
+      // on every reconnect once that phase existed. sessionState.status is
+      // the one value that's always valid.
       for (const phase of sessionState.phases ?? []) {
         if (phase.status !== 'pending') {
           res.write(`data: ${JSON.stringify({
             type: 'phase_change',
-            data: { phaseId: phase.id, status: phase.status, phase: phase.id },
+            data: { phaseId: phase.id, status: phase.status, phase: sessionState.status },
             timestamp: ts,
           })}\n\n`);
         }

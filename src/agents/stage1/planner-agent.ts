@@ -4,6 +4,7 @@ import { DetectedStack, TargetStack } from '../../types.js';
 import { toolRegistry }               from '../../core/tool-invocation-registry.js';
 import { ToolContext }                 from '../../types/tool.js';
 import { AgentExecutor }              from '../core/agentExecutor.js';
+import { lockWriteFileTool }          from '../core/tool-locking.js';
 import { TaskContextManager }         from '../../session/taskContext.js';
 import { SessionManager }             from '../../session/sessionManager.js';
 import { resolveStreamingProvider }   from '../../ai/index.js';
@@ -735,7 +736,7 @@ export class PlannerAgent {
 
       if (graphsAreEmpty) {
         onLog?.(
-          '[PlannerAgent] ⚠️ Graph quality gate: all 3 primary graphs (symbol/entity/api) ' +
+          '[PlannerAgent] Graph quality gate: all 3 primary graphs (symbol/entity/api) ' +
           'have no data on disk after Phase 2. TypeScript resolvers will be no-ops. ' +
           'Pass C runs to save counters (all = 0).',
           'warning'
@@ -766,7 +767,16 @@ export class PlannerAgent {
         
         onLog?.('[PlannerAgent] Stage 3B/5: TypeScript Call-Flow Graph...', 'info');
         try {
-          const cfCount = await buildCallFlowGraph(modernPath);
+          const { traced: cfCount, shallow: shallowEntryPoints } = await buildCallFlowGraph(modernPath);
+          if (shallowEntryPoints.length > 0) {
+            await TaskContextManager.updateContext(sessionId, {
+              SHALLOW_CALLFLOW_ENTRIES: shallowEntryPoints,
+            });
+            onLog?.(
+              `[PlannerAgent] Stage 3B: ${shallowEntryPoints.length} entry point(s) did not resolve to any file — flagged as shallow.`,
+              'warning'
+            );
+          }
           onLog?.(`[PlannerAgent] Stage 3B complete — ${cfCount} entry point(s) traced.`, 'success');
         } catch (cfErr: any) {
           onLog?.(`[PlannerAgent] Stage 3B call-flow error: ${cfErr.message}. Continuing.`, 'warning');
@@ -785,7 +795,7 @@ export class PlannerAgent {
           await TaskContextManager.updateContext(sessionId, {
             MIGRATION_ORDER: migrationOrder.map((filePath, i) => ({ rank: i + 1, file: filePath })),
           });
-          onLog?.(`[PlannerAgent] Migration order: top ${migrationOrder.length} files ranked.`, 'success');
+          onLog?.(`[PlannerAgent] Migration order: ${migrationOrder.length} files topologically ranked.`, 'success');
         } else {
           onLog?.('[PlannerAgent] Migration order: no import data — imports-graph may be empty.', 'info');
         }
@@ -1095,7 +1105,7 @@ export class PlannerAgent {
     // this, a model that writes good content to the wrong path gets scored as
     // "file was not created", triggers an unnecessary retry, and the good content
     // is stranded at an orphaned path while a worse fallback lands at the real one.
-    const lockedTools = PlannerAgent.lockWriteFileTool(tools, sectionRelativePath);
+    const lockedTools = lockWriteFileTool(tools, sectionRelativePath);
 
 
     await withPhaseTimeout(
@@ -1167,35 +1177,6 @@ export class PlannerAgent {
     onSectionDone?.();
   }
 
-  // Returns a copy of `tools` where write_file ignores whatever relativePath/
-  // path/file_path the model supplies and always writes to `lockedRelativePath`
-  // instead. The model still sees the same tool name/description/schema — this
-  // is a deterministic server-side correction, not a prompt-level suggestion,
-  // so it cannot be defeated by the model choosing a different path.
-  private static lockWriteFileTool(
-    tools: ReturnType<typeof toolRegistry.getFunctions>,
-    lockedRelativePath: string
-  ): ReturnType<typeof toolRegistry.getFunctions> {
-    return tools.map(tool => {
-      if (tool.name !== 'write_file') return tool;
-      return {
-        ...tool,
-        handler: async (arg_string: string, ctx?: ToolContext) => {
-          let args: Record<string, unknown> = {};
-          try { args = JSON.parse(arg_string || '{}'); } catch { /* fall through with empty args */ }
-          const corrected = JSON.stringify({
-            ...args,
-            relativePath: lockedRelativePath,
-            path: undefined,
-            file_path: undefined,
-          });
-          return tool.handler(corrected, ctx);
-        },
-      };
-    });
-  }
-
-  
   
 
   private static async validateSectionFile(
@@ -1220,11 +1201,13 @@ export class PlannerAgent {
 
   // Maps a section's source graph name to the DATA_GAP_* flag Pass C/D save when
   // that graph exists but holds zero real entries (see graph-resolution-prompt.ts).
-  // Only entity/api/symbol are covered — those are the three graphs Pass C checks.
+  // entity/api/symbol/rule/db are covered — those are the five graphs Pass C checks.
   private static readonly DATA_GAP_KEY_BY_GRAPH: Record<string, string> = {
     entity: 'DATA_GAP_ENTITY',
     api:    'DATA_GAP_API',
     symbol: 'DATA_GAP_SYMBOL',
+    rule:   'DATA_GAP_RULE',
+    db:     'DATA_GAP_DB',
   };
 
   private static async writeEmptySection(
@@ -1252,7 +1235,7 @@ export class PlannerAgent {
       ? [
           `## ${section.n}. ${section.name}`,
           '',
-          `> ⚠️ DATA GAP WARNING: the \`${section.graph}\` graph is empty, but graph resolution ` +
+          `> DATA GAP WARNING: the \`${section.graph}\` graph is empty, but graph resolution ` +
             `recorded this codebase as having real entries for it. This indicates a Phase 2 ` +
             `(File Analysis) coverage gap — this section is likely INCOMPLETE, not genuinely empty.`,
           `> Re-run the analysis phase to recover this data.`,
@@ -1301,7 +1284,7 @@ export class PlannerAgent {
       const lines: string[] = [
         `## ${section.n}. ${section.name}`,
         '',
-        `> ⚠️ LLM section writer failed after 2 attempts. Raw graph data follows.`,
+        `> LLM section writer failed after 2 attempts. Raw graph data follows.`,
         `> This data was written directly by the TypeScript assembler from \`${section.graph}-graph.json\`.`,
         '',
       ];
@@ -1406,7 +1389,7 @@ export class PlannerAgent {
         });
         if (realEntries.length === 0) {
           onLog?.(
-            `[GraphValidator] ⚠️ ${check.name}-graph: ${realKeys.length} key(s) but 0 real data entries` +
+            `[GraphValidator] ${check.name}-graph: ${realKeys.length} key(s) but 0 real data entries` +
             ` (hollow graph — only metadata or empty objects). ` +
             `${check.sectionRef} will use TypeScript fallback or "not applicable" note.` +
             (check.critical ? ' (CRITICAL — check agent logs for errors)' : ''),
@@ -1414,12 +1397,12 @@ export class PlannerAgent {
           );
         } else {
           onLog?.(
-            `[GraphValidator] ✅ ${check.name}-graph: ${realEntries.length} real entries. ${check.sectionRef} ready.`,
+            `[GraphValidator] ${check.name}-graph: ${realEntries.length} real entries. ${check.sectionRef} ready.`,
             'success'
           );
         }
       } catch {
-        onLog?.(`[GraphValidator] ⚠️ Could not read ${check.name}-graph.json.`, 'warning');
+        onLog?.(`[GraphValidator] Could not read ${check.name}-graph.json.`, 'warning');
       }
     }
   }
@@ -1535,7 +1518,7 @@ export class PlannerAgent {
 
       if (pathErrorCount > 0) {
         onLog?.(
-          `[PlannerAgent] ⚠️ FILE_INDEX path validation: ${pathErrorCount} entries point to ` +
+          `[PlannerAgent] FILE_INDEX path validation: ${pathErrorCount} entries point to ` +
           `non-existent files (marked PATH_ERROR). This is usually caused by the Discovery Agent ` +
           `writing truncated paths. These files will be skipped in Phase 2.`,
           'warning'

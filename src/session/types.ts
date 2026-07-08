@@ -2,6 +2,7 @@
 
 import { DetectedStack, FileNode, MigrationStatus, TargetStack, TokenUsage } from '../types.js';
 import { ModelPricingConfig } from '../agents/compactor/agent-cost-estimator.js';
+import { MigrationTaskEntry, RuleCoverageEntry } from '../agents/stage2/types.js';
 
 export interface TokenUsageEntry {
   agentId: string;     
@@ -60,8 +61,13 @@ export interface MigrationSession {
   mistralMaxRetries?: number;
   mistralRetryDelayRateLimit?: number;
   mistralRetryDelayOther?: number;
-  tokenUsage?: TokenUsage;                       
-  tokenUsageHistory?: TokenUsageEntry[];          
+  tokenUsage?: TokenUsage;
+  tokenUsageHistory?: TokenUsageEntry[];
+
+  // Stage 2 — populated by MIGRATION_PLANNER_AGENT / CODE_GENERATOR_AGENT /
+  // the verification loop. Absent entirely until a session reaches Stage 2.
+  migrationTaskList?: MigrationTaskEntry[];
+  ruleCoverageReport?: RuleCoverageEntry[];
 }
 
 export interface LogEntry {

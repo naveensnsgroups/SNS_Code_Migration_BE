@@ -262,6 +262,42 @@ EXAMPLE — a ROUTE/ROUTER file (any framework: Express, Flask, Spring, Laravel,
   - Leave request:{} and responses:{} empty — that is correct for route-only files
   - NEVER use assumed names or names from other projects — only what you READ in this file
   - NEVER call with data:{} — always include at least one route entry with method+path+handler
+
+  ROUTE MOUNTING / PREFIX COMPOSITION (apply to ANY language/framework):
+  A file that wires a sub-router/blueprint/controller into the app under a path
+  prefix is NOT itself a callable HTTP entry point. Examples of a MOUNT statement
+  (do NOT create an api-graph entry for these): Express/Koa "app.use('/api/user',
+  userRouter)" or "router.use(prefix, subRouter)"; Flask/FastAPI
+  "app.register_blueprint(bp, url_prefix='/api/user')" or
+  "app.include_router(router, prefix='/api/user')"; Django
+  "path('api/user/', include('user.urls'))". The mounted variable
+  (userRouter / bp / router) is a router object, not a function — it can never
+  resolve to a symbol-graph entry, so recording it as a handler produces a dead,
+  unresolvable api-graph entry.
+
+  Instead, when you find a MOUNT statement:
+    1. Do NOT write an api-graph entry keyed by the mount line itself.
+    2. Resolve which FILE the mounted router/blueprint/controller is imported
+       from (follow the import path).
+    3. Save the mapping via edit_task_context: merge into a
+       ROUTE_MOUNT_PREFIXES object keyed by that file's exact path, e.g.
+       { "ROUTE_MOUNT_PREFIXES": { "backend/routes/userRoutes.js": "/api/user" } }
+
+  When you later analyze THAT router/blueprint/controller file and find its own
+  local route definitions (e.g. "router.post('/register', registerUser)"):
+    1. Call get_task_context and check ROUTE_MOUNT_PREFIXES for an entry whose
+       key matches the CURRENT file's path.
+    2. If found, the api-graph key MUST be the composed full path:
+       prefix + local path (e.g. "/api/user" + "/register" = "POST /api/user/register").
+       NEVER write just the local fragment ("POST /register") if a prefix exists
+       for this file — that silently records the wrong URL.
+    3. If no prefix mapping exists yet for this file (the mount statement in the
+       parent file hasn't been analyzed yet, or there is no separate mount file —
+       e.g. NestJS/Spring where the prefix lives on the SAME file via a class-level
+       decorator like @Controller('/api/user') alongside method-level @Get/@Post),
+       compose the prefix directly from what is visible in THIS file, or fall back
+       to the local path only as a last resort — never invent a prefix you did not
+       read somewhere.
 </extraction_guard>
 
 For each PENDING file, execute steps in this EXACT ORDER — no shortcuts, no reordering:

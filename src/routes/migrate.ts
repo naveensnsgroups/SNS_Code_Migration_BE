@@ -1,11 +1,16 @@
 import { Router, Request, Response, NextFunction } from 'express';
 import { SessionManager } from '../session/sessionManager.js';
 import { MigrationOrchestrator } from '../agents/core/migrationOrchestrator.js';
-import { MigrateStartRequest } from '../types.js';
+import { MigrationAgent } from '../agents/stage2/migration-agent.js';
+import { EventBroadcaster } from './stream.js';
+import { MigrateStartRequest, TargetStack } from '../types.js';
 import { FileWatcherService } from '../services/fileWatcherService.js';
 import fs from 'fs-extra';
 import path from 'path';
-import { fileURLToPath } from 'url';
+
+const planningSessions   = new Set<string>();
+const generationSessions = new Set<string>();
+const verificationSessions = new Set<string>();
 
 function pathsOverlap(candidate: string, reference: string): boolean {
   const a = path.resolve(candidate).replace(/[\\/]+$/, '').toLowerCase();
@@ -16,9 +21,6 @@ function pathsOverlap(candidate: string, reference: string): boolean {
 }
 
 const router = Router();
-
-const __filename = fileURLToPath(import.meta.url);
-const __dirname = path.dirname(__filename);
 
 router.post('/start', async (req: Request, res: Response, next: NextFunction) => {
   try {
@@ -311,15 +313,257 @@ router.get('/state', async (req: Request, res: Response, next: NextFunction) => 
     }
 
     res.json({
-      sessionId:     session.sessionId,
-      status:        session.status,
-      fileTree:      session.fileTree,
-      detectedStack: session.detectedStack ?? null,
-      targetStack:   session.targetStack ?? null,
-      phases:        session.phases,
-      progress:      session.progress ?? 0,
-      currentFile:   session.currentFile ?? '',
+      sessionId:          session.sessionId,
+      status:             session.status,
+      fileTree:           session.fileTree,
+      detectedStack:      session.detectedStack ?? null,
+      targetStack:        session.targetStack ?? null,
+      phases:             session.phases,
+      progress:           session.progress ?? 0,
+      currentFile:        session.currentFile ?? '',
+      migrationTaskList:  session.migrationTaskList ?? null,
+      ruleCoverageReport: session.ruleCoverageReport ?? null,
     });
+  } catch (err) {
+    next(err);
+  }
+});
+
+// Stage 2 — Migration Planning. Requires Stage 1 to have already produced
+// graphs for this session (detectedStack must be set). Runs asynchronously,
+// same fire-and-forget shape as /start; progress surfaces via SSE + /state.
+router.post('/plan', async (req: Request, res: Response, next: NextFunction) => {
+  try {
+    const { sessionId, targetStack, apiKey, apiKeys } = req.body as {
+      sessionId?: string; targetStack?: TargetStack;
+      apiKey?: string; apiKeys?: Record<string, string>;
+    };
+
+    if (!sessionId || !targetStack) {
+      res.status(400).json({ error: 'Missing required parameters: sessionId and targetStack are required.', code: 'BAD_REQUEST' });
+      return;
+    }
+
+    const session = await SessionManager.getSession(sessionId);
+    if (!session) {
+      res.status(404).json({ error: 'Session not found.', code: 'NOT_FOUND' });
+      return;
+    }
+    if (!session.detectedStack) {
+      res.status(400).json({
+        error: 'Stage 1 analysis has not completed for this session yet — run /start first.',
+        code: 'STAGE1_INCOMPLETE',
+      });
+      return;
+    }
+    if (planningSessions.has(sessionId)) {
+      res.status(409).json({ error: 'Migration planning is already running for this session.', code: 'ALREADY_RUNNING' });
+      return;
+    }
+
+    // Stage 1 wipes session.apiKey/apiKeys on completion (MigrationOrchestrator,
+    // end of runPipeline) — the same security discipline is followed here: the
+    // key is stored only for the duration of this run, then cleared again below.
+    await SessionManager.updateSession(sessionId, { targetStack, apiKey, apiKeys });
+
+    // Mirrors MigrationOrchestrator.updatePhase's shape: the phase id itself
+    // becomes the overall session status while active, and reverts to
+    // 'complete' once this sub-stage finishes — Stage 1 remains the last
+    // fully-completed stage until Code Generation/Verification/Assembly exist.
+    const updatePhase = async (status: 'active' | 'done' | 'error') => {
+      const current = await SessionManager.getSession(sessionId);
+      if (!current) return;
+      const phases = current.phases.map(p => p.id === 'migration-planning' ? { ...p, status } : p);
+      const overallStatus = status === 'active' ? 'migration-planning' : 'complete';
+      await SessionManager.updateSession(sessionId, { phases, status: overallStatus });
+      EventBroadcaster.broadcast(sessionId, 'phase_change', { phase: overallStatus, phaseId: 'migration-planning', status });
+    };
+
+    planningSessions.add(sessionId);
+    await updatePhase('active');
+
+    MigrationAgent.runPlanning(
+      sessionId,
+      session.projectPath,
+      session.modernPath,
+      session.detectedStack,
+      targetStack,
+      async (msg, lvl) => {
+        const entry = await SessionManager.addLog(sessionId, msg, lvl ?? 'info', 'migration-planning');
+        EventBroadcaster.broadcast(sessionId, 'log', entry);
+      },
+      (percent) => EventBroadcaster.broadcast(sessionId, 'progress', { percent, currentFile: '' }),
+    )
+      .then(() => updatePhase('done'))
+      .catch(async (err) => {
+        console.error(`[migrate/plan] session ${sessionId} failed:`, err);
+        await updatePhase('error');
+        EventBroadcaster.broadcast(sessionId, 'error', { message: err.message });
+      })
+      .finally(async () => {
+        planningSessions.delete(sessionId);
+        await SessionManager.updateSession(sessionId, { apiKey: undefined, apiKeys: undefined });
+      });
+
+    res.json({ success: true, message: 'Migration planning started.' });
+  } catch (err) {
+    next(err);
+  }
+});
+
+// Stage 2 — Code Generation. Requires the migration task list from /plan to
+// already exist for this session. Same fire-and-forget shape as /plan;
+// resumable — tasks already 'generated'/'verified' are skipped on a re-run.
+router.post('/generate', async (req: Request, res: Response, next: NextFunction) => {
+  try {
+    const { sessionId, targetStack, apiKey, apiKeys } = req.body as {
+      sessionId?: string; targetStack?: TargetStack;
+      apiKey?: string; apiKeys?: Record<string, string>;
+    };
+
+    if (!sessionId || !targetStack) {
+      res.status(400).json({ error: 'Missing required parameters: sessionId and targetStack are required.', code: 'BAD_REQUEST' });
+      return;
+    }
+
+    const session = await SessionManager.getSession(sessionId);
+    if (!session) {
+      res.status(404).json({ error: 'Session not found.', code: 'NOT_FOUND' });
+      return;
+    }
+    if (!session.detectedStack) {
+      res.status(400).json({
+        error: 'Stage 1 analysis has not completed for this session yet — run /start first.',
+        code: 'STAGE1_INCOMPLETE',
+      });
+      return;
+    }
+    if (!session.migrationTaskList || session.migrationTaskList.length === 0) {
+      res.status(400).json({
+        error: 'No migration task list found for this session — run /plan first.',
+        code: 'PLANNING_INCOMPLETE',
+      });
+      return;
+    }
+    if (generationSessions.has(sessionId)) {
+      res.status(409).json({ error: 'Code generation is already running for this session.', code: 'ALREADY_RUNNING' });
+      return;
+    }
+
+    await SessionManager.updateSession(sessionId, { targetStack, apiKey, apiKeys });
+
+    const updatePhase = async (status: 'active' | 'done' | 'error') => {
+      const current = await SessionManager.getSession(sessionId);
+      if (!current) return;
+      const phases = current.phases.map(p => p.id === 'code-generation' ? { ...p, status } : p);
+      const overallStatus = status === 'active' ? 'code-generation' : 'complete';
+      await SessionManager.updateSession(sessionId, { phases, status: overallStatus });
+      EventBroadcaster.broadcast(sessionId, 'phase_change', { phase: overallStatus, phaseId: 'code-generation', status });
+    };
+
+    generationSessions.add(sessionId);
+    await updatePhase('active');
+
+    MigrationAgent.runCodeGeneration(
+      sessionId,
+      session.projectPath,
+      session.modernPath,
+      session.detectedStack,
+      targetStack,
+      async (msg, lvl) => {
+        const entry = await SessionManager.addLog(sessionId, msg, lvl ?? 'info', 'code-generation');
+        EventBroadcaster.broadcast(sessionId, 'log', entry);
+      },
+      (percent) => EventBroadcaster.broadcast(sessionId, 'progress', { percent, currentFile: '' }),
+      (targetFile) => EventBroadcaster.broadcast(sessionId, 'file_migrated', { file: targetFile }),
+    )
+      .then(() => updatePhase('done'))
+      .catch(async (err) => {
+        console.error(`[migrate/generate] session ${sessionId} failed:`, err);
+        await updatePhase('error');
+        EventBroadcaster.broadcast(sessionId, 'error', { message: err.message });
+      })
+      .finally(async () => {
+        generationSessions.delete(sessionId);
+        await SessionManager.updateSession(sessionId, { apiKey: undefined, apiKeys: undefined });
+      });
+
+    res.json({ success: true, message: 'Code generation started.' });
+  } catch (err) {
+    next(err);
+  }
+});
+
+// Stage 2 — Verification. Requires at least one 'generated' task from
+// /generate. Deterministic cross-file reference check, not a real build —
+// see verification.ts for why. Same fire-and-forget shape as /plan and /generate.
+router.post('/verify', async (req: Request, res: Response, next: NextFunction) => {
+  try {
+    const { sessionId, targetStack, apiKey, apiKeys } = req.body as {
+      sessionId?: string; targetStack?: TargetStack;
+      apiKey?: string; apiKeys?: Record<string, string>;
+    };
+
+    if (!sessionId || !targetStack) {
+      res.status(400).json({ error: 'Missing required parameters: sessionId and targetStack are required.', code: 'BAD_REQUEST' });
+      return;
+    }
+
+    const session = await SessionManager.getSession(sessionId);
+    if (!session) {
+      res.status(404).json({ error: 'Session not found.', code: 'NOT_FOUND' });
+      return;
+    }
+    if (!session.migrationTaskList || !session.migrationTaskList.some(t => t.status !== 'pending')) {
+      res.status(400).json({
+        error: 'No generated files found for this session — run /generate first.',
+        code: 'GENERATION_INCOMPLETE',
+      });
+      return;
+    }
+    if (verificationSessions.has(sessionId)) {
+      res.status(409).json({ error: 'Verification is already running for this session.', code: 'ALREADY_RUNNING' });
+      return;
+    }
+
+    await SessionManager.updateSession(sessionId, { targetStack, apiKey, apiKeys });
+
+    const updatePhase = async (status: 'active' | 'done' | 'error') => {
+      const current = await SessionManager.getSession(sessionId);
+      if (!current) return;
+      const phases = current.phases.map(p => p.id === 'verification' ? { ...p, status } : p);
+      const overallStatus = status === 'active' ? 'verification' : 'complete';
+      await SessionManager.updateSession(sessionId, { phases, status: overallStatus });
+      EventBroadcaster.broadcast(sessionId, 'phase_change', { phase: overallStatus, phaseId: 'verification', status });
+    };
+
+    verificationSessions.add(sessionId);
+    await updatePhase('active');
+
+    MigrationAgent.runVerification(
+      sessionId,
+      session.projectPath,
+      session.modernPath,
+      session.detectedStack!,
+      targetStack,
+      async (msg, lvl) => {
+        const entry = await SessionManager.addLog(sessionId, msg, lvl ?? 'info', 'verification');
+        EventBroadcaster.broadcast(sessionId, 'log', entry);
+      },
+      (percent) => EventBroadcaster.broadcast(sessionId, 'progress', { percent, currentFile: '' }),
+    )
+      .then(() => updatePhase('done'))
+      .catch(async (err) => {
+        console.error(`[migrate/verify] session ${sessionId} failed:`, err);
+        await updatePhase('error');
+        EventBroadcaster.broadcast(sessionId, 'error', { message: err.message });
+      })
+      .finally(async () => {
+        verificationSessions.delete(sessionId);
+        await SessionManager.updateSession(sessionId, { apiKey: undefined, apiKeys: undefined });
+      });
+
+    res.json({ success: true, message: 'Verification started.' });
   } catch (err) {
     next(err);
   }

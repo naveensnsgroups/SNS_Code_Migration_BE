@@ -90,9 +90,14 @@ Gap-detection self-verify (MANDATORY before saving):
   signal — the file existing proves Phase 2 touched it, so 0 entries means data
   was lost, not that the project genuinely has none. (Do NOT compare a count to
   itself — that can never detect anything.)
-  - entity-graph  exists:true AND TOTAL_DATA_ENTITIES = 0  → DATA_GAP_ENTITY = true
-  - api-graph     exists:true AND TOTAL_API_ENDPOINTS = 0  → DATA_GAP_API    = true
-  - symbol-graph  exists:true AND TOTAL_CALLABLE_UNITS = 0 → DATA_GAP_SYMBOL  = true
+  - entity-graph exists:true AND TOTAL_DATA_ENTITIES = 0  → DATA_GAP_ENTITY = true
+  - api-graph    exists:true AND TOTAL_API_ENDPOINTS = 0  → DATA_GAP_API    = true
+  - symbol-graph exists:true AND TOTAL_CALLABLE_UNITS = 0 → DATA_GAP_SYMBOL = true
+  - rule-graph   exists:true AND TOTAL_BUSINESS_RULES = 0 → DATA_GAP_RULE   = true
+  - db-graph     exists:true AND TOTAL_DB_TABLES = 0      → DATA_GAP_DB     = true
+  rule-graph and db-graph are the two inputs Stage 2 code migration trusts most
+  (business-rule preservation and data-access translation) — an undetected gap
+  in either is worse than in the others, so never skip these two checks.
   Save any DATA_GAP_* flag that is true in the SAME edit_task_context call below,
   so the section writer can surface the gap in the affected section.
 
@@ -111,6 +116,8 @@ edit_task_context in ONE call (include only the DATA_GAP_* flags that are true):
   DATA_GAP_ENTITY:       true,   // include ONLY if the gap condition above held
   DATA_GAP_API:          true,   // include ONLY if the gap condition above held
   DATA_GAP_SYMBOL:       true,   // include ONLY if the gap condition above held
+  DATA_GAP_RULE:         true,   // include ONLY if the gap condition above held
+  DATA_GAP_DB:           true,   // include ONLY if the gap condition above held
   PHASE1_GRAPH_COMPLETE: true
 }
 
@@ -150,6 +157,7 @@ ReAct loop:
 
   C2: Count each of the 9 graphs (entity, symbol, api, rule, db, event, integration, job, imports) — one read per graph.
       Gap-detect: if a graph returns exists:true but 0 real entries, add its DATA_GAP flag.
+      Gap-detection covers ALL FIVE of: entity, api, symbol, rule, db — not just the first three.
       Then: save ALL counters + any DATA_GAP flags + PHASE1_GRAPH_COMPLETE=true in ONE edit_task_context call.
       Retry ONCE if the save fails.
 
@@ -186,8 +194,10 @@ including imports. Dropping any counter here re-creates the gap Pass D exists to
 For each graph: count only REAL entries (exclude keys whose value is empty {} or []).
 
 Gap-detection (same rule as Pass C): if read-knowledge-graph returns exists:true
-for entity/api/symbol but its real entry count is 0, also save the matching flag —
-DATA_GAP_ENTITY / DATA_GAP_API / DATA_GAP_SYMBOL = true.
+for entity/api/symbol/rule/db but its real entry count is 0, also save the
+matching flag — DATA_GAP_ENTITY / DATA_GAP_API / DATA_GAP_SYMBOL / DATA_GAP_RULE /
+DATA_GAP_DB = true. rule and db are covered by this recovery pass exactly like
+the other three — do not drop them here.
 
 After reading all 9 graphs: save ALL 9 counters + any DATA_GAP flags +
 PHASE1_GRAPH_COMPLETE=true in ONE single call to edit_task_context.
