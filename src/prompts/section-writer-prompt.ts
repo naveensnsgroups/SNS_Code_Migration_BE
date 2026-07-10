@@ -354,13 +354,15 @@ IMPORTANT — The api-graph key format reveals the invocation type. Handle each 
   "command:name" / "cli:name" → CLI command
   "consumer:topic" / "worker:queue" → Queue/message consumer
   "rpc:Service.Method" / "grpc:..." → gRPC / RPC method
+  "transaction:ID" → Mainframe/legacy transaction entry point (CICS TRANSID,
+    IMS transaction code, or equivalent COBOL/PL1/RPG program invoked by ID)
   "CLIENT GET /path" / "CLIENT POST /path" → Frontend API call (document separately)
   "schedule:name" / "cron:name" → Scheduled trigger (cross-ref with Section 25)
 
 For EACH entry in api-graph, write the appropriate contract:
 
-### [Key from graph — e.g. "POST /users" or "mutation:createUser" or "command:deploy"]
-  - **Type**: HTTP REST / GraphQL / CLI / Queue Consumer / gRPC / Frontend Call
+### [Key from graph — e.g. "POST /users" or "mutation:createUser" or "command:deploy" or "transaction:TASKA"]
+  - **Type**: HTTP REST / GraphQL / CLI / Queue Consumer / gRPC / Mainframe Transaction / Frontend Call
   - **Handler**: callable name → file path
   - **Auth**: resolved auth requirement (JWT / API Key / Session / None / IAM / etc.)
   - **Rate Limit**: if any

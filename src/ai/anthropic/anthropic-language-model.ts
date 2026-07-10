@@ -282,11 +282,11 @@ export class ClaudeProvider implements StreamingProvider {
       async () => this.client.messages.stream({
         model: this.modelName,
         max_tokens: this.config.maxTokens,
-        system: systemBlocks as any,   
-        messages: cachedMessages as any,
-        tools: anthropicTools as any,
+        system: systemBlocks,
+        messages: cachedMessages,
+        tools: anthropicTools,
         tool_choice: anthropicTools ? { type: 'auto' } : undefined,
-      } as any),
+      }),
       toolCtx
     );
 
@@ -308,8 +308,8 @@ export class ClaudeProvider implements StreamingProvider {
         case 'message_start': {
           
           inputTokens = event.message.usage?.input_tokens ?? 0;
-          cacheCreationTokens = (event.message.usage as any)?.cache_creation_input_tokens ?? 0;
-          cacheReadTokens = (event.message.usage as any)?.cache_read_input_tokens ?? 0;
+          cacheCreationTokens = event.message.usage?.cache_creation_input_tokens ?? 0;
+          cacheReadTokens = event.message.usage?.cache_read_input_tokens ?? 0;
           break;
         }
 

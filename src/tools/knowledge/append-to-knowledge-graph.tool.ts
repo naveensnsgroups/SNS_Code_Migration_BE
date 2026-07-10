@@ -122,16 +122,24 @@ export const appendToKnowledgeGraphTool: ToolRequest = {
     // (a file path, or "METHOD /path") in literal quote characters — e.g. the
     // key ends up as the 22-char string `"backend/server.js"` instead of the
     // 18-char `backend/server.js`. No real path or route ever legitimately
-    // starts AND ends with a literal quote, so stripping one matched pair is
-    // always safe and never destroys a genuine key. This is enforced here
-    // (not just requested in the prompt) because every downstream consumer —
-    // dependency resolution, call-flow tracing, section writers, Stage 2 —
-    // matches graph keys by exact string equality, and a single corrupted key
-    // silently breaks every one of them.
-    const stripWrappingQuotes = (key: string): string =>
-      key.length > 1 && key.startsWith('"') && key.endsWith('"')
-        ? key.slice(1, -1)
-        : key;
+    // starts AND ends with a matching quote pair, so stripping one is always
+    // safe and never destroys a genuine key. Checks double quotes, single
+    // quotes, and backticks — every quoting style a model might reach for
+    // across any language, not just the one most commonly observed. This is
+    // enforced here (not just requested in the prompt) because every
+    // downstream consumer — dependency resolution, call-flow tracing, section
+    // writers, Stage 2 — matches graph keys by exact string equality, and a
+    // single corrupted key silently splits into a duplicate, disconnected
+    // entry instead of merging with the real one.
+    const QUOTE_PAIRS = ['"', "'", '`'];
+    const stripWrappingQuotes = (key: string): string => {
+      for (const q of QUOTE_PAIRS) {
+        if (key.length > 1 && key.startsWith(q) && key.endsWith(q)) {
+          return key.slice(1, -1);
+        }
+      }
+      return key;
+    };
 
     if (args.data && typeof args.data === 'object') {
       const cleaned: Record<string, any> = {};

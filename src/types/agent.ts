@@ -57,8 +57,15 @@ export interface AgentDefinition {
   
   readonly tags?: string[];
 
-  
+
   readonly agentSpecificVariables: AgentSpecificVariable[];
+
+  // Optional agent-authored guidance for the harness's stuck-agent recovery system —
+  // the one real, specific fix for THIS agent when it loops/stalls (e.g. "call
+  // write_file with the complete content, then stop"). When absent, the harness
+  // falls back to fully generic guidance derived from this agent's own real tool
+  // list — never a hardcoded assumption borrowed from a different agent.
+  readonly recoveryHint?: string;
 }
 
 export class AgentRegistry {

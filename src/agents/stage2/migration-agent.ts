@@ -120,7 +120,7 @@ export class MigrationAgent {
 
     const session      = await SessionManager.getSession(sessionId);
     const toolsConfig: Record<string, boolean> = (session as any)?.toolsConfig ?? {};
-    const { provider, resolvedModel } = await resolveStreamingProvider(sessionId, targetStack);
+    const { provider, resolvedModel } = await resolveStreamingProvider(sessionId, targetStack, MIGRATION_PLANNER_AGENT);
 
     const context: ToolContext = {
       sessionId,
@@ -166,7 +166,8 @@ export class MigrationAgent {
               legacyPath, batch, targetStackForPrompt,
               detectedStack.language, detectedStack.framework
             ),
-            tools, context, resolvedModel, `migration-planning-batch-${i + 1}`
+            tools, context, resolvedModel, `migration-planning-batch-${i + 1}`,
+            undefined, MIGRATION_PLANNER_AGENT.recoveryHint
           ),
           PLANNING_BATCH_TIMEOUT_MS,
           `migration-planning-batch-${i + 1}`
@@ -253,7 +254,7 @@ export class MigrationAgent {
     }
 
     const toolsConfig: Record<string, boolean> = (session as any)?.toolsConfig ?? {};
-    const { provider, resolvedModel } = await resolveStreamingProvider(sessionId, targetStack);
+    const { provider, resolvedModel } = await resolveStreamingProvider(sessionId, targetStack, CODE_GENERATOR_AGENT);
 
     const context: ToolContext = {
       sessionId,
@@ -314,7 +315,8 @@ export class MigrationAgent {
                 targetStackForPrompt, detectedStack.language, detectedStack.framework,
                 dependencyTargets
               ),
-              lockedTools, context, resolvedModel, `code-generation-${task.legacyFile}-attempt${attempt}`
+              lockedTools, context, resolvedModel, `code-generation-${task.legacyFile}-attempt${attempt}`,
+              undefined, CODE_GENERATOR_AGENT.recoveryHint
             ),
             GENERATION_TIMEOUT_MS,
             `code-generation-${task.legacyFile}`
@@ -409,7 +411,15 @@ export class MigrationAgent {
     const legacyToTarget = new Map(taskList.map(t => [t.legacyFile, t.targetFile]));
 
     const toolsConfig: Record<string, boolean> = (session as any)?.toolsConfig ?? {};
-    const { provider, resolvedModel } = await resolveStreamingProvider(sessionId, targetStack);
+    // Each agent used within Verification resolves its OWN provider/model — a
+    // rule-coverage judgment, a regeneration fix, and a real build check are
+    // three different agents and may genuinely run on three different providers.
+    const { provider: ruleCoverageProvider, resolvedModel: ruleCoverageModel } =
+      await resolveStreamingProvider(sessionId, targetStack, RULE_COVERAGE_AGENT);
+    const { provider: codeGenProvider, resolvedModel: codeGenModel } =
+      await resolveStreamingProvider(sessionId, targetStack, CODE_GENERATOR_AGENT);
+    const { provider: buildVerificationProvider, resolvedModel: buildVerificationModel } =
+      await resolveStreamingProvider(sessionId, targetStack, BUILD_VERIFICATION_AGENT);
     const context: ToolContext = {
       sessionId, legacyPath, modernPath,
       onLog: (msg, lvl) => onLog?.(msg, lvl),
@@ -435,10 +445,11 @@ export class MigrationAgent {
       try {
         await withTimeout(
           AgentExecutor.execute(
-            provider,
+            ruleCoverageProvider,
             RULE_COVERAGE_SYSTEM_PROMPT,
             buildRuleCoverageUserPrompt(legacyFile, targetFile, fileContent, rules),
-            ruleCheckTools, context, resolvedModel, `rule-coverage-${targetFile}`
+            ruleCheckTools, context, ruleCoverageModel, `rule-coverage-${targetFile}`,
+            undefined, RULE_COVERAGE_AGENT.recoveryHint
           ),
           RULE_CHECK_TIMEOUT_MS,
           `rule-coverage-${targetFile}`
@@ -496,7 +507,7 @@ export class MigrationAgent {
         try {
           await withTimeout(
             AgentExecutor.execute(
-              provider,
+              codeGenProvider,
               CODE_GENERATOR_SYSTEM_PROMPT,
               buildCodeGeneratorUserPrompt(
                 task.legacyFile, task.targetFile, task.rulesInvolved,
@@ -505,7 +516,8 @@ export class MigrationAgent {
                 `Unresolved reference(s) to: ${unresolved.join(', ')} — these dependencies were not ` +
                 `found referenced anywhere in your previous output. Import them correctly this time.`
               ),
-              lockedTools, context, resolvedModel, `verification-fix-${task.legacyFile}`
+              lockedTools, context, codeGenModel, `verification-fix-${task.legacyFile}`,
+              undefined, CODE_GENERATOR_AGENT.recoveryHint
             ),
             GENERATION_TIMEOUT_MS,
             `verification-fix-${task.legacyFile}`
@@ -534,7 +546,7 @@ export class MigrationAgent {
           try {
             await withTimeout(
               AgentExecutor.execute(
-                provider,
+                codeGenProvider,
                 CODE_GENERATOR_SYSTEM_PROMPT,
                 buildCodeGeneratorUserPrompt(
                   task.legacyFile, task.targetFile, task.rulesInvolved,
@@ -544,7 +556,8 @@ export class MigrationAgent {
                   `${ruleResult.uncovered.join('; ')}. Add the missing validation/branch/error logic for ` +
                   `each of them while keeping everything else intact.`
                 ),
-                lockedTools, context, resolvedModel, `rule-fix-${task.legacyFile}`
+                lockedTools, context, codeGenModel, `rule-fix-${task.legacyFile}`,
+                undefined, CODE_GENERATOR_AGENT.recoveryHint
               ),
               GENERATION_TIMEOUT_MS,
               `rule-fix-${task.legacyFile}`
@@ -625,10 +638,11 @@ export class MigrationAgent {
       try {
         await withTimeout(
           AgentExecutor.execute(
-            provider,
+            buildVerificationProvider,
             BUILD_VERIFICATION_SYSTEM_PROMPT,
             buildBuildVerificationUserPrompt(files, targetStackForPrompt),
-            buildTools, context, resolvedModel, tag
+            buildTools, context, buildVerificationModel, tag,
+            undefined, BUILD_VERIFICATION_AGENT.recoveryHint
           ),
           BUILD_CHECK_TIMEOUT_MS,
           tag
@@ -675,7 +689,7 @@ export class MigrationAgent {
           try {
             await withTimeout(
               AgentExecutor.execute(
-                provider,
+                codeGenProvider,
                 CODE_GENERATOR_SYSTEM_PROMPT,
                 buildCodeGeneratorUserPrompt(
                   task.legacyFile, task.targetFile, task.rulesInvolved,
@@ -685,7 +699,8 @@ export class MigrationAgent {
                   `Fix the actual bug causing this (e.g. a missing import, undefined name, or syntax ` +
                   `error) while keeping all existing logic and rules intact.`
                 ),
-                lockedTools, context, resolvedModel, `real-check-fix-${task.legacyFile}`
+                lockedTools, context, codeGenModel, `real-check-fix-${task.legacyFile}`,
+                undefined, CODE_GENERATOR_AGENT.recoveryHint
               ),
               GENERATION_TIMEOUT_MS,
               `real-check-fix-${task.legacyFile}`

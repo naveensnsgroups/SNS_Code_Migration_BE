@@ -1,6 +1,7 @@
 
 
 import { LanguageModelMessage, TextMessage } from '../../types/language-model.js';
+import { RecoveryToolInfo, formatToolList } from '../core/agent-loop-config.js';
 
 const COMPACTION_BUDGET_RATIO = 0.60;   
 const KEEP_RECENT_CHARS       = 40_000; 
@@ -32,10 +33,12 @@ export function estimateContextChars(msgs: LanguageModelMessage[]): number {
 }
 
 export function compactMessagesIfNeeded(
-  messages:  LanguageModelMessage[],
-  budget:    number,
-  iteration: number,
-  onLog?:    (msg: string, lvl?: 'info' | 'success' | 'error' | 'warning') => void
+  messages:       LanguageModelMessage[],
+  budget:         number,
+  iteration:      number,
+  availableTools: RecoveryToolInfo[],
+  resumeHint?:    string,
+  onLog?:         (msg: string, lvl?: 'info' | 'success' | 'error' | 'warning') => void
 ): boolean {
   const currentChars = estimateContextChars(messages);
 
@@ -82,9 +85,10 @@ export function compactMessagesIfNeeded(
     type:  'text',
     text:
       `[SYSTEM: Context window compacted — ${before - messages.length} stale conversation turns removed to free context space. ` +
-      `Your analysis work is NOT lost — all extracted data was written to knowledge graph files on disk. ` +
-      `To resume: call get_task_context to check LAST_FILE_ANALYZED, then continue processing ` +
-      `the next PENDING file from FILE_INDEX. Do not restart from the beginning.]`,
+      `Your work so far is NOT lost — anything already written to disk (files/graphs) is safe. ` +
+      `You have these tools available right now: ${formatToolList(availableTools)}. ` +
+      `Continue from where you left off using them — do not restart from the beginning.]` +
+      (resumeHint ? ` ${resumeHint}` : ''),
   } as TextMessage);
 
   onLog?.(

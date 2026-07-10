@@ -241,21 +241,41 @@ export function resetStateForErrorType(state: LoopState, errorType: AgentLoopErr
   }
 }
 
+export interface RecoveryToolInfo {
+  name:        string;
+  description: string;
+}
+
+// Formats the CURRENT agent's real, registered tools for inclusion in a recovery
+// message — never a hardcoded/borrowed tool list from a different agent. Each
+// description is capped for readability, matching this codebase's existing
+// truncation convention for injected text (e.g. real build errors are capped
+// at 300 chars in migration-agent.ts).
+export function formatToolList(tools: RecoveryToolInfo[]): string {
+  if (tools.length === 0) return '(no tools available)';
+  return tools
+    .map(t => `${t.name} (${t.description.length > 80 ? t.description.slice(0, 80) + '…' : t.description})`)
+    .join(', ');
+}
+
 export function buildRecoveryMessage(
-  errorType: AgentLoopErrorType,
-  toolName:  string,
-  config:    AgentLoopConfig,
-  extra?:    { turnChars?: number }
+  errorType:      AgentLoopErrorType,
+  toolName:       string,
+  config:         AgentLoopConfig,
+  availableTools: RecoveryToolInfo[],
+  recoveryHint?:  string,
+  extra?:         { turnChars?: number }
 ): string {
+  const hintSuffix = recoveryHint ? ` ${recoveryHint}` : '';
+
   switch (errorType) {
 
     case 'stuck-tool':
       return (
         `[ORCHESTRATOR INTERVENTION] Tool "${toolName}" returned an error ` +
         `${config.stuckToolMaxErrors} consecutive times. You are stuck. ` +
-        `STOP calling "${toolName}" for the current file. ` +
-        `Mark the current file DONE: set read_status="DONE" inside the FILE_INDEX array ` +
-        `and re-save via edit_task_context. Then move to the next PENDING file.`
+        `STOP calling "${toolName}". Try a different one of your available tools instead: ` +
+        `${formatToolList(availableTools.filter(t => t.name !== toolName))}.${hintSuffix}`
       );
 
     case 'reasoning-loop':
@@ -264,42 +284,37 @@ export function buildRecoveryMessage(
         `${Math.round((extra?.turnChars ?? 0) / 1_000)}K characters of planning text ` +
         `("Wait, I need to execute step...") but called NO tools. ` +
         `You are stuck in a reasoning loop. STOP WRITING PLANNING TEXT. ` +
-        `NOW call the tools: ` +
-        `(1) append-to-knowledge-graph for files with real extracted data. ` +
-        `(2) edit_task_context to mark each file DONE (read_status="DONE" in file-index array). ` +
-        `Do not write "Wait, I need to..." text. Just call the tools.`
+        `You have these tools available right now: ${formatToolList(availableTools)}. ` +
+        `Call the one that makes real progress now — do not write more planning text first.${hintSuffix}`
       );
 
     case 'no-progress':
       return (
         `[ORCHESTRATOR INTERVENTION] ${config.noProgressMaxTurns} consecutive turns had ALL ` +
-        `tools return errors. Zero state change. EMERGENCY RECOVERY: ` +
-        `(1) Call get_task_context() with NO key parameter — get FILE_INDEX_KEY value and LAST_FILE_ANALYZED. ` +
-        `(2) Call get_task_context({ key: "file-index" }) — load the actual file list. ` +
-        `(3) Find the FIRST file where read_status="PENDING". ` +
-        `(4) Mark it DONE: update read_status="DONE" inside FILE_INDEX array and call edit_task_context. ` +
-        `(5) Move to the next PENDING file. Skip files that keep erroring.`
+        `tools return errors. Zero state change. You have these tools available right now: ` +
+        `${formatToolList(availableTools)}. Re-check the parameters you're passing against what ` +
+        `each tool actually needs, and call one correctly this time.${hintSuffix}`
       );
 
     case 'duplicate-blocked':
       return (
         `[ORCHESTRATOR INTERVENTION] "${toolName}" was called with identical arguments ` +
         `${config.fingerprintMaxDupes} times. This action already completed. ` +
-        `Do NOT repeat it. Move to the NEXT required action ` +
-        `(next graph type or next file in FILE_INDEX).`
+        `Do NOT repeat it. Move to the next required step using one of your other available ` +
+        `tools: ${formatToolList(availableTools.filter(t => t.name !== toolName))}.${hintSuffix}`
       );
 
-    case 'bookkeeping-loop':
+    case 'bookkeeping-loop': {
+      const productive = availableTools.filter(t => !BOOKKEEPING_TOOL_NAMES.has(t.name));
       return (
         `[ORCHESTRATOR INTERVENTION] You have made ${config.bookkeepingStreakMax} ` +
-        `state-only calls in a row (get_task_context / edit_task_context / todoWrite) ` +
-        `without any real analysis. You are spinning, not progressing — and wasting LLM calls. ` +
-        `Do ONE of these NOW: ` +
-        `(1) If a PENDING file remains: read it (getFileContent / batch-read-files) and ` +
-        `extract its data via append-to-knowledge-graph. ` +
-        `(2) If NO PENDING files remain in this batch: STOP — reply with a one-line summary ` +
-        `and DO NOT call any more tools. Do not re-save context that is already saved.`
+        `state-only calls in a row (${[...BOOKKEEPING_TOOL_NAMES].join(' / ')}) ` +
+        `without any real progress. You are spinning, not progressing — and wasting LLM calls. ` +
+        `Call one of these instead: ${formatToolList(productive)}. ` +
+        `If there is genuinely nothing left to do, reply with a one-line summary and DO NOT call ` +
+        `any more tools.${hintSuffix}`
       );
+    }
 
     case 'config-error':
       return (
@@ -312,15 +327,15 @@ export function buildRecoveryMessage(
     case 'tool-not-found':
       return (
         `[ORCHESTRATOR INTERVENTION] Tool "${toolName}" is not registered. ` +
-        `Only call tools from the tools list provided at the start of this session. ` +
-        `Check the available tool names and use the correct one.`
+        `Only call tools from the tools list provided at the start of this session: ` +
+        `${formatToolList(availableTools)}.`
       );
 
     default:
       return (
         `[ORCHESTRATOR INTERVENTION] An unexpected error occurred in "${toolName}". ` +
-        `Read the tool result error message above and decide the correct recovery action. ` +
-        `If you cannot recover, mark the current file DONE and move to the next PENDING file.`
+        `Read the tool result error message above and decide the correct recovery action ` +
+        `using one of your available tools: ${formatToolList(availableTools)}.${hintSuffix}`
       );
   }
 }

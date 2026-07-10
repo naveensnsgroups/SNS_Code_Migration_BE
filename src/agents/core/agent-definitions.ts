@@ -228,6 +228,9 @@ export const ANALYSIS_AGENT: AgentDefinition = {
     { name: 'language',   description: 'Detected primary language.',                 usedInPrompt: true },
     { name: 'framework',  description: 'Detected primary framework.',                usedInPrompt: true },
   ],
+  recoveryHint:
+    'Extract this file\'s real data via append-to-knowledge-graph, then mark it DONE ' +
+    '(read_status="DONE" in the FILE_INDEX array) via edit_task_context, then move to the next PENDING file.',
 };
 
 AgentRegistry.register(ANALYSIS_AGENT);
@@ -303,6 +306,7 @@ export const CODE_GENERATOR_AGENT: AgentDefinition = {
   agentSpecificVariables: [
     { name: 'legacyPath', description: 'Absolute path to the legacy project root.', usedInPrompt: true },
   ],
+  recoveryHint: 'Call write_file with the COMPLETE translated file content now, then stop.',
 };
 
 AgentRegistry.register(CODE_GENERATOR_AGENT);

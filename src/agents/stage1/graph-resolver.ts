@@ -2,6 +2,7 @@
 
 import path from 'path';
 import fs   from 'fs-extra';
+import { TaskContextManager } from '../../session/taskContext.js';
 
 export async function resolveForeignKeys(modernPath: string): Promise<number> {
   const graphPath = path.join(modernPath, '_analysis', 'entity-graph.json');
@@ -119,8 +120,11 @@ export async function resolveForeignKeys(modernPath: string): Promise<number> {
 // attempt against a quote-wrapped string would silently fail the same way.
 export function resolveLocalImportPath(importingFile: string, rawImport: string): string {
   let normalized = (rawImport ?? '').replace(/\\/g, '/');
-  if (normalized.length > 1 && normalized.startsWith('"') && normalized.endsWith('"')) {
-    normalized = normalized.slice(1, -1);
+  for (const q of ['"', "'", '`']) {
+    if (normalized.length > 1 && normalized.startsWith(q) && normalized.endsWith(q)) {
+      normalized = normalized.slice(1, -1);
+      break;
+    }
   }
   if (normalized.startsWith('./') || normalized.startsWith('../')) {
     const importingDir = path.posix.dirname(importingFile.replace(/\\/g, '/'));
@@ -129,16 +133,21 @@ export function resolveLocalImportPath(importingFile: string, rawImport: string)
   return normalized;
 }
 
-// Strips a stray leading+trailing literal quote pair from every top-level key
-// of a graph object (see the sanitization note in append-to-knowledge-graph.tool.ts).
-// Applied on READ so graphs written before that fix existed self-heal on the
-// next resolver pass, instead of staying permanently broken.
+// Strips a stray leading+trailing literal quote pair (double, single, or backtick)
+// from every top-level key of a graph object (see the sanitization note in
+// append-to-knowledge-graph.tool.ts). Applied on READ so graphs written before
+// that fix existed self-heal on the next resolver pass, instead of staying
+// permanently broken.
 export function normalizeGraphKeys(graph: Record<string, any>): Record<string, any> {
   const normalized: Record<string, any> = {};
   for (const [key, value] of Object.entries(graph)) {
-    const cleanKey = key.length > 1 && key.startsWith('"') && key.endsWith('"')
-      ? key.slice(1, -1)
-      : key;
+    let cleanKey = key;
+    for (const q of ['"', "'", '`']) {
+      if (key.length > 1 && key.startsWith(q) && key.endsWith(q)) {
+        cleanKey = key.slice(1, -1);
+        break;
+      }
+    }
     normalized[cleanKey] = value;
   }
   return normalized;
@@ -193,8 +202,74 @@ export async function computeImportedBy(modernPath: string): Promise<void> {
   try {
     await fs.writeJson(graphPath, graph, { spaces: 2 });
   } catch {
-    
+
   }
+}
+
+// Reconciles request/response shapes a handler/controller file staged before it
+// could determine its own api-graph key (see HANDLER FILE → REQUEST/RESPONSE
+// SHAPES in file-analysis-prompt.ts). Runs deterministically — no LLM call — so
+// it works regardless of which order the route file vs. handler file happened
+// to be analyzed in, and is language-agnostic (pure name/key matching, no
+// per-framework logic).
+export async function reconcilePendingHandlerShapes(sessionId: string, modernPath: string): Promise<number> {
+  const ctx = await TaskContextManager.getContext(sessionId);
+  const pending: Record<string, { request?: unknown; responses?: unknown }> =
+    ctx.PENDING_HANDLER_SHAPES && typeof ctx.PENDING_HANDLER_SHAPES === 'object'
+      ? ctx.PENDING_HANDLER_SHAPES
+      : {};
+  if (Object.keys(pending).length === 0) return 0;
+
+  const handlerToRouteKey: Record<string, string> =
+    ctx.HANDLER_TO_ROUTE_KEY && typeof ctx.HANDLER_TO_ROUTE_KEY === 'object'
+      ? ctx.HANDLER_TO_ROUTE_KEY
+      : {};
+
+  const graphPath = path.join(modernPath, '_analysis', 'api-graph.json');
+  if (!(await fs.pathExists(graphPath))) return 0;
+
+  let graph: Record<string, any>;
+  try {
+    graph = normalizeGraphKeys(await fs.readJson(graphPath));
+  } catch {
+    return 0;
+  }
+
+  let reconciled = 0;
+  for (const [handlerName, shape] of Object.entries(pending)) {
+    // Primary lookup: the mapping the route file saved when it recorded this handler.
+    let routeKey = handlerToRouteKey[handlerName];
+
+    // Fallback: no mapping was ever saved (e.g. the route file genuinely used a
+    // different name internally) — scan existing api-graph entries for one whose
+    // own recorded `handler` field matches this function name exactly.
+    if (!routeKey) {
+      const match = Object.entries(graph).find(
+        ([key, entry]) => key !== '_sources' && entry?.handler === handlerName
+      );
+      if (match) routeKey = match[0];
+    }
+
+    if (!routeKey || !graph[routeKey] || typeof graph[routeKey] !== 'object') continue;
+
+    if (shape.request && typeof shape.request === 'object') {
+      graph[routeKey].request = { ...(graph[routeKey].request ?? {}), ...shape.request };
+    }
+    if (shape.responses && typeof shape.responses === 'object') {
+      graph[routeKey].responses = { ...(graph[routeKey].responses ?? {}), ...shape.responses };
+    }
+    reconciled++;
+  }
+
+  if (reconciled > 0) {
+    try {
+      await fs.writeJson(graphPath, graph, { spaces: 2 });
+    } catch {
+
+    }
+  }
+
+  return reconciled;
 }
 
 export interface CallFlowResult {

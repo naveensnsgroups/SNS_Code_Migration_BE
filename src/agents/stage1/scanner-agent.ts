@@ -5,8 +5,7 @@ import { DetectedStack, FileNode } from '../../types.js';
 import { toolRegistry } from '../../core/tool-invocation-registry.js';
 import { ToolContext } from '../../types/tool.js';
 import { AgentExecutor } from '../core/agentExecutor.js';
-import { AIProviderFactory } from '../../ai/provider.js';
-import { StreamingProvider } from '../../types/language-model.js';
+import { resolveStreamingProvider } from '../../ai/resolve-provider.js';
 import { SCANNER_SYSTEM_PROMPT, buildScannerUserPrompt } from '../../prompts/scanner-prompt.js';
 import { SCANNER_AGENT } from '../core/agent-definitions.js';
 
@@ -29,14 +28,16 @@ export interface ScannerAgentConfig {
   provider?: string;
   model?: string;
   apiKey?: string;
-  maxRetries?: number;
-  retryDelayRateLimit?: number;
-  retryDelayOther?: number;
-  timeoutMs?: number;
 }
 
 export class ScannerAgent {
   static async run(
+    // The REAL session, already created by the scan route before this runs —
+    // needed so this agent can resolve its model/provider through the same
+    // shared per-agent-override → alias → default chain every other agent
+    // uses (see resolveStreamingProvider), instead of a special-cased path
+    // that silently ignored the Scanner's own AI Config override.
+    sessionId:   string,
     projectPath: string,
     modernPath:  string,
     config?:     ScannerAgentConfig,
@@ -58,7 +59,6 @@ export class ScannerAgent {
       'info'
     );
 
-    const sessionId = `scan-${Date.now().toString(36)}`;
     const context: ToolContext = {
       sessionId,
       legacyPath: projectPath,
@@ -87,21 +87,15 @@ export class ScannerAgent {
       try {
         onLog?.('Querying autonomous codebase scanner agent for stack verification...', 'info');
 
-        const resolvedModel = config.model
-          || SCANNER_AGENT.languageModelRequirements[0]?.identifier?.replace('alias:', '')
-          || 'fast-model';
-
-        const providerConfig = {
-          maxRetries:           config.maxRetries,
-          retryDelayRateLimit:  config.retryDelayRateLimit,
-          retryDelayOther:      config.retryDelayOther,
-        };
-
-        const provider: StreamingProvider = AIProviderFactory.getStreamingProvider(
-          config.provider,
-          resolvedModel,
-          config.apiKey,
-          providerConfig
+        // Same resolution chain as every other agent: per-agent override (AI
+        // Config → Agents → Scanner) → the Scanner's declared alias → this
+        // upload's provider/model (Settings' default) as the final fallback.
+        // The route already saved apiKey/apiKeys/agentsConfig/aliasesConfig
+        // and the retry-delay settings onto this session before calling here.
+        const { provider, resolvedModel } = await resolveStreamingProvider(
+          sessionId,
+          { provider: config.provider, model: config.model ?? '' },
+          SCANNER_AGENT
         );
 
         const userPrompt = buildScannerUserPrompt(projectPath, rawFileCount, manifestFiles);
@@ -113,7 +107,9 @@ export class ScannerAgent {
           scanTools,
           context,
           resolvedModel,
-          'scanner-agent'
+          'scanner-agent',
+          undefined,
+          SCANNER_AGENT.recoveryHint
         );
 
         const stripped = executorResponse

@@ -98,11 +98,7 @@ router.post('/', upload.array('files'), async (req: Request, res: Response, next
         ? {
             provider,
             model: model || undefined,
-            apiKey,
-            maxRetries,
-            retryDelayRateLimit,
-            retryDelayOther,
-            timeoutMs
+            apiKey
           }
         : undefined;
 
@@ -110,10 +106,30 @@ router.post('/', upload.array('files'), async (req: Request, res: Response, next
       await SessionManager.addLog(sessionId, 'No AI provider configured — using static manifest scan.', 'info');
     }
 
-    
+    // The Scanner now resolves its model through the same per-agent-override →
+    // alias → default chain as every other agent (resolveStreamingProvider),
+    // which reads all of this from the SESSION — so it has to be saved here,
+    // before the scan runs, exactly like /api/migrate/start already does for
+    // the main pipeline.
+    let agentsConfig: unknown;
+    try { agentsConfig = req.body.agentsConfig ? JSON.parse(req.body.agentsConfig) : undefined; } catch { agentsConfig = undefined; }
+    let aliasesConfig: Record<string, string> | undefined;
+    try { aliasesConfig = req.body.aliasesConfig ? JSON.parse(req.body.aliasesConfig) : undefined; } catch { aliasesConfig = undefined; }
+    let apiKeys: Record<string, string> | undefined;
+    try { apiKeys = req.body.apiKeys ? JSON.parse(req.body.apiKeys) : undefined; } catch { apiKeys = undefined; }
+
+    await SessionManager.updateSession(sessionId, {
+      apiKey, apiKeys, agentsConfig, aliasesConfig,
+      googleMaxRetries: maxRetries,
+      googleRetryDelayRateLimit: retryDelayRateLimit,
+      googleRetryDelayOther: retryDelayOther,
+    } as any);
+
+
     ScannerAgent.run(
+      sessionId,
       session.projectPath,
-      session.modernPath,    
+      session.modernPath,
       aiConfig,
       async (msg, lvl) => {
         const entry = await SessionManager.addLog(sessionId, msg, lvl ?? 'info');

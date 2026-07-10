@@ -48,7 +48,9 @@ symbol-graph:
       file: str,
       signature: str,              // full signature with all params and types
       returnType: str,
-      executionModel: str,       // "async" | "sync" | "concurrent" | "procedural" | "reactive"
+      executionModel: str,       // e.g. "async" | "sync" | "concurrent" | "procedural" | "reactive" |
+                                 // "generator" | "coroutine" | "batch" — examples, not exhaustive;
+                                 // use whatever term accurately describes the real execution model
       purpose: str,                // one sentence: WHAT it does
       pseudocode: str,             // numbered steps: HOW it does it
                                    // "1. Validate...\\n2. Check auth...\\n3. Call repo..."
@@ -60,7 +62,9 @@ symbol-graph:
 rule-graph:
   { "domain": [{
       rule:         str,   // one sentence: exactly what this rule enforces
-      type:         str,   // "validation" | "authorization" | "calculation" | "state-transition" | "rate-limit"
+      type:         str,   // e.g. "validation" | "authorization" | "calculation" | "state-transition" |
+                            // "rate-limit" | "audit-logging" | "encryption" | "idempotency" |
+                            // "compliance" — examples, not exhaustive; use the term that actually fits
       enforcement:  str,   // "functionName:file/path" — where exactly it is enforced
       violation:    str,   // what happens on violation: "throw ForbiddenError → HTTP 403" or "return false"
       pseudocode:   [str], // the rule logic as steps: ["1. Check X", "2. IF Y: throw Z"]
@@ -70,13 +74,20 @@ rule-graph:
   }
 
 api-graph:
-  { "METHOD /actual/path": {
-      handler:        str,   // exact function/method name that handles this entry point
+  // Key is NOT limited to HTTP — use whichever prefix actually matches the real
+  // invocation mechanism: "METHOD /path" (HTTP/REST), "query:x"/"mutation:x"
+  // (GraphQL), "command:x"/"cli:x" (CLI), "consumer:x"/"worker:x" (queue),
+  // "rpc:Service.Method"/"grpc:Service.Method" (RPC/gRPC), or "transaction:ID"
+  // (CICS/IMS/mainframe transaction entry point). See NON-HTTP ENTRY POINTS in
+  // the file-analysis prompt for the full list — never force-fit an HTTP shape
+  // onto something that isn't HTTP.
+  { "<kind-prefixed key>": {
+      handler:        str,   // exact function/method/paragraph/program that handles this entry point
       auth:           str,   // middleware/guard/decorator name enforcing auth, or "" if none
       request: {
-        body:         {},    // body fields: { fieldName: { type, required, description } }
-        query:        {},    // query param fields
-        path:         {}     // path param fields (e.g. :id, {userId})
+        body:         {},    // body/payload/COMMAREA fields: { fieldName: { type, required, description } }
+        query:        {},    // query param fields (HTTP only — {} otherwise)
+        path:         {}     // path param fields (HTTP only — {} otherwise)
       },
       responses: {
         "200":        {},    // success response shape
@@ -89,12 +100,19 @@ api-graph:
   } }
 
 db-graph:
-  { "table_or_collection_name": {
+  // "table_or_collection_name" fits SQL/NoSQL — for a hierarchical/sequential
+  // store (VSAM, IMS DL/I, ISAM) use the real file/segment/dataset name instead.
+  { "table_or_collection_or_dataset_name": {
       operations: [{
-        type:         str,   // "find" | "findOne" | "create" | "update" | "delete" | "upsert" | "count" | "raw"
+        type:         str,   // e.g. "find" | "findOne" | "create" | "update" | "delete" | "upsert" |
+                              // "count" | "raw" (SQL/NoSQL) — or "read" | "rewrite" | "start" | "browse" |
+                              // "delete-keyed" (VSAM) — or "get-unique" | "get-next" | "insert" | "delete" |
+                              // "replace" (IMS DL/I GU/GN/ISRT/DLET/REPL) — examples, not exhaustive;
+                              // use the REAL operation name/verb exactly as it appears in the code
         fields:       [str], // fields read or written in this operation
-        condition:    str,   // filter/WHERE expression — exact as it appears in code
-        function:     str,   // name of the function that performs this operation
+        condition:    str,   // filter/WHERE expression, or the exact key/segment-search-argument used —
+                              // as it appears in the code, whatever access method this actually is
+        function:     str,   // name of the function/paragraph that performs this operation
         calledFrom:   [str]  // file paths that call this function
       }],
       repositoryFile: str,   // file that owns the data access layer for this table/collection
@@ -165,7 +183,7 @@ export const GRAPH_SHAPE_HINTS: Record<string, string> = {
   'entity':       '{ "EntityName": { table, files:[...], fields:[{name,type,pk,fk,nullable,unique,...}], relations:[...] } }',
   'symbol':       '{ "funcName": { file, signature, returnType, executionModel, purpose, pseudocode, calledBy:[...], calls:[...], sideEffects:[...] } }',
   'rule':         '{ "domain": [{ rule, type, enforcement, violation, pseudocode:[...], relatedFiles:[...], migratable:bool }] }',
-  'api':          '{ "METHOD /path": { handler, auth, request:{body,query,path}, responses:{}, middlewareChain:[...], files:[...] } }',
+  'api':          '{ "<METHOD /path | query:x | command:x | consumer:x | rpc:Svc.Method | transaction:ID>": { handler, auth, request:{body,query,path}, responses:{}, middlewareChain:[...], files:[...] } }',
   'db':           '{ "tableName": { operations:[{ type, fields, condition, function, calledFrom:[...] }], repositoryFile, modelFile } }',
   'event':        '{ "event.name": { emittedIn, payload, listeners:[{ file, handler, does }], registrationFile } }',
   'config':       '{ "CONFIG_KEY": { type, required, default, purpose, usedIn:[...] } }',

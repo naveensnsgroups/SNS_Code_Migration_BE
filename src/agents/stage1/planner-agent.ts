@@ -46,6 +46,7 @@ import {
   buildCallFlowGraph,
   computeImportedBy,
   computeMigrationOrder,
+  reconcilePendingHandlerShapes,
 } from './graph-resolver.js';
 import {
   deduplicateFileIndex,
@@ -275,6 +276,13 @@ function resolveFileIndexFromContext(ctx: Record<string, unknown>): { key: strin
 // cancellation callback; active_phase remains saved so the run can resume.
 export const STAGE1_ABORTED = 'STAGE1_ABORTED';
 
+// Returned when the pipeline reaches the HITL checkpoint after graph-resolution.
+// active_phase is already persisted at 'section-writing', so a later
+// /continue-analysis resumes straight into section writing (same resume
+// mechanism as pause/abort). The orchestrator sets status 'awaiting-graph-review'
+// and does NOT mark the run complete.
+export const STAGE1_AWAITING_GRAPH_REVIEW = 'STAGE1_AWAITING_GRAPH_REVIEW';
+
 export class PlannerAgent {
 
   static async run(
@@ -307,9 +315,9 @@ export class PlannerAgent {
     const toolsConfig    : Record<string, boolean> = (session as any)?.toolsConfig    ?? {};
     const promptFragments: Record<string, string>  = (session as any)?.promptFragments ?? {};
 
-    const { provider, resolvedModel } = await resolveStreamingProvider(sessionId, targetStack);
-
-    
+    // Each phase below resolves its OWN provider/model — per-agent override, then
+    // the agent's declared alias, then the global target model — so different
+    // phases can genuinely run on different providers in the same pipeline run.
     const context: ToolContext = {
       sessionId,
       legacyPath,
@@ -353,7 +361,9 @@ export class PlannerAgent {
       onLog?.('[PlannerAgent] Stage 1/5: Workspace Discovery...', 'info');
       await onPhase?.('discovery', 'active');
 
-      
+      const { provider, resolvedModel } = await resolveStreamingProvider(sessionId, targetStack, DISCOVERY_AGENT);
+
+
       
       
       
@@ -398,7 +408,9 @@ export class PlannerAgent {
           discoveryTools,
           context,
           resolvedModel,
-          'discovery-agent'
+          'discovery-agent',
+          undefined,
+          DISCOVERY_AGENT.recoveryHint
         ),
         PHASE_TIMEOUT_MS.discovery,
         'discovery',
@@ -490,7 +502,9 @@ export class PlannerAgent {
       onLog?.(`[PlannerAgent] Stage 2/5: File Analysis (${totalFiles} files)...`, 'info');
       await onPhase?.('file-analysis', 'active');
 
-      
+      const { provider, resolvedModel } = await resolveStreamingProvider(sessionId, targetStack, ANALYSIS_AGENT);
+
+
       
       
       
@@ -621,7 +635,8 @@ export class PlannerAgent {
                 ),
                 analysisTools, context, resolvedModel,
                 `analysis-agent-pass${passNumber}`,
-                passMaxIterations
+                passMaxIterations,
+                ANALYSIS_AGENT.recoveryHint
               ),
               PHASE_TIMEOUT_MS.analysisPass,
               `analysis-pass-${passNumber}`,
@@ -728,7 +743,9 @@ export class PlannerAgent {
       await onPhase?.('graph-resolution', 'active');
       onLog?.('[PlannerAgent] Stage 3/5: Graph Resolution (TypeScript + Architecture Synthesis)...', 'info');
 
-      // Gate on the actual Phase-2 graph files on disk. The TOTAL_* counters must NOT
+      const { provider, resolvedModel } = await resolveStreamingProvider(sessionId, targetStack, GRAPH_RESOLVER_AGENT);
+
+// Gate on the actual Phase-2 graph files on disk. The TOTAL_* counters must NOT
       // be used here: they are only computed later by Pass C/D below, so reading them
       // at this point always yields 0/undefined on a first run and falsely triggers
       // the gate (which then wrongly skips the 3A/3B TypeScript resolvers).
@@ -789,6 +806,10 @@ export class PlannerAgent {
       
       onLog?.('[PlannerAgent] Stage 3C-pre: TypeScript importedBy + Migration Order...', 'info');
       try {
+        const reconciledCount = await reconcilePendingHandlerShapes(sessionId, modernPath);
+        if (reconciledCount > 0) {
+          onLog?.(`[PlannerAgent] Reconciled ${reconciledCount} handler request/response shape(s) into api-graph.`, 'success');
+        }
         await computeImportedBy(modernPath);
         const migrationOrder = await computeMigrationOrder(modernPath);
         if (migrationOrder.length > 0) {
@@ -811,7 +832,8 @@ export class PlannerAgent {
           provider,
           GRAPH_PASS_C_SYSTEM + customSuffix,
           buildGraphPassCUserPrompt(legacyPath, detectedStack.language, detectedStack.framework),
-          graphTools, context, resolvedModel, 'graph-resolver-architecture'
+          graphTools, context, resolvedModel, 'graph-resolver-architecture',
+          undefined, GRAPH_RESOLVER_AGENT.recoveryHint
         ),
         PHASE_TIMEOUT_MS.graphPass,
         'graph-pass-C',
@@ -845,7 +867,8 @@ export class PlannerAgent {
               provider,
               GRAPH_PASS_D_SYSTEM + customSuffix,
               buildGraphPassDUserPrompt(legacyPath, detectedStack.language, detectedStack.framework),
-              graphTools, context, resolvedModel, 'graph-resolver-counters'
+              graphTools, context, resolvedModel, 'graph-resolver-counters',
+              undefined, GRAPH_RESOLVER_AGENT.recoveryHint
             ),
             PHASE_TIMEOUT_MS.graphPass,
             'graph-pass-D',
@@ -888,9 +911,34 @@ export class PlannerAgent {
       onLog?.('[PlannerAgent] Stage 3/5: 3-pass graph resolution complete.', 'success');
       onProgress?.(55, 'Graph Resolution');
       await onPhase?.('graph-resolution', 'done');
-      await onPhase?.('section-writing', 'active');
+      // Persist the resume point BEFORE the checkpoint: a later /continue-analysis
+      // reads active_phase='section-writing' and resumes into the block below,
+      // skipping graph-resolution (and this checkpoint) entirely.
       await TaskContextManager.updateContext(sessionId, { active_phase: 'section-writing' });
       activePhase = 'section-writing';
+
+      // ── HITL checkpoint ──────────────────────────────────────────────────
+      // Capture the real graph-resolution result for the human to review, then
+      // halt. section-writing is intentionally NOT marked 'active' yet — it only
+      // starts once the user chooses Continue (the block below sets it active).
+      const ctxForSummary = await TaskContextManager.getContext(sessionId);
+      const counters: Record<string, number> = {};
+      for (const [k, v] of Object.entries(ctxForSummary)) {
+        if (k.startsWith('TOTAL_') && typeof v === 'number') counters[k] = v;
+      }
+      await SessionManager.updateSession(sessionId, {
+        graphResolutionSummary: {
+          counters,
+          primaryGraphsEmpty: await PlannerAgent.arePrimaryGraphsEmpty(modernPath),
+          generatedAt: new Date().toISOString(),
+        },
+      });
+      onLog?.(
+        '[PlannerAgent] Graph resolution complete — awaiting review. ' +
+        'Continue to write the analysis report, or skip to code migration.',
+        'success'
+      );
+      return STAGE1_AWAITING_GRAPH_REVIEW;
     }
 
     
@@ -904,7 +952,9 @@ export class PlannerAgent {
       onLog?.('[PlannerAgent] Stage 4/5: Writing 26 sections...', 'info');
       await onPhase?.('section-writing', 'active');
 
-      
+      const { provider, resolvedModel } = await resolveStreamingProvider(sessionId, targetStack, SECTION_WRITER_AGENT);
+
+
       const alreadyWritten = await getWrittenSections(modernPath);
 
       
@@ -1111,7 +1161,8 @@ export class PlannerAgent {
     await withPhaseTimeout(
       AgentExecutor.execute(
         provider, systemPrompt, userPrompt, lockedTools, context,
-        resolvedModel, `section-${section.n}`
+        resolvedModel, `section-${section.n}`,
+        undefined, SECTION_WRITER_AGENT.recoveryHint
       ),
       PHASE_TIMEOUT_MS.section,
       `section-${section.n}-first-attempt`,
@@ -1142,7 +1193,8 @@ export class PlannerAgent {
     await withPhaseTimeout(
       AgentExecutor.execute(
         provider, systemPrompt, retryPrompt, lockedTools, context,
-        resolvedModel, `section-${section.n}-retry`
+        resolvedModel, `section-${section.n}-retry`,
+        undefined, SECTION_WRITER_AGENT.recoveryHint
       ),
       PHASE_TIMEOUT_MS.section,
       `section-${section.n}-retry`,

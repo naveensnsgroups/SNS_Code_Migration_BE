@@ -138,12 +138,20 @@ export class AgentExecutor {
     agentId = 'migration-agent',
     // Optional per-run cap on turns. The analysis phase passes a small value so a
     // single pass cannot run 30+ turns and blow a rate-limited token/minute budget.
-    maxIterationsOverride?: number
+    maxIterationsOverride?: number,
+    // Optional agent-authored recovery guidance (AgentDefinition.recoveryHint) — kept
+    // separate from agentId, which is already a free-text tracing tag, not a structured
+    // agent identity. Appended to the generic, tool-list-derived recovery message.
+    recoveryHint?: string
   ): Promise<string> {
 
 
 
     const loopConfig = resolveLoopConfig(modelName);
+    // The CURRENT agent's real, registered tools — never a hardcoded/borrowed list
+    // from a different agent. This is what makes stuck-agent recovery messages
+    // actionable regardless of which agent is running.
+    const availableTools = tools.map(t => ({ name: t.name, description: t.description }));
     const effectiveMaxIterations = Math.min(
       loopConfig.maxIterations,
       maxIterationsOverride && maxIterationsOverride > 0 ? maxIterationsOverride : loopConfig.maxIterations
@@ -168,7 +176,7 @@ export class AgentExecutor {
       iteration++;
 
       
-      compactMessagesIfNeeded(messages, compactionCharBudget, iteration, context.onLog);
+      compactMessagesIfNeeded(messages, compactionCharBudget, iteration, availableTools, recoveryHint, context.onLog);
 
       context.onLog?.(`[AI Request] Submitting query to LLM (Turn ${iteration})...`, 'info');
 
@@ -281,7 +289,7 @@ export class AgentExecutor {
 
         
         const recoveryMsg = buildRecoveryMessage(
-          'reasoning-loop', '', loopConfig, { turnChars: turnText.length }
+          'reasoning-loop', '', loopConfig, availableTools, recoveryHint, { turnChars: turnText.length }
         );
         messages.push({ actor: 'user', type: 'text', text: recoveryMsg } as TextMessage);
 
@@ -329,7 +337,7 @@ export class AgentExecutor {
             const errMsg = `Tool '${tc.name}' not registered. Available: ${tools.map(t => t.name).join(', ')}`;
             context.onLog?.(`[AgentExecutor] ${errMsg}`, 'warning');
             result = makeToolErrorResult(
-              buildRecoveryMessage('tool-not-found', tc.name, loopConfig),
+              buildRecoveryMessage('tool-not-found', tc.name, loopConfig, availableTools, recoveryHint),
               'tool-not-found'
             );
           } else {
@@ -342,7 +350,7 @@ export class AgentExecutor {
 
             if (dupeCount >= loopConfig.fingerprintMaxDupes) {
               
-              const dupeMsg = buildRecoveryMessage('duplicate-blocked', tc.name, loopConfig);
+              const dupeMsg = buildRecoveryMessage('duplicate-blocked', tc.name, loopConfig, availableTools, recoveryHint);
               context.onLog?.(
                 `[AgentExecutor] DUPLICATE BLOCKED: "${tc.name}" with same args already called ` +
                 `${dupeCount}x (limit: ${loopConfig.fingerprintMaxDupes}).`,
@@ -448,7 +456,7 @@ export class AgentExecutor {
             }
             for (const [name, errCount] of errorCounts) {
               if (errCount >= loopConfig.stuckToolMaxErrors && !successNames.has(name)) {
-                const stuckMsg = buildRecoveryMessage('stuck-tool', name, loopConfig);
+                const stuckMsg = buildRecoveryMessage('stuck-tool', name, loopConfig, availableTools, recoveryHint);
                 messages.push({ actor: 'user', type: 'text', text: stuckMsg } as TextMessage);
                 resetStateForErrorType(loopState, 'stuck-tool');
                 context.onLog?.(
@@ -481,7 +489,7 @@ export class AgentExecutor {
             
             loopState.noProgressTurns++;
             if (loopState.noProgressTurns >= loopConfig.noProgressMaxTurns) {
-              const noProgressMsg = buildRecoveryMessage('no-progress', '', loopConfig);
+              const noProgressMsg = buildRecoveryMessage('no-progress', '', loopConfig, availableTools, recoveryHint);
               messages.push({ actor: 'user', type: 'text', text: noProgressMsg } as TextMessage);
               resetStateForErrorType(loopState, 'no-progress');
               context.onLog?.(
@@ -500,7 +508,7 @@ export class AgentExecutor {
         // productive analysis in between. Invisible to the error/duplicate
         // detectors, so guard it explicitly: nudge to do real work or stop.
         if (loopState.bookkeepingStreak >= loopConfig.bookkeepingStreakMax) {
-          const bkMsg = buildRecoveryMessage('bookkeeping-loop', '', loopConfig);
+          const bkMsg = buildRecoveryMessage('bookkeeping-loop', '', loopConfig, availableTools, recoveryHint);
           messages.push({ actor: 'user', type: 'text', text: bkMsg } as TextMessage);
           context.onLog?.(
             `[AgentExecutor] BOOKKEEPING LOOP: ${loopState.bookkeepingStreak} state-only calls ` +
