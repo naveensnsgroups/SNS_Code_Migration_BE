@@ -3,6 +3,7 @@
 import path from 'path';
 import fs   from 'fs-extra';
 import { TaskContextManager } from '../../session/taskContext.js';
+import { LogFn } from '../core/agent-concurrency-utils.js';
 
 export async function resolveForeignKeys(modernPath: string): Promise<number> {
   const graphPath = path.join(modernPath, '_analysis', 'entity-graph.json');
@@ -473,4 +474,91 @@ export async function computeMigrationOrder(modernPath: string): Promise<string[
   }
 
   return order;
+}
+
+// ── Graph-emptiness validation ──────────────────────────────────────────────
+// Moved from planner-agent.ts — belongs here with the rest of the graph
+// post-processing rather than the Stage-1 phase-sequencer.
+
+export function isGraphEmpty(graphData: unknown): boolean {
+  if (!graphData || typeof graphData !== 'object') return true;
+  const obj = graphData as Record<string, unknown>;
+
+  for (const val of Object.values(obj)) {
+    if (Array.isArray(val)  && val.length > 0)        return false;
+    if (typeof val === 'object' && val !== null && Object.keys(val as object).length > 0) return false;
+    if (typeof val === 'string' && val.trim().length > 0) return false;
+    if (typeof val === 'number' && val > 0)           return false;
+  }
+  return true;
+}
+
+// Checks the three primary Phase-2 graphs (symbol/entity/api) directly on disk.
+// Used by the graph quality gate instead of the TOTAL_* counters, which do not
+// exist until Pass C/D runs.
+export async function arePrimaryGraphsEmpty(modernPath: string): Promise<boolean> {
+  const graphsDir = path.join(modernPath, '_analysis');
+  for (const name of ['symbol', 'entity', 'api']) {
+    try {
+      const raw  = await fs.readFile(path.join(graphsDir, `${name}-graph.json`), 'utf-8');
+      const data = JSON.parse(raw) as Record<string, unknown>;
+      const domainData = Object.fromEntries(
+        Object.entries(data).filter(([k]) => k !== '_sources')
+      );
+      if (!isGraphEmpty(domainData)) return false;
+    } catch {
+      // missing or unreadable file counts as empty
+    }
+  }
+  return true;
+}
+
+export async function validateGraphResolverOutputs(
+  modernPath: string,
+  onLog?: LogFn
+): Promise<void> {
+  const graphsDir = path.join(modernPath, '_analysis');
+  const checks = [
+    { name: 'call-flow',    sectionRef: 'Section 14',   critical: true  },
+    { name: 'architecture', sectionRef: 'Section 2',    critical: true  },
+    { name: 'entity',       sectionRef: 'Section 5',    critical: false },
+    { name: 'symbol',       sectionRef: 'Sections 7+8', critical: false },
+    { name: 'api',          sectionRef: 'Section 10',   critical: false },
+  ];
+
+  onLog?.('[GraphValidator] Validating graph resolver outputs...', 'info');
+
+  for (const check of checks) {
+    const graphPath = path.join(graphsDir, `${check.name}-graph.json`);
+    try {
+      const raw  = await fs.readFile(graphPath, 'utf-8').catch(() => '{}');
+      const data = JSON.parse(raw) as Record<string, unknown>;
+
+      const realKeys = Object.keys(data).filter(k => k !== '_sources');
+
+      const realEntries = realKeys.filter(k => {
+        const v = data[k];
+        if (Array.isArray(v))                                    return v.length > 0;
+        if (v && typeof v === 'object') return Object.keys(v as object).length > 0;
+        if (typeof v === 'string')                               return (v as string).trim().length > 0;
+        return v !== null && v !== undefined;
+      });
+      if (realEntries.length === 0) {
+        onLog?.(
+          `[GraphValidator] ${check.name}-graph: ${realKeys.length} key(s) but 0 real data entries` +
+          ` (hollow graph — only metadata or empty objects). ` +
+          `${check.sectionRef} will use TypeScript fallback or "not applicable" note.` +
+          (check.critical ? ' (CRITICAL — check agent logs for errors)' : ''),
+          'warning'
+        );
+      } else {
+        onLog?.(
+          `[GraphValidator] ${check.name}-graph: ${realEntries.length} real entries. ${check.sectionRef} ready.`,
+          'success'
+        );
+      }
+    } catch {
+      onLog?.(`[GraphValidator] Could not read ${check.name}-graph.json.`, 'warning');
+    }
+  }
 }
