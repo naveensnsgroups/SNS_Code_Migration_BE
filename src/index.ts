@@ -21,6 +21,8 @@ import migrateRouter from './routes/migrate.js';
 import searchRouter from './routes/search.js';
 import mcpRouter from './routes/mcp.js';
 import configRouter from './routes/config.js';
+import githubAuthRouter from './routes/github-auth.js';
+import githubRouter from './routes/github.js';
 
 dotenv.config();
 
@@ -41,6 +43,8 @@ app.use('/api/migrate', migrateRouter);
 app.use('/api/search', searchRouter);
 app.use('/api/mcp', mcpRouter);
 app.use('/api/config', configRouter);
+app.use('/api/auth/github', githubAuthRouter);
+app.use('/api/github', githubRouter);
 
 app.get('/health', (req, res) => {
   res.json({ status: 'healthy', service: 'Code Migration Backend' });
