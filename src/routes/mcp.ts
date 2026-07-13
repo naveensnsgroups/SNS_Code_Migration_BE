@@ -29,8 +29,8 @@ router.get('/status', async (req: Request, res: Response, next: NextFunction) =>
         description: 'Direct filesystem access via backend tool registry.',
         tools: [
           'getFileContent', 'getWorkspaceFileList', 'getWorkspaceDirectoryStructure',
-          'searchInWorkspace', 'findFilesByPattern', 'write_file', 'write-migration-files',
-          'extractFileSymbols', 'scanAssetFiles', 'copyStaticAssets', 'compareFiles',
+          'searchInWorkspace', 'findFilesByPattern', 'write_file',
+          'extractFileSymbols', 'scanAssetFiles', 'copyStaticAssets',
           'batch-read-files',
         ],
         version: `Node.js ${process.version}`,

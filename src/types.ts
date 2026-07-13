@@ -4,6 +4,19 @@ export type MigrationStatus =
   | 'idle'
   | 'scanning'
   | 'planning'
+  | 'discovery'
+  | 'file-analysis'
+  | 'graph-resolution'
+  // HITL checkpoint: pipeline halts here after graph-resolution so the user can
+  // review the resolved graphs and choose to continue to the report or skip to
+  // code migration. Resumable via active_phase (same mechanism as pause/resume).
+  | 'awaiting-graph-review'
+  | 'section-writing'
+  | 'assembly'
+  | 'migration-planning'
+  | 'code-generation'
+  | 'verification'
+  | 'migration-assembly'
   | 'complete'
   | 'error'
   | 'paused';

@@ -2,6 +2,7 @@
 
 import { DetectedStack, FileNode, MigrationStatus, TargetStack, TokenUsage } from '../types.js';
 import { ModelPricingConfig } from '../agents/compactor/agent-cost-estimator.js';
+import { MigrationTaskEntry, RuleCoverageEntry } from '../agents/stage2/types.js';
 
 export interface TokenUsageEntry {
   agentId: string;     
@@ -60,8 +61,30 @@ export interface MigrationSession {
   mistralMaxRetries?: number;
   mistralRetryDelayRateLimit?: number;
   mistralRetryDelayOther?: number;
-  tokenUsage?: TokenUsage;                       
-  tokenUsageHistory?: TokenUsageEntry[];          
+  tokenUsage?: TokenUsage;
+  tokenUsageHistory?: TokenUsageEntry[];
+
+  // Stage 2 — populated by MIGRATION_PLANNER_AGENT / CODE_GENERATOR_AGENT /
+  // the verification loop. Absent entirely until a session reaches Stage 2.
+  migrationTaskList?: MigrationTaskEntry[];
+  ruleCoverageReport?: RuleCoverageEntry[];
+
+  // HITL graph-review checkpoint data — captured when the pipeline halts after
+  // graph-resolution (status 'awaiting-graph-review'). Read by the review UI.
+  graphResolutionSummary?: GraphResolutionSummary;
+}
+
+// Real per-run graph-resolution result the human reviews at the checkpoint —
+// all values come from what graph-resolution actually computed, never invented.
+export interface GraphResolutionSummary {
+  // Every TOTAL_* counter graph-resolution wrote to task context (callable units,
+  // API endpoints, data entities, DB tables, business rules, events, etc.). Kept
+  // as an open record so a newly-added counter flows through with no code change.
+  counters: Record<string, number>;
+  // True when the 3 primary graphs (symbol/entity/api) are all empty on disk —
+  // continuing or skipping is pointless in that case, so the UI blocks both.
+  primaryGraphsEmpty: boolean;
+  generatedAt: string;
 }
 
 export interface LogEntry {

@@ -54,12 +54,17 @@ export class SessionManager {
       completedFiles: 0,
       fileTree: [],
       phases: [
-        { id: 'scan',             label: 'Stack Detection',   status: 'pending' },
-        { id: 'discovery',        label: 'Discovery',         status: 'pending' },
-        { id: 'file-analysis',    label: 'File Analysis',     status: 'pending' },
-        { id: 'graph-resolution', label: 'Graph Resolution',  status: 'pending' },
-        { id: 'section-writing',  label: 'Section Writing',   status: 'pending' },
-        { id: 'assembly',         label: 'Assembly',          status: 'pending' },
+        { id: 'scan',               label: 'Stack Detection',    status: 'pending' },
+        { id: 'discovery',          label: 'Discovery',          status: 'pending' },
+        { id: 'file-analysis',      label: 'File Analysis',      status: 'pending' },
+        { id: 'graph-resolution',   label: 'Graph Resolution',   status: 'pending' },
+        { id: 'section-writing',    label: 'Section Writing',    status: 'pending' },
+        { id: 'assembly',           label: 'Assembly',           status: 'pending' },
+        // Stage 2 — code migration (added after Stage 1 stabilization).
+        { id: 'migration-planning', label: 'Migration Planning', status: 'pending' },
+        { id: 'code-generation',    label: 'Code Generation',    status: 'pending' },
+        { id: 'verification',      label: 'Verification',       status: 'pending' },
+        { id: 'migration-assembly', label: 'Migration Report',   status: 'pending' },
       ],
     };
 

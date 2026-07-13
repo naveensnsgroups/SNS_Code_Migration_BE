@@ -1,7 +1,7 @@
 import { SessionManager } from '../../session/sessionManager.js';
 import { EventBroadcaster } from '../../routes/stream.js';
 import { TaskContextManager } from '../../session/taskContext.js';
-import { PlannerAgent, STAGE1_ABORTED } from '../stage1/planner-agent.js';
+import { PlannerAgent, STAGE1_ABORTED, STAGE1_AWAITING_GRAPH_REVIEW } from '../stage1/planner-agent.js';
 import { ShellExecutor } from '../../tools/shellExecutor.js';
 import { writeSessionFile } from '../../tools/fileWriter.js';
 import { scanProjectDirectory } from '../../tools/fileScanner.js';
@@ -85,10 +85,15 @@ export class MigrationOrchestrator {
       agentsConfig,
     });
 
-    
-    this.activeSessions.add(sessionId);
 
-    
+    this.activeSessions.add(sessionId);
+    this.launchPipeline(sessionId);
+  }
+
+  // Fire-and-forget pipeline run with shared guard/error/cleanup handling. Used
+  // by both a fresh startMigration and a /continue-analysis resume — the pipeline
+  // itself resumes from the persisted active_phase, so this is identical for both.
+  private static launchPipeline(sessionId: string): void {
     this.runPipeline(sessionId).catch(async (err) => {
       console.error(`Pipeline error in session ${sessionId}:`, err);
 
@@ -97,9 +102,48 @@ export class MigrationOrchestrator {
 
       EventBroadcaster.broadcast(sessionId, 'error', { message: err.message });
     }).finally(() => {
-      
       this.activeSessions.delete(sessionId);
     });
+  }
+
+  // HITL: resume Stage 1 from the graph-review checkpoint into section-writing.
+  // The pipeline reads active_phase='section-writing' (persisted at the checkpoint)
+  // and continues from there. apiKey/apiKeys are re-sent because the checkpoint
+  // wiped them — same discipline as each Stage 2 sub-stage.
+  static async continueAnalysis(sessionId: string, apiKey: string, apiKeys?: any): Promise<void> {
+    if (this.activeSessions.has(sessionId)) {
+      console.warn(`[MigrationOrchestrator] Session ${sessionId} is already running. Ignoring continueAnalysis.`);
+      return;
+    }
+    this.pausedSessions.delete(sessionId);
+    this.stoppedSessions.delete(sessionId);
+
+    const session = await SessionManager.getSession(sessionId);
+    if (!session) return;
+
+    await SessionManager.updateSession(sessionId, { status: 'section-writing', apiKey, apiKeys });
+    this.activeSessions.add(sessionId);
+    this.launchPipeline(sessionId);
+  }
+
+  // HITL: skip the analysis report entirely and mark Stage 1 complete so Stage 2
+  // becomes available. The graphs are all Stage 2 needs (Migration Planning reads
+  // them directly); the written report is intentionally forfeited. active_phase is
+  // set to 'complete' so a stray resume can never re-run analysis.
+  static async skipToStage2(sessionId: string): Promise<void> {
+    await TaskContextManager.updateContext(sessionId, { active_phase: 'complete' });
+    await SessionManager.updateSession(sessionId, {
+      status: 'complete',
+      apiKey: undefined,
+      apiKeys: undefined,
+    });
+    const entry = await SessionManager.addLog(
+      sessionId,
+      '[Pipeline] Skipped analysis report — proceeding to code migration. Graphs are ready for Stage 2.',
+      'info',
+    );
+    EventBroadcaster.broadcast(sessionId, 'log', entry);
+    EventBroadcaster.broadcast(sessionId, 'complete', { success: true });
   }
 
   private static async runPipeline(sessionId: string): Promise<void> {
@@ -308,6 +352,23 @@ export class MigrationOrchestrator {
       // already been set by checkCancellation — do not mark the run complete.
       if (result === STAGE1_ABORTED) {
         await log('[Pipeline] Stage 1 halted by user request. Resume to continue from the saved phase.', 'warning', 'stage1');
+        return;
+      }
+
+      // HITL graph-review checkpoint: halt after graph-resolution. The summary is
+      // already persisted by PlannerAgent; here we set the review status, wipe the
+      // keys (re-sent by /continue-analysis), and notify the UI. Not a completion.
+      if (result === STAGE1_AWAITING_GRAPH_REVIEW) {
+        await SessionManager.updateSession(sessionId, {
+          status: 'awaiting-graph-review',
+          apiKey: undefined,
+          apiKeys: undefined,
+        });
+        EventBroadcaster.broadcast(sessionId, 'phase_change', {
+          phase: 'awaiting-graph-review',
+          phaseId: 'graph-resolution',
+          status: 'done',
+        });
         return;
       }
     } else {

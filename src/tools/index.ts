@@ -18,7 +18,6 @@ import { getGitLogTool }             from './environment/get-git-log.tool.js';
 import { capturedShellExecuteTool }  from './environment/captured-shell-execute.tool.js';
 
 import { writeFileTool }             from './output/write-file.tool.js';
-import { writeMigrationFilesTool }   from './output/write-migration-files.tool.js';
 import { copyStaticAssetsTool }      from './output/copy-static-assets.tool.js';
 
 import { getTaskContextTool }        from './memory/get-task-context.tool.js';
@@ -30,8 +29,6 @@ import { compressMigrationContextTool }      from './progress/compress-migration
 
 import { findMigrationSessionTool }  from './session/find-migration-session.tool.js';
 import { getSkillFileContentTool }   from './session/get-skill-file-content.tool.js';
-
-import { compareFilesTool }          from './compare/compare-files.tool.js';
 
 import { appendToKnowledgeGraphTool } from './knowledge/append-to-knowledge-graph.tool.js';
 import { readKnowledgeGraphTool }     from './knowledge/read-knowledge-graph.tool.js';
@@ -54,9 +51,8 @@ export function registerAllTools(): void {
   toolRegistry.registerTool(getGitLogTool);
   toolRegistry.registerTool(capturedShellExecuteTool);
 
-  
+
   toolRegistry.registerTool(writeFileTool);
-  toolRegistry.registerTool(writeMigrationFilesTool);
   toolRegistry.registerTool(copyStaticAssetsTool);
 
   
@@ -68,14 +64,11 @@ export function registerAllTools(): void {
   toolRegistry.registerTool(updateMigrationDashboardTool);
   toolRegistry.registerTool(compressMigrationContextTool);
 
-  
+
   toolRegistry.registerTool(findMigrationSessionTool);
   toolRegistry.registerTool(getSkillFileContentTool);
 
-  
-  toolRegistry.registerTool(compareFilesTool);
 
-  
   toolRegistry.registerTool(appendToKnowledgeGraphTool);
   toolRegistry.registerTool(readKnowledgeGraphTool);
 }

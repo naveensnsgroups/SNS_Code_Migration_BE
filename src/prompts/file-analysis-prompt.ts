@@ -262,6 +262,114 @@ EXAMPLE — a ROUTE/ROUTER file (any framework: Express, Flask, Spring, Laravel,
   - Leave request:{} and responses:{} empty — that is correct for route-only files
   - NEVER use assumed names or names from other projects — only what you READ in this file
   - NEVER call with data:{} — always include at least one route entry with method+path+handler
+
+  NON-HTTP ENTRY POINTS (apply to ANY language/framework — not every program is a
+  web server): "METHOD /path" only fits HTTP. A LOT of real systems expose their
+  callable surface a different way, and api-graph still captures ALL of them —
+  just with a key prefix that names the real invocation mechanism instead of
+  inventing an HTTP shape that was never there. Use whichever of these actually
+  matches what you read (do not force-fit HTTP onto something that isn't HTTP):
+
+    "GET /path", "POST /path", etc.  → HTTP/REST endpoint (the default above)
+    "query:operationName" /
+    "mutation:operationName"         → GraphQL resolver
+    "command:name" / "cli:name"      → CLI command (argparse/click/cobra/commander/
+                                         picocli, or any language's CLI framework)
+    "consumer:topic" / "worker:queue"→ Message/queue consumer (Kafka listener,
+                                         RabbitMQ consumer, SQS handler, any language)
+    "rpc:Service.Method" /
+    "grpc:Service.Method"            → RPC / gRPC service method
+    "transaction:ID"                 → Mainframe/legacy transaction entry point —
+                                         a CICS transaction (EXEC CICS LINK/XCTL/
+                                         RETURN, a 4-char CICS TRANSID), an IMS
+                                         transaction code, or an equivalent
+                                         COBOL/PL1/RPG program entry invoked by ID
+                                         rather than by network path. Use the exact
+                                         transaction ID/program name as it appears
+                                         in the code (e.g. "transaction:TASKA").
+
+  For all of these, the same fields still apply as best they fit: "handler" is
+  the actual function/paragraph/program that executes, "auth" is whatever real
+  authorization mechanism guards it (or "" if none), "request"/"responses" hold
+  whatever input/output shape actually exists (e.g. a CICS COMMAREA layout, a
+  gRPC message type, a CLI argument list) — never invent a field's content, and
+  never invent an HTTP-shaped key for something that has no HTTP method or path.
+  This is separate from job-graph: a SCHEDULED trigger (cron, batch job, JCL step)
+  still belongs in job-graph, not here — only record it here as well if it is ALSO
+  independently callable on demand through one of the mechanisms above.
+
+  This list is guidance, NOT an exhaustive/closed set. If the real invocation
+  mechanism you are reading does not match any of the above (e.g. a WebSocket
+  handler, an EDI/X12 transaction, an SNMP trap handler, a hardware interrupt
+  service routine, a Unix signal handler) — invent a short, honest prefix that
+  names what it actually is (e.g. "websocket:eventName", "edi:TransactionSet")
+  rather than force-fitting it into one of the examples above. The prefix only
+  needs to be consistent and descriptive — there is no fixed enum to satisfy.
+
+  ROUTE MOUNTING / PREFIX COMPOSITION (apply to ANY language/framework):
+  A file that wires a sub-router/blueprint/controller into the app under a path
+  prefix is NOT itself a callable HTTP entry point. Examples of a MOUNT statement
+  (do NOT create an api-graph entry for these): Express/Koa "app.use('/api/user',
+  userRouter)" or "router.use(prefix, subRouter)"; Flask/FastAPI
+  "app.register_blueprint(bp, url_prefix='/api/user')" or
+  "app.include_router(router, prefix='/api/user')"; Django
+  "path('api/user/', include('user.urls'))". The mounted variable
+  (userRouter / bp / router) is a router object, not a function — it can never
+  resolve to a symbol-graph entry, so recording it as a handler produces a dead,
+  unresolvable api-graph entry.
+
+  Instead, when you find a MOUNT statement:
+    1. Do NOT write an api-graph entry keyed by the mount line itself.
+    2. Resolve which FILE the mounted router/blueprint/controller is imported
+       from (follow the import path).
+    3. Save the mapping via edit_task_context: merge into a
+       ROUTE_MOUNT_PREFIXES object keyed by that file's exact path, e.g.
+       { "ROUTE_MOUNT_PREFIXES": { "backend/routes/userRoutes.js": "/api/user" } }
+
+  When you later analyze THAT router/blueprint/controller file and find its own
+  local route definitions (e.g. "router.post('/register', registerUser)"):
+    1. Call get_task_context and check ROUTE_MOUNT_PREFIXES for an entry whose
+       key matches the CURRENT file's path.
+    2. If found, the api-graph key MUST be the composed full path:
+       prefix + local path (e.g. "/api/user" + "/register" = "POST /api/user/register").
+       NEVER write just the local fragment ("POST /register") if a prefix exists
+       for this file — that silently records the wrong URL.
+    3. If no prefix mapping exists yet for this file (the mount statement in the
+       parent file hasn't been analyzed yet, or there is no separate mount file —
+       e.g. NestJS/Spring where the prefix lives on the SAME file via a class-level
+       decorator like @Controller('/api/user') alongside method-level @Get/@Post),
+       compose the prefix directly from what is visible in THIS file, or fall back
+       to the local path only as a last resort — never invent a prefix you did not
+       read somewhere.
+
+  HANDLER FILE → REQUEST/RESPONSE SHAPES (apply to ANY language/framework):
+  A route file only knows the path — it cannot see the request body or response
+  shape, since those only exist in the separate handler/controller/service file's
+  own code (e.g. where it reads req.body.email, request.json()['email'], a DTO
+  class, or a @RequestBody parameter). When you analyze a route file and write an
+  api-graph entry with a "handler" name, ALSO save a lookup so the handler file —
+  analyzed separately, in either order — can find which entry it belongs to:
+    1. Save via edit_task_context: merge into a HANDLER_TO_ROUTE_KEY object keyed
+       by the EXACT handler function/method name, e.g.
+       { "HANDLER_TO_ROUTE_KEY": { "registerUser": "POST /api/user/register" } }
+
+  When you later analyze the HANDLER/CONTROLLER file itself and extract its real
+  request body fields and response shape:
+    1. Call get_task_context and check HANDLER_TO_ROUTE_KEY for an entry whose
+       key matches THIS function's exact name.
+    2. If found: call append-to-knowledge-graph({ graphName: "api", data: {
+         "<the exact key from HANDLER_TO_ROUTE_KEY>": { request: {...}, responses: {...} }
+       } }) — this MERGES into the route file's existing entry; it does not
+       replace handler/auth/middlewareChain already recorded there.
+    3. If NOT found (the route file has not been analyzed yet, or there is no
+       separate route file — e.g. NestJS/Spring where the path decorator is on
+       THIS SAME file, in which case just write the api-graph entry directly
+       with the full key as normal): stage the shape instead of guessing a key.
+       Save via edit_task_context: merge into a PENDING_HANDLER_SHAPES object
+       keyed by the exact handler function name, e.g.
+       { "PENDING_HANDLER_SHAPES": { "registerUser": { request: {...}, responses: {...} } } }
+       Graph Resolution reconciles this against api-graph automatically once all
+       files are analyzed — never invent or guess an api-graph key in this case.
 </extraction_guard>
 
 For each PENDING file, execute steps in this EXACT ORDER — no shortcuts, no reordering:
@@ -522,7 +630,9 @@ You may skip Q1–Q17 below if the role clearly matches one of these rows:
   ─────────────────────────────────────────────────────────────────────────
   Model / ORM / Schema / DTO       → entity-graph  + state-graph (if any status/enum field)
   Route / Router                   → api-graph     + middleware-graph
-  Controller / Handler             → symbol-graph  + api-graph (req/res shapes) + db-graph (if direct DB ops)
+  Controller / Handler             → symbol-graph  + api-graph (req/res shapes — see
+                                      HANDLER FILE → REQUEST/RESPONSE SHAPES in <extraction_guard>
+                                      for the exact key to merge into) + db-graph (if direct DB ops)
   Service / Business Logic         → symbol-graph  + rule-graph (REQUIRED: every validation,
     every authorization check, every calculation, every state-change condition = one rule entry.
     Include type, pseudocode steps, and migratable flag for each) + async-graph + db-graph
@@ -659,6 +769,14 @@ A file may match multiple questions — call append-to-knowledge-graph once per 
 Use exactly these shapes when calling append-to-knowledge-graph:
 
 ${GRAPH_SHAPES_DOC}
+
+KEY FORMATTING (applies to every graph keyed by a composite string — api-graph's
+"METHOD /path", symbol-graph's "funcName", imports-graph's file path, etc.):
+write the key as a PLAIN string. NEVER wrap it in quote characters as part of the
+string itself — "POST /api/user/register" is correct; '"POST /api/user/register"'
+or "'POST /api/user/register'" is wrong and creates a duplicate, disconnected
+entry instead of merging with the real one. This applies in every language and
+every graph, not just api-graph.
 </graph_shapes>
 
 <related_files_rule>

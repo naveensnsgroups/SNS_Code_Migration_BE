@@ -31,7 +31,6 @@ export const EDIT_TASK_CONTEXT_FUNCTION_ID                 = 'edit_task_context'
 
 export const GET_DEPENDENCY_TREE_FUNCTION_ID               = 'getDependencyTree';
 export const GET_GIT_LOG_FUNCTION_ID                       = 'getGitLog';
-export const COMPARE_FILES_FUNCTION_ID                     = 'compareFiles';
 export const GET_ENVIRONMENT_INFO_FUNCTION_ID              = 'getEnvironmentInfo';
 
 export const EXTRACT_FILE_SYMBOLS_FUNCTION_ID              = 'extractFileSymbols';
@@ -44,8 +43,6 @@ export const BATCH_READ_FILES_FUNCTION_ID                  = 'batch-read-files';
 export const COMPRESS_MIGRATION_CONTEXT_FUNCTION_ID        = 'compress-migration-context';
 
 export const UPDATE_MIGRATION_DASHBOARD_FUNCTION_ID        = 'update-migration-dashboard';
-
-export const WRITE_MIGRATION_FILES_FUNCTION_ID             = 'write-migration-files';
 
 export const FIND_MIGRATION_SESSION_FUNCTION_ID            = 'find-migration-session';
 

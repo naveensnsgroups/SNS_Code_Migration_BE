@@ -15,8 +15,10 @@ export const getFileContentTool: ToolRequest = {
   name: 'getFileContent',
   providerName: 'migration-workspace',
   description:
-    'Returns the content of a specified file in the legacy workspace as a raw string. ' +
-    'The file path must be relative to the workspace root. ' +
+    'Returns the content of a specified file as a raw string. Reads from the LEGACY ' +
+    'workspace by default. Pass workspace:"modern" to read an already-generated file from ' +
+    'the modern/output workspace instead (e.g. to inspect a file Code Generation already wrote). ' +
+    'The file path must be relative to whichever workspace root you selected. ' +
     'Supports optional offset (zero-based line number) and limit (max lines to return) for reading large files in chunks. ' +
     'It is recommended to read the whole file without offset/limit unless you expect it to be very large. ' +
     'If the file is very large (>300 lines), use offset+limit to page through it in chunks of ~200 lines. ' +
@@ -26,7 +28,11 @@ export const getFileContentTool: ToolRequest = {
     properties: {
       file: {
         type: 'string',
-        description: 'The relative path to the target file within the legacy workspace (e.g. "src/index.ts", "package.json"). Must be relative to workspace root.'
+        description: 'The relative path to the target file (e.g. "src/index.ts", "package.json"). Must be relative to the selected workspace root.'
+      },
+      workspace: {
+        type: 'string',
+        description: 'Which workspace to read from: "legacy" (default, the original source project) or "modern" (the migration output workspace, for reading already-generated files).'
       },
       offset: {
         type: 'number',
@@ -40,14 +46,15 @@ export const getFileContentTool: ToolRequest = {
     required: ['file']
   },
   handler: async (arg_string: string, ctx?: ToolContext) => {
-    const parsed = parseToolArgs<{ file: string; offset?: number; limit?: number }>(arg_string, 'getFileContent');
+    const parsed = parseToolArgs<{ file: string; workspace?: string; offset?: number; limit?: number }>(arg_string, 'getFileContent');
     if (!parsed.ok) return parsed.error;
     const args = parsed.value;
     if (!args.file) {
       return makeToolErrorResult('getFileContent: missing required parameter "file".');
     }
-    const targetPath = path.resolve(ctx!.legacyPath, args.file);
-    if (!targetPath.startsWith(path.resolve(ctx!.legacyPath))) {
+    const workspaceRoot = args.workspace === 'modern' ? ctx!.modernPath : ctx!.legacyPath;
+    const targetPath = path.resolve(workspaceRoot, args.file);
+    if (!targetPath.startsWith(path.resolve(workspaceRoot))) {
       return makeToolErrorResult('getFileContent: access denied — path is outside the workspace.');
     }
     if (!(await fs.pathExists(targetPath))) {

@@ -180,7 +180,7 @@ For EVERY entity in the graph, write a complete entity specification:
 RAW SQL / NO-ORM HANDLING:
   If an entity has no fields[] (project uses raw SQL without ORM, or C structs, or PHP arrays):
   → Write what IS available: table name, operations observed, files where it appears.
-  → Add note: "> ⚠️ Raw SQL / no ORM detected — field-level schema not available from static analysis."
+  → Add note: "> Warning: Raw SQL / no ORM detected — field-level schema not available from static analysis."
   → Do NOT invent field names. Write only what was explicitly found in the code.
 
 Include ALL entities. Do NOT truncate any field list.
@@ -205,17 +205,17 @@ For every dependency found, write a complete table:
              Testing / Logging / Queue / Cache / File / Utility / DevDependency
   Purpose: one sentence describing what this package does in the project
   Migration Status:
-    ✅ Safe     — well-maintained, has modern equivalent, no breaking API changes
-    ⚠️ Caution — still works but has concerns (deprecated API, security issues, slow updates)
-    🔴 Breaking — requires significant migration effort (explain the specific challenge)
-    ⚪ Unknown  — package from an ecosystem you cannot assess with certainty
+    Safe     — well-maintained, has modern equivalent, no breaking API changes
+    Caution  — still works but has concerns (deprecated API, security issues, slow updates)
+    Breaking — requires significant migration effort (explain the specific challenge)
+    Unknown  — package from an ecosystem you cannot assess with certainty
                   (use this for obscure PHP/Java/Ruby/Go packages rather than guessing)
 
-  IMPORTANT: Only assign ✅/⚠️/🔴 if you are certain about this package's status.
-  For packages you do not recognize or cannot assess: always use ⚪ Unknown.
+  IMPORTANT: Only assign Safe/Caution/Breaking if you are certain about this package's status.
+  For packages you do not recognize or cannot assess: always use Unknown.
   Never guess or fabricate migration difficulty for unfamiliar libraries.
 
-Include ALL packages. After table: list any packages with ⚪ Unknown status — flag for manual research.
+Include ALL packages. After table: list any packages with Unknown status — flag for manual research.
 Group by Category for readability.`,
   },
   {
@@ -354,13 +354,15 @@ IMPORTANT — The api-graph key format reveals the invocation type. Handle each 
   "command:name" / "cli:name" → CLI command
   "consumer:topic" / "worker:queue" → Queue/message consumer
   "rpc:Service.Method" / "grpc:..." → gRPC / RPC method
+  "transaction:ID" → Mainframe/legacy transaction entry point (CICS TRANSID,
+    IMS transaction code, or equivalent COBOL/PL1/RPG program invoked by ID)
   "CLIENT GET /path" / "CLIENT POST /path" → Frontend API call (document separately)
   "schedule:name" / "cron:name" → Scheduled trigger (cross-ref with Section 25)
 
 For EACH entry in api-graph, write the appropriate contract:
 
-### [Key from graph — e.g. "POST /users" or "mutation:createUser" or "command:deploy"]
-  - **Type**: HTTP REST / GraphQL / CLI / Queue Consumer / gRPC / Frontend Call
+### [Key from graph — e.g. "POST /users" or "mutation:createUser" or "command:deploy" or "transaction:TASKA"]
+  - **Type**: HTTP REST / GraphQL / CLI / Queue Consumer / gRPC / Mainframe Transaction / Frontend Call
   - **Handler**: callable name → file path
   - **Auth**: resolved auth requirement (JWT / API Key / Session / None / IAM / etc.)
   - **Rate Limit**: if any
@@ -1012,7 +1014,7 @@ Save the result to the output file path given. Then stop.
    c. If the relevant graph is EMPTY and its counter is GREATER THAN 0
       (whether or not it exceeds the threshold above):
       → Write this DATA GAP WARNING at the TOP of the section:
-      "> ⚠️ DATA GAP WARNING: The [graph-name] is empty, but [counter]=[N] was recorded.
+      "> DATA GAP WARNING: The [graph-name] is empty, but [counter]=[N] was recorded.
       > This indicates a Phase 2 or Phase 3 analysis gap. Section content is incomplete.
       > Re-run the analysis to regenerate this graph."
       → Then write what you CAN determine from other available graphs.
@@ -1025,7 +1027,7 @@ Save the result to the output file path given. Then stop.
    e. If the relevant counter is MISSING / NOT SET (the key does not exist in task context):
       → This means Phase 3 (graph resolution) did not complete — counters were never saved.
       → Write this ANALYSIS GAP WARNING at the TOP of the section:
-      "> ⚠️ ANALYSIS GAP: G5 counters were not saved (Phase 3 may not have completed).
+      "> ANALYSIS GAP: G5 counters were not saved (Phase 3 may not have completed).
       > The 'None detected' result below may be incorrect. Re-run the full analysis."
       → Then write "None detected (counter not set — re-run to verify)."
       → This is DIFFERENT from d above: 0 means zero, missing means unknown.
