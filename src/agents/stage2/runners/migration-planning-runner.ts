@@ -15,7 +15,9 @@ import {
 } from '../../../prompts/migration-planner-prompt.js';
 import { buildDraftMigrationTasks, DraftMigrationTask } from '../migration-planner.js';
 import { MigrationTaskEntry, RuleCoverageEntry } from '../types.js';
-import { LogFn, PLANNING_BATCH_TIMEOUT_MS, withTimeout, guessExtension, withExtension } from './shared.js';
+import { LogFn, PLANNING_BATCH_TIMEOUT_MS, withTimeout, guessExtension, withExtension, mergeTargetFileCollisions, preservePriorTaskStatus, buildScaffoldingTasks } from './shared.js';
+import { resolveFrameworkSkill } from '../../../knowledge/framework-skills/registry.js';
+import { checkImportsGraphSanity } from '../../stage1/graph-resolver.js';
 
 // Same tiered shape as Stage 1's batch-size heuristic — smaller batches once the
 // total file count grows, so a single LLM turn's output (one path per file)
@@ -52,6 +54,9 @@ export async function runPlanning(
   onLog?.(`[${MIGRATION_PLANNER_AGENT.name}] Draft task list built: ${draftTasks.length} file(s), dependency-ordered.`, 'success');
 
   const session      = await SessionManager.getSession(sessionId);
+  // Captured now, before this run overwrites it — used to carry forward
+  // status/lastError for any task whose identity didn't actually change.
+  const previousTaskList: MigrationTaskEntry[] = (session as any)?.migrationTaskList ?? [];
   const toolsConfig: Record<string, boolean> = (session as any)?.toolsConfig ?? {};
   const { provider, resolvedModel } = await resolveStreamingProvider(sessionId, targetStack, MIGRATION_PLANNER_AGENT);
 
@@ -72,6 +77,20 @@ export async function runPlanning(
     language:      targetStack.language,
     testFramework: targetStack.testFramework,
   };
+
+  // Curated, per-target-framework conventions (folder layout, router/DI/async
+  // idioms, required scaffolding) — see src/knowledge/framework-skills/*.md.
+  // Resolved once here: reused both for the path-assignment prompt below and
+  // for the scaffolding-task step further down. A framework with no matching
+  // skill falls back to today's prose-guessing behavior — explicitly, not silently.
+  const skill = await resolveFrameworkSkill(targetStack.framework);
+  onLog?.(
+    skill
+      ? `[${MIGRATION_PLANNER_AGENT.name}] Using curated conventions for target framework "${targetStack.framework}".`
+      : `[${MIGRATION_PLANNER_AGENT.name}] No curated skill for target framework "${targetStack.framework}" — ` +
+        `proceeding with general LLM knowledge; architecture consistency across files is not guaranteed.`,
+    skill ? 'info' : 'warning'
+  );
 
   // legacyFile -> targetFile, filled in batch by batch. Kept in TS memory and
   // reconciled from each batch's isolated result — never trusted to survive
@@ -97,7 +116,8 @@ export async function runPlanning(
           MIGRATION_PLANNER_SYSTEM_PROMPT,
           buildMigrationPlannerUserPrompt(
             legacyPath, batch, targetStackForPrompt,
-            detectedStack.language, detectedStack.framework
+            detectedStack.language, detectedStack.framework,
+            skill?.folderLayout
           ),
           tools, context, resolvedModel, `migration-planning-batch-${i + 1}`,
           undefined, MIGRATION_PLANNER_AGENT.recoveryHint
@@ -135,7 +155,7 @@ export async function runPlanning(
   // leave a task without a target path — an unresolved path silently blocks
   // Phase 3 (Code Generator) from knowing where to write.
   const fallbackExt = guessExtension(targetStack.language);
-  const migrationTaskList: MigrationTaskEntry[] = draftTasks.map(t => ({
+  const rawTaskList: MigrationTaskEntry[] = draftTasks.map(t => ({
     legacyFile:    t.legacyFile,
     targetFile:    targetPaths.get(t.legacyFile) ?? withExtension(t.legacyFile, fallbackExt),
     rulesInvolved: t.rulesInvolved,
@@ -143,15 +163,80 @@ export async function runPlanning(
     status:        'pending',
   }));
 
+  // Add whatever scaffolding the resolved skill declares as required (e.g. a
+  // shared DB connection module, a dependency manifest, an app entrypoint) —
+  // 'first'-order files go before everything and become a dependency of every
+  // real task; 'last'-order files (the entrypoint) go after everything and
+  // depend on every real + 'first' task. Without this, each file independently
+  // guesses its own framework conventions (confirmed in a real run as the
+  // direct cause of both a hedged DB-access stub and an app with no entrypoint).
+  const { firstTasks, lastTasks } = buildScaffoldingTasks(skill, rawTaskList);
+  if (firstTasks.length + lastTasks.length > 0) {
+    onLog?.(
+      `[${MIGRATION_PLANNER_AGENT.name}] Added ${firstTasks.length + lastTasks.length} required scaffolding ` +
+      `file(s) for "${targetStack.framework}": ${[...firstTasks, ...lastTasks].map(t => t.targetFile).join(', ')}.`,
+      'info'
+    );
+  }
+  const scaffoldedTaskList = [...firstTasks, ...rawTaskList, ...lastTasks];
+
+  // Fold any legacy files the Planner assigned to the SAME targetFile into one
+  // task — Code Generation writes one complete file per task, so two tasks
+  // sharing a target would just have the second write silently erase the first.
+  const mergedTaskList = mergeTargetFileCollisions(scaffoldedTaskList);
+  const collisionCount = scaffoldedTaskList.length - mergedTaskList.length;
+  if (collisionCount > 0) {
+    onLog?.(
+      `[${MIGRATION_PLANNER_AGENT.name}] ${collisionCount} file(s) shared a target path with another file — ` +
+      `merged into a single combined-generation task each, so they'll be translated together into one file instead ` +
+      `of overwriting each other.`,
+      'info'
+    );
+  }
+
+  // Carry forward status/lastError for any task whose legacyFile, targetFile,
+  // dependsOn, and merged group are unchanged from the previous plan — a
+  // re-plan should not silently discard already-completed generation work.
+  const migrationTaskList = preservePriorTaskStatus(mergedTaskList, previousTaskList);
+  const preservedCount = migrationTaskList.filter(t => t.status !== 'pending').length;
+  if (preservedCount > 0) {
+    onLog?.(
+      `[${MIGRATION_PLANNER_AGENT.name}] ${preservedCount} file(s) unchanged since the last plan — ` +
+      `their generation/verification status was preserved, not reset.`,
+      'info'
+    );
+  }
+
+  // Preserve prior covered/uncovered verdicts too — a task carrying forward
+  // its status (unchanged since the last plan) shouldn't lose its already-
+  // judged rule coverage just because /plan ran again.
+  const previousRuleCoverageReport: RuleCoverageEntry[] = (session as any)?.ruleCoverageReport ?? [];
+  const previousCoverageByLegacyFile = new Map(previousRuleCoverageReport.map(r => [r.legacyFile, r]));
+
   const ruleCoverageReport: RuleCoverageEntry[] = migrationTaskList
     .filter(t => t.rulesInvolved.length > 0)
-    .map(t => ({
-      legacyFile: t.legacyFile,
-      targetFile: t.targetFile,
-      rules:      t.rulesInvolved,
-    }));
+    .map(t => {
+      const prior = t.status !== 'pending' ? previousCoverageByLegacyFile.get(t.legacyFile) : undefined;
+      return {
+        legacyFile: t.legacyFile,
+        targetFile: t.targetFile,
+        rules:      t.rulesInvolved,
+        covered:    prior?.covered,
+        uncovered:  prior?.uncovered,
+      };
+    });
 
-  await SessionManager.updateSession(sessionId, { migrationTaskList, ruleCoverageReport });
+  // Non-blocking sanity check — real files silently missing from imports-graph
+  // (the exact confirmed bug: every file's data collapsing into one shared
+  // key) produce a "valid-looking" but wrong plan otherwise. Surfaced in the
+  // same review panel the human already checks before generating code, not
+  // left for them to notice unaided.
+  const planSanityWarning = await checkImportsGraphSanity(modernPath);
+  if (planSanityWarning) {
+    onLog?.(`[${MIGRATION_PLANNER_AGENT.name}] SANITY WARNING: ${planSanityWarning}`, 'warning');
+  }
+
+  await SessionManager.updateSession(sessionId, { migrationTaskList, ruleCoverageReport, planSanityWarning: planSanityWarning ?? undefined });
 
   onLog?.(
     `[${MIGRATION_PLANNER_AGENT.name}] Stage 2 complete: ${migrationTaskList.length} file(s) planned, ` +

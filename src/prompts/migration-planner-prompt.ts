@@ -90,11 +90,16 @@ export function buildMigrationPlannerUserPrompt(
   batch:         DraftMigrationTask[],
   targetStack:   { framework: string; database: string; language: string; testFramework: string },
   detectedLanguage?: string,
-  detectedFramework?: string
+  detectedFramework?: string,
+  curatedFolderLayout?: string
 ): string {
   const fileList = batch
     .map(t => `  - ${t.legacyFile}  (${t.rulesInvolved.length} rule(s) attached, depends on: ${t.dependsOn.length ? t.dependsOn.join(', ') : 'none'})`)
     .join('\n');
+
+  const folderLayoutBlock = curatedFolderLayout
+    ? `\nCURATED FOLDER LAYOUT for ${targetStack.framework} (follow this exactly, do not invent a different scheme):\n${curatedFolderLayout}\n`
+    : '';
 
   return `${buildLanguageHint(detectedLanguage, detectedFramework)}Assign target-stack file paths for this batch of legacy files from: "${legacyPath}"
 
@@ -103,7 +108,7 @@ TARGET STACK (assign paths idiomatic to THIS stack, not the legacy one):
   Language:       ${targetStack.language}
   Database:       ${targetStack.database}
   Test framework: ${targetStack.testFramework}
-
+${folderLayoutBlock}
 BATCH (${batch.length} file(s), already dependency-ordered):
 ${fileList}
 

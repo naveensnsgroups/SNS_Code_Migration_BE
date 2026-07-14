@@ -333,6 +333,9 @@ router.get('/state', async (req: Request, res: Response, next: NextFunction) => 
       migrationTaskList:  session.migrationTaskList ?? null,
       ruleCoverageReport: session.ruleCoverageReport ?? null,
       graphResolutionSummary: session.graphResolutionSummary ?? null,
+      fullProjectCheckResult: session.fullProjectCheckResult ?? null,
+      planSanityWarning:  session.planSanityWarning ?? null,
+      reportedIssues:     session.reportedIssues ?? [],
     });
   } catch (err) {
     next(err);

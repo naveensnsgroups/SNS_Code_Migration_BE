@@ -99,6 +99,19 @@ command from a language you weren't given). Capture the exact real
 stdout/stderr for any failure.
 </step>
 
+<step id="B4b" name="check_assembled_entrypoint" priority="MANDATORY IF AN ENTRYPOINT IS GIVEN">
+If the user prompt names a real ENTRYPOINT file, ALSO specifically
+import/run THAT exact file as its own extra check, after B4's per-file
+checks. A file importing correctly on its own only proves it's individually
+well-formed — it says nothing about whether it's wired together correctly
+with every other file (e.g. every router actually being mounted, every
+shared module actually being importable from where it's used). Importing
+the real entrypoint transitively exercises the WHOLE assembled app's wiring
+in one shot, which per-file checks cannot catch. Report this as its own
+entry in "results" keyed by the entrypoint's exact path, in addition to (not
+instead of) its individual per-file check from B4.
+</step>
+
 <step id="B5" name="report" priority="MANDATORY — THIS STEP IS THE ONLY DELIVERABLE">
 This step is not a formality — it is THE task. B1-B4 produced data that
 exists nowhere except your own context until you call this tool. Call
@@ -150,9 +163,14 @@ command must be this edit_task_context call. Stop only after it succeeds.
 
 export function buildBuildVerificationUserPrompt(
   targetFiles: string[],
-  targetStack: { framework: string; database: string; language: string; testFramework: string }
+  targetStack: { framework: string; database: string; language: string; testFramework: string },
+  entrypointFile?: string
 ): string {
   const fileList = targetFiles.map((f, i) => `  ${i + 1}. ${f}`).join('\n');
+
+  const entrypointNote = entrypointFile
+    ? `\nENTRYPOINT (do the B4b whole-app import/run check on this exact file, IN ADDITION to its own B4 per-file check): ${entrypointFile}\n`
+    : '';
 
   return `Actually install dependencies and actually verify these generated files import/build correctly.
 
@@ -161,11 +179,11 @@ TARGET STACK:
   Language:       ${targetStack.language}
   Database:       ${targetStack.database}
   Test framework: ${targetStack.testFramework}
-
+${entrypointNote}
 FILES TO CHECK (all ${targetFiles.length} must appear in your final report):
 ${fileList}
 
-Follow B1 (determine dependencies) → B2 (write manifest) → B3 (install, one at a time) → B4 (check every file for real) → B5 (report).
+Follow B1 (determine dependencies) → B2 (write manifest) → B3 (install, one at a time) → B4 (check every file for real)${entrypointFile ? ' → B4b (check the assembled entrypoint)' : ''} → B5 (report).
 
 Reminder: B5 is not optional and is not a text reply — it is the
 edit_task_context call with REAL_BUILD_RESULT. Nothing else you write is ever

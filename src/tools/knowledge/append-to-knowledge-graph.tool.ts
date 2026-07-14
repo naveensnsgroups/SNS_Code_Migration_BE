@@ -149,6 +149,33 @@ export const appendToKnowledgeGraphTool: ToolRequest = {
       args.data = cleaned;
     }
 
+    // The "imports" graph's schema (graph-schemas.ts) is the ONE graph type
+    // where the correct top-level key is deterministically known in advance —
+    // it MUST be the exact sourceFile path, never a semantic name (unlike
+    // entity/symbol/api/db/event, which are correctly keyed by an entity name,
+    // function name, route, etc. — those are left alone). A real run confirmed
+    // the model can instead use the GRAPH NAME itself ("imports") as the key,
+    // which silently collapses every file's entry into one shared slot on
+    // merge — the graph ends up with a single bogus "imports" entry instead of
+    // one per real file, and Stage 2 sees only one (fake) file to migrate.
+    // Auto-corrected here, not just requested in the prompt, for the same
+    // reason the quote-stripping above is enforced at the tool level: every
+    // downstream consumer (computeMigrationOrder, buildDraftMigrationTasks)
+    // matches graph keys by exact string equality against real file paths.
+    if (args.graphName === 'imports' && args.data && typeof args.data === 'object') {
+      const keys = Object.keys(args.data);
+      if (keys.length > 0 && !keys.includes(args.sourceFile)) {
+        const merged: Record<string, any> = {};
+        for (const k of keys) Object.assign(merged, args.data[k]);
+        args.data = { [args.sourceFile]: merged };
+        ctx?.onLog?.(
+          `[KnowledgeGraph] Corrected imports-graph key(s) [${keys.join(', ')}] -> "${args.sourceFile}" ` +
+          `for this call (the key must be the real file path, not the graph name or any other label).`,
+          'warning'
+        );
+      }
+    }
+
     // The entire read→dedup-check→merge→write cycle is serialized per graph file.
     // Section writers and analysis passes run concurrently; without this queue two
     // callers read the same snapshot and the second write erases the first (data

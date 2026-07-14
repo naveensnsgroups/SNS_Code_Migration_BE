@@ -5,6 +5,7 @@ import fs from 'fs-extra';
 import path from 'path';
 import { ALL_AGENT_DEFINITIONS } from '../agents/core/agent-definitions.js';
 import { toolRegistry } from '../core/tool-invocation-registry.js';
+import { listAllSkills } from '../knowledge/framework-skills/registry.js';
 
 const router = Router();
 
@@ -46,42 +47,26 @@ router.get('/tools', (_req: Request, res: Response, next: NextFunction) => {
   } catch (err) { next(err); }
 });
 
+// These read from src/knowledge/framework-skills/<name>/skill.md — the
+// curated, per-target-framework conventions the Migration Planner and Code
+// Generator actually inject into their prompts (see resolveFrameworkSkill).
+// Not agent-tool-invoked, not a generic free-form rules file: each skill is
+// resolved deterministically by matching the session's target framework.
 router.get('/skills', async (_req: Request, res: Response, next: NextFunction) => {
   try {
-    const skillsDir = path.join(process.cwd(), 'skills');
-    const skills: { id: string; name: string; description: string; path: string; sizeBytes: number }[] = [];
-
-    if (await fs.pathExists(skillsDir)) {
-      const entries = await fs.readdir(skillsDir, { withFileTypes: true });
-      for (const entry of entries) {
-        if (!entry.isDirectory()) continue;
-        const skillFile = path.join(skillsDir, entry.name, 'SKILL.md');
-        if (!(await fs.pathExists(skillFile))) continue;
-
-        const content = await fs.readFile(skillFile, 'utf-8');
-        const stat    = await fs.stat(skillFile);
-
-        
-        let skillName   = entry.name;
-        let description = '';
-        const fmMatch = content.match(/^---\r?\n([\s\S]*?)\r?\n---/);
-        if (fmMatch) {
-          const fm = fmMatch[1];
-          const nameMatch = fm.match(/^name:\s*(.+)$/m);
-          const descMatch = fm.match(/^description:\s*(.+)$/m);
-          if (nameMatch) skillName   = nameMatch[1].trim();
-          if (descMatch) description = descMatch[1].trim();
-        }
-
-        skills.push({
-          id:          entry.name,
-          name:        skillName,
-          description,
-          path:        `skills/${entry.name}/SKILL.md`,
-          sizeBytes:   stat.size,
-        });
-      }
-    }
+    const allSkills = await listAllSkills();
+    const skills = await Promise.all(allSkills.map(async skill => {
+      const id   = path.basename(path.dirname(skill.sourceFile));
+      const stat = await fs.stat(skill.sourceFile);
+      return {
+        id,
+        name:        skill.frameworkNames[0],
+        description: `Curated ${skill.language} conventions for ${skill.frameworkNames[0]} — folder layout, ` +
+                      `router/DI/async patterns, and ${skill.scaffolding.length} required scaffolding file(s).`,
+        path:        `src/knowledge/framework-skills/${id}/skill.md`,
+        sizeBytes:   stat.size,
+      };
+    }));
     res.json({ skills, total: skills.length, timestamp: new Date().toISOString() });
   } catch (err) { next(err); }
 });
@@ -91,11 +76,12 @@ router.get('/skill-content', async (req: Request, res: Response, next: NextFunct
     const skillId = ((req.query['id'] as string) || '').replace(/[^a-z0-9-]/g, '');
     if (!skillId) return res.status(400).json({ error: 'id query param required' });
 
-    const skillFile = path.join(process.cwd(), 'skills', skillId, 'SKILL.md');
-    if (!(await fs.pathExists(skillFile))) {
+    const allSkills = await listAllSkills();
+    const match = allSkills.find(s => path.basename(path.dirname(s.sourceFile)) === skillId);
+    if (!match) {
       return res.status(404).json({ error: `Skill "${skillId}" not found` });
     }
-    const content = await fs.readFile(skillFile, 'utf-8');
+    const content = await fs.readFile(match.sourceFile, 'utf-8');
     return res.json({ id: skillId, content, timestamp: new Date().toISOString() });
   } catch (err) { next(err); }
 });

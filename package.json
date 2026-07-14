@@ -7,6 +7,7 @@
   "scripts": {
     "dev": "tsx watch src/index.ts",
     "build": "tsc",
+    "postbuild": "node scripts/copy-skill-assets.cjs",
     "start": "node dist/index.js"
   },
   "dependencies": {
@@ -17,9 +18,11 @@
     "@parcel/watcher": "^2.5.6",
     "cors": "^2.8.5",
     "dotenv": "^16.4.5",
+    "e2b": "^2.32.0",
     "express": "^4.19.2",
     "fast-glob": "^3.3.2",
     "fs-extra": "^11.2.0",
+    "gray-matter": "^4.0.3",
     "multer": "^1.4.5-lts.1",
     "openai": "^4.47.1",
     "undici": "^8.4.1"

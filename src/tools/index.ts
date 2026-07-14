@@ -28,7 +28,6 @@ import { updateMigrationDashboardTool }      from './progress/update-migration-d
 import { compressMigrationContextTool }      from './progress/compress-migration-context.tool.js';
 
 import { findMigrationSessionTool }  from './session/find-migration-session.tool.js';
-import { getSkillFileContentTool }   from './session/get-skill-file-content.tool.js';
 
 import { appendToKnowledgeGraphTool } from './knowledge/append-to-knowledge-graph.tool.js';
 import { readKnowledgeGraphTool }     from './knowledge/read-knowledge-graph.tool.js';
@@ -66,7 +65,6 @@ export function registerAllTools(): void {
 
 
   toolRegistry.registerTool(findMigrationSessionTool);
-  toolRegistry.registerTool(getSkillFileContentTool);
 
 
   toolRegistry.registerTool(appendToKnowledgeGraphTool);

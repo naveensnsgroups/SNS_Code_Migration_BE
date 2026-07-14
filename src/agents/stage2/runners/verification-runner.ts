@@ -1,9 +1,15 @@
-// Verification sub-stage: deterministic cross-file reference check (see
-// verification.ts for why this is the reliable check available — real
-// build/execute verification needs an installed toolchain for whatever
-// target stack the user chose, which this platform does not provision).
-// On a failed check, attempts ONE bounded regeneration of that file with
-// the exact unresolved reference named, then re-checks.
+// Verification sub-stage — three checks per file, then one whole-project check:
+//   1. Deterministic cross-file reference check (see verification.ts).
+//   2. LLM rule-coverage judgment against each file's attached business rules.
+//   3. A REAL build check: a real E2B sandbox (see sandbox-manager.ts) installs
+//      dependencies and imports/builds every file for real, including the
+//      assembled entrypoint. Degrades to a best-effort host-toolchain check
+//      if no sandbox is configured/available.
+// On a failed check, attempts up to 2 bounded regeneration fixes, each staged
+// to a temp path (or backed up first, for the real-build-error case, since its
+// recheck runs against the real path) — a fix is only kept if it's actually
+// better than what was there, and each attempt is told what the previous one
+// already tried (task.fixAttempts).
 import fs   from 'fs-extra';
 import path from 'path';
 import { DetectedStack, TargetStack } from '../../../types.js';
@@ -20,6 +26,7 @@ import {
 import {
   CODE_GENERATOR_SYSTEM_PROMPT,
   buildCodeGeneratorUserPrompt,
+  selectRelevantConventions,
 } from '../../../prompts/code-generator-prompt.js';
 import {
   RULE_COVERAGE_SYSTEM_PROMPT,
@@ -31,7 +38,35 @@ import {
 } from '../../../prompts/build-verification-prompt.js';
 import { checkCrossFileReferences } from '../verification.js';
 import { MigrationTaskEntry, RuleCoverageEntry } from '../types.js';
-import { LogFn, GENERATION_TIMEOUT_MS, RULE_CHECK_TIMEOUT_MS, BUILD_CHECK_TIMEOUT_MS, withTimeout } from './shared.js';
+import { LogFn, GENERATION_TIMEOUT_MS, RULE_CHECK_TIMEOUT_MS, BUILD_CHECK_TIMEOUT_MS, withTimeout, INFRASTRUCTURE_TASK_PREFIX, resolveScaffoldingBrief } from './shared.js';
+import { resolveFrameworkSkill } from '../../../knowledge/framework-skills/registry.js';
+import { extractExportedSymbols } from '../symbol-extraction.js';
+import { provisionSandbox } from '../../../sandbox/sandbox-manager.js';
+import { FullProjectCheckResult } from '../../../session/types.js';
+
+// A shared scaffolding dependency (e.g. the DB connection module — see
+// buildScaffoldingTasks) is wired into EVERY task's dependsOn so it's available
+// for the generator to import if relevant — it is NOT mandatory. A file with
+// no real need for it (a pure JSON/hash utility, confirmed in a real run)
+// correctly won't reference it, and the deterministic cross-file check must
+// not fail it for that — only a REAL legacy-to-legacy dependency (the
+// Planner's dependsOn edges from the imports-graph) is something the
+// generated file is actually required to reference.
+//
+// A 'last'-order scaffolding task (the entrypoint) is a SEPARATE case: its own
+// dependsOn is set to every real task in the project so it's always generated
+// LAST (an ordering need), not because it must literally import every one of
+// them. A real run confirmed this produces a false failure: main.py correctly
+// does not import app/dependencies.py (only the routers use it) or schema.sql
+// (not even a Python file) — yet the deterministic check demanded both be
+// "referenced". The entrypoint's own generated correctness is already proven
+// by the real, sandboxed full-project build check (which actually imports it) —
+// the crude string-presence heuristic below is the wrong tool for this task,
+// so it's skipped entirely for any task whose OWN legacyFile is a scaffolding marker.
+function mandatoryDependsOn(ownerLegacyFile: string, dependsOn: string[]): string[] {
+  if (ownerLegacyFile.startsWith(INFRASTRUCTURE_TASK_PREFIX)) return [];
+  return dependsOn.filter(d => !d.startsWith(INFRASTRUCTURE_TASK_PREFIX));
+}
 
 export async function runVerification(
   sessionId:     string,
@@ -66,7 +101,17 @@ export async function runVerification(
     'info'
   );
 
-  const legacyToTarget = new Map(taskList.map(t => [t.legacyFile, t.targetFile]));
+  // Includes every merged-in secondary legacy file (see mergeTargetFileCollisions)
+  // so a dependent task can still resolve the correct target path for one.
+  const legacyToTarget = new Map(
+    taskList.flatMap(t => [t.legacyFile, ...(t.mergedLegacyFiles ?? [])].map(lf => [lf, t.targetFile] as const))
+  );
+
+  // Curated per-target-framework conventions — see migration-planning-runner.ts.
+  // Resolved once; the SELECTION of which sections apply is done per-task
+  // below (selectRelevantConventions), since it depends on each task's own
+  // targetFile, not a single fixed bundle for every regeneration-fix call.
+  const skill = await resolveFrameworkSkill(targetStack.framework);
 
   const toolsConfig: Record<string, boolean> = (session as any)?.toolsConfig ?? {};
   // Each agent used within Verification resolves its OWN provider/model — a
@@ -138,8 +183,16 @@ export async function runVerification(
       continue;
     }
 
+    const allLegacyFiles = [task.legacyFile, ...(task.mergedLegacyFiles ?? [])];
+    const taskLabel = allLegacyFiles.join(' + ');
+
+    // Selected per-task, not once for the whole run — see selectRelevantConventions.
+    const frameworkConventions = skill
+      ? selectRelevantConventions(skill, task.targetFile)
+      : undefined;
+
     const targetAbsPath = path.join(modernPath, task.targetFile);
-    const dependencyTargetPaths = task.dependsOn
+    const dependencyTargetPaths = mandatoryDependsOn(task.legacyFile, task.dependsOn)
       .map(f => legacyToTarget.get(f))
       .filter((f): f is string => !!f);
 
@@ -151,39 +204,74 @@ export async function runVerification(
     const dependencyTargets = task.dependsOn
       .map(legacyFile => {
         const targetFile = legacyToTarget.get(legacyFile);
-        return targetFile ? { legacyFile, targetFile } : null;
+        if (!targetFile) return null;
+        const owner = taskList.find(t => t.legacyFile === legacyFile || t.mergedLegacyFiles?.includes(legacyFile));
+        return { legacyFile, targetFile, exportedSymbols: owner?.exportedSymbols };
       })
-      .filter((d): d is { legacyFile: string; targetFile: string } => d !== null);
+      .filter((d): d is NonNullable<typeof d> => d !== null);
 
-    if (unresolved.length > 0) {
+    for (let attempt = 1; attempt <= 2 && unresolved.length > 0; attempt++) {
       onLog?.(
-        `[Verification] ${task.targetFile}: unresolved reference(s) to ${unresolved.join(', ')}. Attempting one regeneration fix via ${CODE_GENERATOR_AGENT.name}.`,
+        `[Verification] ${task.targetFile}: unresolved reference(s) to ${unresolved.join(', ')}. ` +
+        `Attempting fix ${attempt}/2 via ${CODE_GENERATOR_AGENT.name}.`,
         'warning'
       );
 
-      const lockedTools = lockWriteFileTool(codeGenTools, task.targetFile);
+      // Checkpoint: fix attempts write to a temp path, never the real target
+      // directly — a fix that doesn't actually resolve the reference must
+      // never overwrite the last-known-good file with something worse.
+      const tempRelPath = `${task.targetFile}.fixing.tmp`;
+      const tempAbsPath = path.join(modernPath, tempRelPath);
+      const lockedTools = lockWriteFileTool(codeGenTools, tempRelPath);
+
+      task.fixAttempts = [
+        ...(task.fixAttempts ?? []),
+        `Unresolved reference(s) to: ${unresolved.join(', ')} — these dependencies were not ` +
+        `found referenced anywhere in your previous output. Import them correctly this time.`,
+      ];
+      const attemptHistory = task.fixAttempts
+        .map((e, i) => `Attempt ${i + 1}: ${e}`)
+        .join('\n');
+
       try {
         await withTimeout(
           AgentExecutor.execute(
             codeGenProvider,
             CODE_GENERATOR_SYSTEM_PROMPT,
             buildCodeGeneratorUserPrompt(
-              task.legacyFile, task.targetFile, task.rulesInvolved,
+              allLegacyFiles, task.targetFile, task.rulesInvolved,
               targetStackForPrompt, detectedStack.language, detectedStack.framework,
               dependencyTargets,
-              `Unresolved reference(s) to: ${unresolved.join(', ')} — these dependencies were not ` +
-              `found referenced anywhere in your previous output. Import them correctly this time.`
+              attemptHistory,
+              resolveScaffoldingBrief(skill, task.legacyFile),
+              frameworkConventions
             ),
-            lockedTools, context, codeGenModel, `verification-fix-${task.legacyFile}`,
+            lockedTools, context, codeGenModel, `verification-fix-${taskLabel}-attempt${attempt}`,
             undefined, CODE_GENERATOR_AGENT.recoveryHint
           ),
           GENERATION_TIMEOUT_MS,
-          `verification-fix-${task.legacyFile}`
+          `verification-fix-${taskLabel}`
         );
-        content    = await fs.readFile(targetAbsPath, 'utf-8').catch(() => '');
-        unresolved = checkCrossFileReferences(content, dependencyTargetPaths);
+        const newContent = await fs.readFile(tempAbsPath, 'utf-8').catch(() => '');
+        const stillUnresolved = checkCrossFileReferences(newContent, dependencyTargetPaths);
+        if (stillUnresolved.length < unresolved.length) {
+          // Promote only when the fix actually improved things — never
+          // overwrite the real file with something equally or more broken.
+          await fs.ensureDir(path.dirname(targetAbsPath));
+          await fs.move(tempAbsPath, targetAbsPath, { overwrite: true });
+          content = newContent;
+          // Re-extract — a fix can change what this file exports (a rename, a
+          // new/removed function, a change in async-ness); anything that reads
+          // task.exportedSymbols after this point must see the CURRENT content,
+          // not what the first generation pass produced.
+          if (content) task.exportedSymbols = extractExportedSymbols(content, targetStack.language);
+        } else {
+          await fs.remove(tempAbsPath).catch(() => {});
+        }
+        unresolved = stillUnresolved;
       } catch (err: any) {
-        onLog?.(`[${CODE_GENERATOR_AGENT.name}] ${task.targetFile}: regeneration fix failed: ${err.message}`, 'error');
+        await fs.remove(tempAbsPath).catch(() => {});
+        onLog?.(`[${CODE_GENERATOR_AGENT.name}] ${task.targetFile}: regeneration fix attempt ${attempt} failed: ${err.message}`, 'error');
       }
     }
 
@@ -192,41 +280,69 @@ export async function runVerification(
     // nothing. Skips entirely for files with no attached rules.
     let ruleResult: { covered: string[]; uncovered: string[] } | null = null;
     if (unresolved.length === 0) {
-      ruleResult = await checkRules(task.rulesInvolved, task.legacyFile, task.targetFile, content);
+      ruleResult = await checkRules(task.rulesInvolved, taskLabel, task.targetFile, content);
 
-      if (ruleResult && ruleResult.uncovered.length > 0) {
+      for (let attempt = 1; attempt <= 2 && ruleResult && ruleResult.uncovered.length > 0; attempt++) {
         onLog?.(
-          `[Verification] ${task.targetFile}: rule(s) not enforced: ${ruleResult.uncovered.join('; ')}. Attempting one regeneration fix via ${CODE_GENERATOR_AGENT.name}.`,
+          `[Verification] ${task.targetFile}: rule(s) not enforced: ${ruleResult.uncovered.join('; ')}. ` +
+          `Attempting fix ${attempt}/2 via ${CODE_GENERATOR_AGENT.name}.`,
           'warning'
         );
 
-        const lockedTools = lockWriteFileTool(codeGenTools, task.targetFile);
+        const tempRelPath = `${task.targetFile}.fixing.tmp`;
+        const tempAbsPath = path.join(modernPath, tempRelPath);
+        const lockedTools = lockWriteFileTool(codeGenTools, tempRelPath);
+
+        task.fixAttempts = [
+          ...(task.fixAttempts ?? []),
+          `These specific business rule(s) are NOT visibly enforced in your previous output: ` +
+          `${ruleResult.uncovered.join('; ')}. Add the missing validation/branch/error logic for ` +
+          `each of them while keeping everything else intact.`,
+        ];
+        const attemptHistory = task.fixAttempts
+          .map((e, i) => `Attempt ${i + 1}: ${e}`)
+          .join('\n');
+
         try {
           await withTimeout(
             AgentExecutor.execute(
               codeGenProvider,
               CODE_GENERATOR_SYSTEM_PROMPT,
               buildCodeGeneratorUserPrompt(
-                task.legacyFile, task.targetFile, task.rulesInvolved,
+                allLegacyFiles, task.targetFile, task.rulesInvolved,
                 targetStackForPrompt, detectedStack.language, detectedStack.framework,
                 dependencyTargets,
-                `These specific business rule(s) are NOT visibly enforced in your previous output: ` +
-                `${ruleResult.uncovered.join('; ')}. Add the missing validation/branch/error logic for ` +
-                `each of them while keeping everything else intact.`
+                attemptHistory,
+                resolveScaffoldingBrief(skill, task.legacyFile),
+                frameworkConventions
               ),
-              lockedTools, context, codeGenModel, `rule-fix-${task.legacyFile}`,
+              lockedTools, context, codeGenModel, `rule-fix-${taskLabel}-attempt${attempt}`,
               undefined, CODE_GENERATOR_AGENT.recoveryHint
             ),
             GENERATION_TIMEOUT_MS,
-            `rule-fix-${task.legacyFile}`
+            `rule-fix-${taskLabel}`
           );
-          content    = await fs.readFile(targetAbsPath, 'utf-8').catch(() => '');
-          unresolved = checkCrossFileReferences(content, dependencyTargetPaths);
-          ruleResult = unresolved.length === 0
-            ? await checkRules(task.rulesInvolved, task.legacyFile, task.targetFile, content)
+          const newContent = await fs.readFile(tempAbsPath, 'utf-8').catch(() => '');
+          const newUnresolved = checkCrossFileReferences(newContent, dependencyTargetPaths);
+          const newRuleResult = newUnresolved.length === 0
+            ? await checkRules(task.rulesInvolved, taskLabel, task.targetFile, newContent)
             : ruleResult; // cross-file check regressed — don't bother re-checking rules
+
+          const improved = newUnresolved.length === 0
+            && (!newRuleResult || newRuleResult.uncovered.length < ruleResult.uncovered.length);
+          if (improved) {
+            await fs.ensureDir(path.dirname(targetAbsPath));
+            await fs.move(tempAbsPath, targetAbsPath, { overwrite: true });
+            content    = newContent;
+            unresolved = newUnresolved;
+            ruleResult = newRuleResult;
+            if (content) task.exportedSymbols = extractExportedSymbols(content, targetStack.language);
+          } else {
+            await fs.remove(tempAbsPath).catch(() => {});
+          }
         } catch (err: any) {
-          onLog?.(`[${CODE_GENERATOR_AGENT.name}] ${task.targetFile}: rule fix regeneration failed: ${err.message}`, 'error');
+          await fs.remove(tempAbsPath).catch(() => {});
+          onLog?.(`[${CODE_GENERATOR_AGENT.name}] ${task.targetFile}: rule fix attempt ${attempt} failed: ${err.message}`, 'error');
         }
       }
     }
@@ -292,14 +408,53 @@ export async function runVerification(
     .getFunctions(...BUILD_VERIFICATION_AGENT.functions)
     .filter(t => toolsConfig[t.name] !== false);
 
-  const runBuildVerification = async (files: string[], tag: string): Promise<BuildCheckOutcome | null> => {
+  // A real, isolated, guaranteed sandbox (E2B) for this check — see
+  // sandbox-manager.ts for why: capturedShellExecute routes through it when
+  // present (ctx.sandbox), so every install/build command below runs there
+  // instead of on this host. null (no E2B_API_KEY, or provisioning failed)
+  // degrades gracefully to today's best-effort host-toolchain behavior.
+  const sandbox = await provisionSandbox(sessionId, targetStack, modernPath);
+  onLog?.(
+    sandbox
+      ? '[Verification] Real build check will run inside an isolated E2B sandbox.'
+      : '[Verification] No E2B sandbox available (not configured, or provisioning failed) — falling back to whatever toolchain this host happens to have installed.',
+    sandbox ? 'info' : 'warning'
+  );
+  let buildContext: ToolContext = sandbox ? ToolContext.withSandbox(context, sandbox) : context;
+
+  // Real env vars from the generated project's own .env scaffolding file
+  // (see fastapi/skill.md's env-file entry) — parsed here and attached so
+  // every sandboxed command below actually has what db.py's os.getenv(...)
+  // calls expect, instead of nothing. Simple KEY=VALUE line parse — no new
+  // dependency needed for this.
+  const envFileContent = await fs.readFile(path.join(modernPath, '.env'), 'utf-8').catch(() => null);
+  if (envFileContent) {
+    const parsedEnvs: Record<string, string> = {};
+    for (const line of envFileContent.split(/\r?\n/)) {
+      const trimmed = line.trim();
+      if (!trimmed || trimmed.startsWith('#')) continue;
+      const eq = trimmed.indexOf('=');
+      if (eq <= 0) continue;
+      parsedEnvs[trimmed.slice(0, eq).trim()] = trimmed.slice(eq + 1).trim();
+    }
+    if (Object.keys(parsedEnvs).length > 0) {
+      buildContext = ToolContext.withEnvs(buildContext, parsedEnvs);
+      onLog?.(`[Verification] Loaded ${Object.keys(parsedEnvs).length} env var(s) from .env for the real build check.`, 'info');
+    }
+  }
+
+  // The one real file that proves the WHOLE project is wired together, not
+  // just individually well-formed files — see buildScaffoldingTasks (Workstream 1).
+  const entrypointTask = taskList.find(t => t.legacyFile === `${INFRASTRUCTURE_TASK_PREFIX}entrypoint`);
+
+  const runBuildVerification = async (files: string[], tag: string, entrypointFile?: string): Promise<BuildCheckOutcome | null> => {
     try {
       await withTimeout(
         AgentExecutor.execute(
           buildVerificationProvider,
           BUILD_VERIFICATION_SYSTEM_PROMPT,
-          buildBuildVerificationUserPrompt(files, targetStackForPrompt),
-          buildTools, context, buildVerificationModel, tag,
+          buildBuildVerificationUserPrompt(files, targetStackForPrompt, entrypointFile),
+          buildTools, buildContext, buildVerificationModel, tag,
           undefined, BUILD_VERIFICATION_AGENT.recoveryHint
         ),
         BUILD_CHECK_TIMEOUT_MS,
@@ -319,10 +474,24 @@ export async function runVerification(
   };
 
   const nonPendingTasks = taskList.filter(t => t.status !== 'pending');
+  let fullProjectCheckResult: FullProjectCheckResult = {
+    ran: false, sandboxAvailable: !!sandbox, errors: [], checkedAt: new Date().toISOString(),
+  };
+
   if (nonPendingTasks.length > 0) {
     onLog?.(`[${BUILD_VERIFICATION_AGENT.name}] Running real build verification (agent-directed — no hardcoded per-language logic)...`, 'info');
 
-    const buildResult = await runBuildVerification(nonPendingTasks.map(t => t.targetFile), 'build-verification');
+    const buildResult = await runBuildVerification(
+      nonPendingTasks.map(t => t.targetFile), 'build-verification', entrypointTask?.targetFile
+    );
+    fullProjectCheckResult = {
+      ran: !!buildResult?.environmentAvailable,
+      sandboxAvailable: !!sandbox,
+      errors: buildResult
+        ? Object.entries(buildResult.results).filter(([, r]) => !r.passed).map(([file, r]) => ({ file, message: r.error || 'unknown real build error' }))
+        : [],
+      checkedAt: new Date().toISOString(),
+    };
 
     if (buildResult && buildResult.environmentAvailable) {
       for (const task of nonPendingTasks) {
@@ -330,60 +499,98 @@ export async function runVerification(
         if (!fileResult || fileResult.passed) continue;
 
         const realError = fileResult.error || 'unknown real build error';
-        onLog?.(
-          `[${BUILD_VERIFICATION_AGENT.name}] ${task.targetFile}: real error: ${realError.slice(0, 300)}. Attempting one regeneration fix via ${CODE_GENERATOR_AGENT.name}.`,
-          'warning'
-        );
+        const allLegacyFiles = [task.legacyFile, ...(task.mergedLegacyFiles ?? [])];
+        const taskLabel = allLegacyFiles.join(' + ');
+
+        // Selected per-task, not once for the whole run — see selectRelevantConventions.
+        const frameworkConventions = skill
+          ? selectRelevantConventions(skill, task.targetFile)
+          : undefined;
 
         const dependencyTargets = task.dependsOn
           .map(legacyFile => {
             const targetFile = legacyToTarget.get(legacyFile);
-            return targetFile ? { legacyFile, targetFile } : null;
+            if (!targetFile) return null;
+            const owner = taskList.find(t => t.legacyFile === legacyFile || t.mergedLegacyFiles?.includes(legacyFile));
+            return { legacyFile, targetFile, exportedSymbols: owner?.exportedSymbols };
           })
-          .filter((d): d is { legacyFile: string; targetFile: string } => d !== null);
+          .filter((d): d is NonNullable<typeof d> => d !== null);
 
         const lockedTools = lockWriteFileTool(codeGenTools, task.targetFile);
+        const targetAbsPathForFix = path.join(modernPath, task.targetFile);
+        // Checkpoint: the recheck below re-runs the real sandboxed build
+        // check against this exact real path (not a temp path — the Build
+        // Verification Agent's own file list names the real path), so the
+        // rollback here is backup-then-restore instead of write-temp-then-
+        // promote. Either way, a fix attempt that doesn't actually pass never
+        // leaves the real file worse than it started.
+        const lastGoodContent = await fs.readFile(targetAbsPathForFix, 'utf-8').catch(() => null);
+
         let fixedError = realError;
-        try {
-          await withTimeout(
-            AgentExecutor.execute(
-              codeGenProvider,
-              CODE_GENERATOR_SYSTEM_PROMPT,
-              buildCodeGeneratorUserPrompt(
-                task.legacyFile, task.targetFile, task.rulesInvolved,
-                targetStackForPrompt, detectedStack.language, detectedStack.framework,
-                dependencyTargets,
-                `Running this file for real produced this error: ${realError.slice(0, 800)}\n` +
-                `Fix the actual bug causing this (e.g. a missing import, undefined name, or syntax ` +
-                `error) while keeping all existing logic and rules intact.`
-              ),
-              lockedTools, context, codeGenModel, `real-check-fix-${task.legacyFile}`,
-              undefined, CODE_GENERATOR_AGENT.recoveryHint
-            ),
-            GENERATION_TIMEOUT_MS,
-            `real-check-fix-${task.legacyFile}`
+        for (let attempt = 1; attempt <= 2 && fixedError; attempt++) {
+          onLog?.(
+            `[${BUILD_VERIFICATION_AGENT.name}] ${task.targetFile}: real error: ${fixedError.slice(0, 300)}. ` +
+            `Attempting fix ${attempt}/2 via ${CODE_GENERATOR_AGENT.name}.`,
+            'warning'
           );
 
-          const recheck = await runBuildVerification([task.targetFile], `real-check-recheck-${task.legacyFile}`);
-          const recheckResult = recheck?.results[task.targetFile];
-          fixedError = recheckResult && !recheckResult.passed ? (recheckResult.error || 'still failing') : '';
+          task.fixAttempts = [
+            ...(task.fixAttempts ?? []),
+            `Running this file for real produced this error: ${fixedError.slice(0, 800)}\n` +
+            `Fix the actual bug causing this (e.g. a missing import, undefined name, or syntax ` +
+            `error) while keeping all existing logic and rules intact.`,
+          ];
+          const attemptHistory = task.fixAttempts
+            .map((e, i) => `Attempt ${i + 1}: ${e}`)
+            .join('\n');
 
-          if (!fixedError) {
-            const targetAbsPath = path.join(modernPath, task.targetFile);
-            const content = await fs.readFile(targetAbsPath, 'utf-8').catch(() => '');
-            const dependencyTargetPaths = task.dependsOn
-              .map(f => legacyToTarget.get(f))
-              .filter((f): f is string => !!f);
-            const stillResolved = checkCrossFileReferences(content, dependencyTargetPaths).length === 0;
-            if (stillResolved) {
-              task.status = 'verified';
-              task.lastError = undefined;
-            } else {
-              fixedError = 'regeneration fixed the real build error but broke a cross-file reference';
+          try {
+            await withTimeout(
+              AgentExecutor.execute(
+                codeGenProvider,
+                CODE_GENERATOR_SYSTEM_PROMPT,
+                buildCodeGeneratorUserPrompt(
+                  allLegacyFiles, task.targetFile, task.rulesInvolved,
+                  targetStackForPrompt, detectedStack.language, detectedStack.framework,
+                  dependencyTargets,
+                  attemptHistory,
+                  resolveScaffoldingBrief(skill, task.legacyFile),
+                  frameworkConventions
+                ),
+                lockedTools, context, codeGenModel, `real-check-fix-${taskLabel}-attempt${attempt}`,
+                undefined, CODE_GENERATOR_AGENT.recoveryHint
+              ),
+              GENERATION_TIMEOUT_MS,
+              `real-check-fix-${taskLabel}`
+            );
+
+            const recheck = await runBuildVerification([task.targetFile], `real-check-recheck-${taskLabel}`);
+            const recheckResult = recheck?.results[task.targetFile];
+            fixedError = recheckResult && !recheckResult.passed ? (recheckResult.error || 'still failing') : '';
+
+            if (!fixedError) {
+              const content = await fs.readFile(targetAbsPathForFix, 'utf-8').catch(() => '');
+              const dependencyTargetPaths = mandatoryDependsOn(task.legacyFile, task.dependsOn)
+                .map(f => legacyToTarget.get(f))
+                .filter((f): f is string => !!f);
+              const stillResolved = checkCrossFileReferences(content, dependencyTargetPaths).length === 0;
+              if (content) task.exportedSymbols = extractExportedSymbols(content, targetStack.language);
+              if (stillResolved) {
+                task.status = 'verified';
+                task.lastError = undefined;
+              } else {
+                fixedError = 'regeneration fixed the real build error but broke a cross-file reference';
+              }
             }
+          } catch (err: any) {
+            fixedError = `regeneration fix attempt ${attempt} failed to run: ${err.message}`;
           }
-        } catch (err: any) {
-          fixedError = `regeneration fix failed to run: ${err.message}`;
+        }
+
+        // Rollback: every attempt failed — restore the last-known-good
+        // content instead of leaving whatever the final failed attempt wrote.
+        if (fixedError && lastGoodContent !== null) {
+          await fs.writeFile(targetAbsPathForFix, lastGoodContent, 'utf-8').catch(() => {});
         }
 
         if (fixedError) {
@@ -405,13 +612,17 @@ export async function runVerification(
     }
   }
 
+  if (sandbox) await sandbox.destroy().catch(() => {});
+  await SessionManager.updateSession(sessionId, { fullProjectCheckResult });
+
   const verifiedCount = taskList.filter(t => t.status === 'verified').length;
   const failedCount   = taskList.filter(t => t.status === 'failed').length;
   onLog?.(
     `[Verification] Stage 2 complete: ${verifiedCount} verified, ${failedCount} still failing. ` +
     `Checks performed: deterministic cross-file reference matching, an LLM rule-coverage judgment against each ` +
-    `file's Rule Coverage Manifest entries, and — where the Build Verification Agent found a usable toolchain ` +
-    `for the target language — a real, agent-directed dependency install + import/build check.`,
+    `file's Rule Coverage Manifest entries, and ${fullProjectCheckResult.ran
+      ? `a real, agent-directed dependency install + import/build check${fullProjectCheckResult.sandboxAvailable ? ' (ran inside an isolated E2B sandbox)' : ' (ran on this host — no sandbox was available)'}, ${fullProjectCheckResult.errors.length} real error(s) found`
+      : 'no real build check this pass (no usable toolchain — sandbox unavailable and no host toolchain either)'}.`,
     failedCount > 0 ? 'warning' : 'success'
   );
 }

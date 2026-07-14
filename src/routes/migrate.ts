@@ -5,11 +5,13 @@ import { Router } from 'express';
 import sessionRoutes    from './migrate/session-routes.js';
 import checkpointRoutes from './migrate/checkpoint-routes.js';
 import stage2Routes     from './migrate/stage2-routes.js';
+import diagnosticRoutes from './migrate/diagnostic-routes.js';
 
 const router = Router();
 
 router.use('/', sessionRoutes);
 router.use('/', checkpointRoutes);
 router.use('/', stage2Routes);
+router.use('/', diagnosticRoutes);
 
 export default router;
