@@ -75,8 +75,32 @@ export const capturedShellExecuteTool: ToolRequest = {
       return makeToolTextResult(JSON.stringify(result));
     }
 
-    
-    
+    // During the full-project verification stage (Workstream 3), ctx.sandbox
+    // is set and every command runs inside the real, isolated E2B sandbox
+    // instead of this host machine — same tool, same schema, only the
+    // execution target changes. "legacy"/"modern" cwd distinctions don't apply
+    // inside the sandbox (only the generated project was uploaded there); a
+    // relative path is passed through as-is, relative to the uploaded project root.
+    if (ctx?.sandbox) {
+      const sandboxCwd = (args.cwd && args.cwd !== 'modern' && args.cwd !== '.' && args.cwd !== 'legacy')
+        ? args.cwd
+        : undefined;
+      // Real env vars (parsed from the generated project's own .env, see
+      // verification-runner.ts) are injected transparently into every
+      // sandboxed command — never requested by the agent itself.
+      const sandboxResult = await ctx.sandbox.execInSandbox(args.command, sandboxCwd, args.timeoutSeconds, ctx.envs);
+      const response: CapturedShellResult = {
+        exit_code:   sandboxResult.exitCode,
+        stdout_tail: sandboxResult.stdout.split('\n').slice(-200).join('\n').trim(),
+        stderr_tail: sandboxResult.stderr.split('\n').slice(-200).join('\n').trim(),
+        timed_out:   false,
+        log_path:    '(ran in the verification sandbox — no host log file)',
+        command:     args.command,
+        cwd:         sandboxCwd ?? '(sandbox project root)',
+      };
+      return makeToolTextResult(JSON.stringify(response, null, 2));
+    }
+
     const modernPath  = ctx!.modernPath;
     const legacyPath  = ctx!.legacyPath;
 

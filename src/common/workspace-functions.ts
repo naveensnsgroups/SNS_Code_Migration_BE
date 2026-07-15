@@ -13,8 +13,6 @@ export const LIST_LAUNCH_CONFIGURATIONS_FUNCTION_ID        = 'listLaunchConfigur
 export const RUN_LAUNCH_CONFIGURATION_FUNCTION_ID          = 'runLaunchConfiguration';
 export const STOP_LAUNCH_CONFIGURATION_FUNCTION_ID         = 'stopLaunchConfiguration';
 
-export const GET_SKILL_FILE_CONTENT_FUNCTION_ID            = 'getSkillFileContent';
-
 export const SHELL_EXECUTION_FUNCTION_ID                   = 'shellExecute';
 
 export const CAPTURED_SHELL_EXECUTION_ID                   = 'capturedShellExecute';

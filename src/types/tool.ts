@@ -1,18 +1,31 @@
 
 
 import { ToolCallResult } from './language-model.js';
+import { SandboxHandle } from '../sandbox/sandbox-manager.js';
 
 export interface ToolContext {
-  
+
   sessionId: string;
-  
+
   legacyPath: string;
-  
+
   modernPath: string;
-  
+
   onLog?: (message: string, level?: 'info' | 'success' | 'error' | 'warning') => void;
-  
+
   toolCallId?: string;
+
+  // Present only during the full-project verification stage (Workstream 3) —
+  // when set, capturedShellExecute routes commands through this real,
+  // isolated sandbox instead of the host machine. Absent everywhere else.
+  sandbox?: SandboxHandle;
+
+  // Real environment variables (parsed from the generated project's own
+  // .env scaffolding file) that capturedShellExecute passes to every sandboxed
+  // command automatically — never requested by the agent itself, since these
+  // are real local-dev credentials/connection strings, not something a model
+  // should need to know to ask for. Absent when no .env was found/parsed.
+  envs?: Record<string, string>;
 }
 
 export namespace ToolContext {
@@ -24,6 +37,14 @@ export namespace ToolContext {
     onLog?: ToolContext['onLog']
   ): ToolContext {
     return { sessionId, legacyPath, modernPath, toolCallId, onLog };
+  }
+
+  export function withSandbox(ctx: ToolContext, sandbox: SandboxHandle): ToolContext {
+    return { ...ctx, sandbox };
+  }
+
+  export function withEnvs(ctx: ToolContext, envs: Record<string, string>): ToolContext {
+    return { ...ctx, envs };
   }
 
   export function withToolCallId(ctx: ToolContext, toolCallId: string): ToolContext {

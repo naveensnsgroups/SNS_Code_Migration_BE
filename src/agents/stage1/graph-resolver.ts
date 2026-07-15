@@ -513,6 +513,55 @@ export async function arePrimaryGraphsEmpty(modernPath: string): Promise<boolean
   return true;
 }
 
+// Detects the specific corruption class confirmed in a real run: the
+// imports-graph collapsing every file's entry into one bogus shared key
+// (e.g. literally "imports", the graph's own domain name) instead of one
+// real entry per file — which makes computeMigrationOrder() below see only
+// ONE (fake) file to migrate, silently dropping every real one before
+// Migration Planning ever runs.
+//
+// Deliberately NOT a self-check (imports-graph's own _sources vs its own
+// entry count) — a file can legitimately be ABSENT from _sources entirely
+// (e.g. a COBOL file with no local COPY/imports at all triggers the "skip
+// this graph, don't call the tool with empty data" rule), which would make
+// a self-check blind to that file being missing from BOTH sides at once.
+// Compared instead against symbol-graph's _sources — a real, external,
+// language-agnostic ground truth: almost every file (any language, COBOL
+// included) yields at least one symbol/paragraph entry, even when it has
+// zero local dependencies.
+export async function checkImportsGraphSanity(modernPath: string): Promise<string | null> {
+  const dir = path.join(modernPath, '_analysis');
+
+  const readSources = async (name: string): Promise<string[]> => {
+    try {
+      const data = JSON.parse(await fs.readFile(path.join(dir, `${name}-graph.json`), 'utf-8'));
+      return Array.isArray(data._sources) ? data._sources : [];
+    } catch {
+      return [];
+    }
+  };
+
+  const symbolSources = await readSources('symbol');
+  if (symbolSources.length === 0) return null; // nothing real to compare against yet
+
+  let importsData: Record<string, unknown> = {};
+  try {
+    importsData = JSON.parse(await fs.readFile(path.join(dir, 'imports-graph.json'), 'utf-8'));
+  } catch {
+    return null; // missing entirely is a different, already-handled case (draftTasks.length === 0)
+  }
+
+  const realEntries = Object.keys(importsData).filter(k => k !== '_sources').length;
+
+  if (realEntries < symbolSources.length * 0.5) {
+    return `imports-graph looks incomplete: symbol-graph found ${symbolSources.length} real ` +
+           `file(s), but imports-graph only has ${realEntries} real entr${realEntries === 1 ? 'y' : 'ies'}. ` +
+           `Migration Planning may be missing real files as a result — check imports-graph.json ` +
+           `for a bug like every file's data collapsing into one shared key instead of one per file.`;
+  }
+  return null;
+}
+
 export async function validateGraphResolverOutputs(
   modernPath: string,
   onLog?: LogFn

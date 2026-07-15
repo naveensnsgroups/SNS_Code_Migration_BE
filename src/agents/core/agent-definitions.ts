@@ -39,6 +39,9 @@ import {
 import {
   BUILD_VERIFICATION_SYSTEM_PROMPT,
 } from '../../prompts/build-verification-prompt.js';
+import {
+  DIAGNOSTIC_SYSTEM_PROMPT,
+} from '../../prompts/diagnostic-prompt.js';
 
 export const SCANNER_AGENT_ID = 'codebase-scanner';
 
@@ -390,6 +393,48 @@ export const BUILD_VERIFICATION_AGENT: AgentDefinition = {
 
 AgentRegistry.register(BUILD_VERIFICATION_AGENT);
 
+export const DIAGNOSTIC_AGENT_ID = 'diagnostic-agent';
+
+export const DIAGNOSTIC_AGENT: AgentDefinition = {
+  id: DIAGNOSTIC_AGENT_ID,
+  name: 'Diagnostic Agent',
+  description:
+    'Investigates a human-reported issue against a migration session for real — reads the ' +
+    'actual knowledge graphs, task list, and files relevant to what was reported, and forms ' +
+    'a root-cause diagnosis grounded in what it actually observed. Deliberately READ-ONLY: ' +
+    'no write_file, no shell execution — it diagnoses, a human decides what to do about it. ' +
+    'Exists because an automatic sanity check can only catch failure patterns anticipated in ' +
+    'advance; this is the channel for whatever a human notices that no check anticipated.',
+  tags: ['diagnostic', 'stage2'],
+  functions: [
+    GET_TASK_CONTEXT_FUNCTION_ID,
+    READ_KNOWLEDGE_GRAPH_FUNCTION_ID,
+    FILE_CONTENT_FUNCTION_ID,
+    FIND_FILES_BY_PATTERN_FUNCTION_ID,
+    GET_WORKSPACE_FILE_LIST_FUNCTION_ID,
+    EDIT_TASK_CONTEXT_FUNCTION_ID,
+  ],
+  variables: ['legacyPath'],
+  languageModelRequirements: [
+    { purpose: 'diagnostic-check', identifier: 'alias:reasoning-model' }
+  ],
+  prompts: [
+    {
+      id: 'diagnostic-system',
+      defaultVariant: {
+        id: 'diagnostic-system-default',
+        label: 'Diagnostic System Prompt',
+        template: DIAGNOSTIC_SYSTEM_PROMPT,
+      }
+    }
+  ],
+  agentSpecificVariables: [
+    { name: 'legacyPath', description: 'Absolute path to the legacy project root.', usedInPrompt: true },
+  ],
+};
+
+AgentRegistry.register(DIAGNOSTIC_AGENT);
+
 agentService.registerAgent(SCANNER_AGENT);
 agentService.registerAgent(DISCOVERY_AGENT);
 agentService.registerAgent(GRAPH_RESOLVER_AGENT);
@@ -399,6 +444,7 @@ agentService.registerAgent(MIGRATION_PLANNER_AGENT);
 agentService.registerAgent(CODE_GENERATOR_AGENT);
 agentService.registerAgent(RULE_COVERAGE_AGENT);
 agentService.registerAgent(BUILD_VERIFICATION_AGENT);
+agentService.registerAgent(DIAGNOSTIC_AGENT);
 
 export const ALL_AGENT_DEFINITIONS = [
   SCANNER_AGENT,
@@ -410,4 +456,5 @@ export const ALL_AGENT_DEFINITIONS = [
   CODE_GENERATOR_AGENT,
   RULE_COVERAGE_AGENT,
   BUILD_VERIFICATION_AGENT,
+  DIAGNOSTIC_AGENT,
 ];

@@ -180,52 +180,14 @@ export class SessionManager {
     try {
       const { estimateCost } = await import('../agents/compactor/agent-cost-estimator.js');
 
-      // The read-of-current-totals and the accumulate+write must happen inside the
-      // SAME queued slot. Computing totals before enqueueing lets two concurrent
-      // completions read the same snapshot and the second write drop the first's
-      // tokens (silent undercount). Do not call updateSession here — a nested
-      // enqueueWrite on the same session would deadlock the queue.
+      // The read-of-history and the recompute+write must happen inside the SAME
+      // queued slot — otherwise two concurrent completions could read the same
+      // snapshot and the second write would drop the first's entry entirely.
+      // Do not call updateSession here — a nested enqueueWrite on the same
+      // session would deadlock the queue.
       const newTotals = await this.enqueueWrite(sessionId, async () => {
         const session = await this.getSession(sessionId);
         if (!session) return null;
-
-        // Cost uses the user-configured rate for THIS model, read fresh from the
-        // session inside the queue — never a hardcoded table (see agent-cost-estimator.ts).
-        const thisCallCost = estimateCost(
-          inputTokens, outputTokens, modelName, session.modelPricing,
-          cachedInputTokens ?? 0, readCachedInputTokens ?? 0
-        );
-
-        const ex = session.tokenUsage;
-        const accumulatedInput = (ex?.inputTokens ?? 0) + inputTokens;
-        const accumulatedOutput = (ex?.outputTokens ?? 0) + outputTokens;
-        const accumulatedCached = (ex?.cachedInputTokens ?? 0) + (cachedInputTokens ?? 0);
-        const accumulatedReadCached = (ex?.readCachedInputTokens ?? 0) + (readCachedInputTokens ?? 0);
-        const accumulatedTotal = accumulatedInput + accumulatedOutput + accumulatedCached;
-
-        // If this call's cost is unknown (no rate configured) AND nothing has been
-        // priced so far, the running total stays null (honest "unavailable") rather
-        // than silently treating the unknown call as $0.
-        const priorCost = ex?.estimatedCost ?? null;
-        const accumulatedCost =
-          thisCallCost === null && priorCost === null ? null
-          : (priorCost ?? 0) + (thisCallCost ?? 0);
-        // Distinct from "fully unavailable": some calls WERE priced, but at least
-        // one model used in this session has no configured rate, so the total is
-        // a real but INCOMPLETE lower bound — the UI must say so, not present it
-        // as the full cost.
-        const costIncomplete = thisCallCost === null || (ex as any)?.costIncomplete === true;
-
-        const totals = {
-          inputTokens: accumulatedInput,
-          outputTokens: accumulatedOutput,
-          cachedInputTokens: accumulatedCached > 0 ? accumulatedCached : undefined,
-          readCachedInputTokens: accumulatedReadCached > 0 ? accumulatedReadCached : undefined,
-          totalTokens: accumulatedTotal,
-          estimatedCost: accumulatedCost,
-          costIncomplete: accumulatedCost !== null ? costIncomplete : undefined,
-          model: modelName,
-        };
 
         const entry: TokenUsageEntry = {
           agentId,
@@ -237,11 +199,58 @@ export class SessionManager {
           readCachedInputTokens: readCachedInputTokens && readCachedInputTokens > 0 ? readCachedInputTokens : undefined,
           timestamp: new Date().toISOString(),
         };
+        const history = [...(session.tokenUsageHistory ?? []), entry];
+
+        // Recomputed FRESH from the complete history every time — NOT an
+        // incrementally accumulated running counter. A real session confirmed
+        // an incremental total can silently drift: token counts stayed fully
+        // correct but the cost total quietly dropped one entire model's
+        // contribution (across ~190 calls, a $0.02 discrepancy traced to
+        // exactly one model's cost never landing in the running total —
+        // root cause unconfirmed, but an incremental counter has no way to
+        // self-correct once ANY single update is lost or misordered).
+        // Recomputing from tokenUsageHistory — the actually-persisted, provably
+        // complete record — makes the aggregate self-healing: it can never
+        // diverge from history, because it IS history, summed fresh each time.
+        let totalInput = 0, totalOutput = 0, totalCached = 0, totalReadCached = 0;
+        let totalCost: number | null = null;
+        let costIncomplete = false;
+        for (const e of history) {
+          totalInput      += e.inputTokens ?? 0;
+          totalOutput     += e.outputTokens ?? 0;
+          totalCached     += e.cachedInputTokens ?? 0;
+          totalReadCached += e.readCachedInputTokens ?? 0;
+
+          // Cost uses the user-configured rate for THIS entry's model, read
+          // fresh each time — never a hardcoded table (see agent-cost-estimator.ts).
+          const cost = estimateCost(
+            e.inputTokens, e.outputTokens, e.model, session.modelPricing,
+            e.cachedInputTokens ?? 0, e.readCachedInputTokens ?? 0
+          );
+          if (cost === null) {
+            // No rate configured for this entry's model — the total becomes an
+            // honest, flagged lower bound rather than silently treating it as $0.
+            costIncomplete = true;
+          } else {
+            totalCost = (totalCost ?? 0) + cost;
+          }
+        }
+
+        const totals = {
+          inputTokens: totalInput,
+          outputTokens: totalOutput,
+          cachedInputTokens: totalCached > 0 ? totalCached : undefined,
+          readCachedInputTokens: totalReadCached > 0 ? totalReadCached : undefined,
+          totalTokens: totalInput + totalOutput + totalCached,
+          estimatedCost: totalCost,
+          costIncomplete: totalCost !== null ? costIncomplete : undefined,
+          model: modelName,
+        };
 
         const updatedSession = {
           ...session,
           tokenUsage: totals,
-          tokenUsageHistory: [...(session.tokenUsageHistory ?? []), entry],
+          tokenUsageHistory: history,
         };
         await this.saveSession(updatedSession);
         return totals;
